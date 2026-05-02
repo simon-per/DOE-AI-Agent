@@ -97,7 +97,12 @@ def authenticate() -> gspread.Client:
     creds = None
 
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        except Exception:
+            log.warning(f"token.json is corrupted or invalid — deleting and re-authenticating. ({TOKEN_FILE})")
+            TOKEN_FILE.unlink(missing_ok=True)
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -314,6 +319,34 @@ def _apply_formatting(worksheet):
             format=CellFormat(backgroundColor=Color(0.96, 0.7, 0.7)),
         ),
     ))
+
+    # Status column (P) conditional formatting
+    status_range = [GridRange.from_a1_range("P2:P5000", worksheet)]
+
+    status_colors = [
+        ("New",              Color(0.80, 0.90, 1.00)),  # light blue
+        ("Ready_to_Apply",   Color(0.00, 0.80, 0.75)),  # teal
+        ("APPLYING",         Color(0.80, 0.92, 0.60)),  # yellow-green
+        ("Applied",          Color(0.56, 0.74, 0.96)),  # blue
+        ("PAUSED",           Color(1.00, 0.85, 0.40)),  # amber
+        ("FAILED",           Color(0.80, 0.40, 0.40)),  # dark red
+        ("Follow-Up_Sent",   Color(0.85, 0.75, 0.95)),  # lavender
+        ("Interviewing",     Color(0.72, 0.88, 0.73)),  # green
+        ("Offer",            Color(0.40, 0.85, 0.50)),  # bright green
+        ("Rejected",         Color(0.96, 0.70, 0.70)),  # red
+        ("No_Response",      Color(0.87, 0.87, 0.87)),  # light grey
+        ("Expired",          Color(0.80, 0.80, 0.80)),  # grey
+        ("Duplicate",        Color(1.00, 0.76, 0.38)),  # orange
+    ]
+    for status_text, color in status_colors:
+        rules.append(ConditionalFormatRule(
+            ranges=status_range,
+            booleanRule=BooleanRule(
+                condition=BooleanCondition('TEXT_EQ', [status_text]),
+                format=CellFormat(backgroundColor=color),
+            ),
+        ))
+
     rules.save()
     log.info("Applied conditional formatting")
 
@@ -357,6 +390,13 @@ def write_to_sheet(client: gspread.Client, jobs: list[dict], sheet_name: str, cl
             if len(row) > URL_COL_INDEX and row[URL_COL_INDEX]:
                 existing_urls.add(row[URL_COL_INDEX].strip())
 
+        # Build title+company key set once (for jobs with no URL) — row[2]=Title, row[3]=Company
+        existing_title_company_keys = {
+            f"{row[2]}|{row[3]}".lower()
+            for row in existing_data[1:]
+            if len(row) > 3
+        }
+
         # Filter to only new jobs (URL not already in sheet)
         new_jobs = []
         skipped = 0
@@ -367,12 +407,7 @@ def write_to_sheet(client: gspread.Client, jobs: list[dict], sheet_name: str, cl
             elif not job_url:
                 # No URL — fall back to title+company dedup
                 job_key = f"{job.get('title', '')}|{job.get('company', '')}".lower()
-                existing_keys = {
-                    f"{row[1]}|{row[2]}".lower()
-                    for row in existing_data[1:]
-                    if len(row) > 2
-                }
-                if job_key in existing_keys:
+                if job_key in existing_title_company_keys:
                     skipped += 1
                 else:
                     new_jobs.append(job)
@@ -388,6 +423,11 @@ def write_to_sheet(client: gspread.Client, jobs: list[dict], sheet_name: str, cl
         # Append new rows after last existing row
         new_rows = [job_to_row(j) for j in new_jobs]
         next_row = len(existing_data) + 1
+        required_rows = next_row + len(new_rows) - 1
+        if required_rows > worksheet.row_count:
+            extra = required_rows - worksheet.row_count + 100  # add 100 buffer
+            log.info(f"Expanding sheet by {extra} rows (current: {worksheet.row_count}, needed: {required_rows})")
+            _sheets_api_call(worksheet.add_rows, extra)
         try:
             _sheets_api_call(worksheet.update, range_name=f"A{next_row}", values=new_rows)
             log.info(f"Appended {len(new_jobs)} new jobs (skipped {skipped} existing)")
@@ -410,7 +450,15 @@ def main():
     parser = argparse.ArgumentParser(description="Write scored jobs to Google Sheet")
     parser.add_argument("--sheet-name", default="Swiss Job Search Pipeline", help="Name of the Google Sheet")
     parser.add_argument("--clear", action="store_true", help="Clear all existing rows before writing")
+    parser.add_argument("--reformat", action="store_true", help="Re-apply formatting to existing sheet without touching data")
     args = parser.parse_args()
+
+    if args.reformat:
+        client = authenticate()
+        spreadsheet = client.open(args.sheet_name)
+        _apply_formatting(spreadsheet.sheet1)
+        log.info(f"Formatting updated: {spreadsheet.url}")
+        return spreadsheet.url
 
     if not INPUT_FILE.exists():
         log.error(f"Input file not found: {INPUT_FILE}")

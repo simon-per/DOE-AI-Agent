@@ -93,12 +93,16 @@ def call_gemini(
     prompt: str,
     temperature: float = 0.3,
     max_tokens: int = 500,
+    json_mode: bool = False,
 ) -> str:
     """Call Gemini API with retry and rate limit handling."""
     url = f"{GEMINI_URL}?key={api_key}"
+    gen_config: dict = {"temperature": temperature, "maxOutputTokens": max_tokens}
+    if json_mode:
+        gen_config["responseMimeType"] = "application/json"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        "generationConfig": gen_config,
     }
     for attempt in range(5):
         try:
@@ -142,7 +146,7 @@ def call_llm(
             else:
                 raise
     if gemini_key:
-        result = call_gemini(gemini_key, prompt, temperature, max_tokens)
+        result = call_gemini(gemini_key, prompt, temperature, max_tokens, json_mode)
         return result, "gemini"
     raise RuntimeError("No API keys available")
 

@@ -1,0 +1,11 @@
+{
+  "_comment": "Curated CH employers on public ATS boards. Slugs MUST be verified before adding: GET https://boards-api.greenhouse.io/v1/boards/{slug}/jobs (200 = ok) or https://api.lever.co/v0/postings/{slug}?mode=json. Many companies' careers page text differs from their ATS slug.",
+  "_unverified_candidates": [
+    "Nexthink, Frontify, SonarSource, Squirro, Smallpdf, Acronis, Beekeeper, Sherpany, Yokoy, Numbrs were probed and returned 404 — likely on different ATS or under different slug. Verify by inspecting their /careers page Network tab."
+  ],
+  "greenhouse": [
+    {"company": "Scandit", "slug": "scandit"},
+    {"company": "Proton", "slug": "proton"}
+  ],
+  "lever": []
+}

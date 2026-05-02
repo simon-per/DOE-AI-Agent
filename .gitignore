@@ -4,6 +4,14 @@ credentials.json
 token.json
 token_gmail.json
 
+# Token backups (still contain client_secret)
+*.bak
+token.json*.bak
+
+# Personal documents (never commit to public repo)
+Certificates_*.pdf
+Zwischenzeugnis_*.pdf
+
 # Personal data (use ABOUTME.example.md as template)
 ABOUTME.md
 

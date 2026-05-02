@@ -29,6 +29,8 @@ class PersonalInfo:
     phone: str = ""
     linkedin: str = ""
     linkedin_handle: str = ""
+    github: str = ""
+    github_handle: str = ""
     location: str = ""
     location_localized: dict[str, str] = field(default_factory=dict)
     availability: str = ""
@@ -44,12 +46,37 @@ class Experience:
     company_anonymous: str = ""
     company_location: str = ""
     role: str = ""
+    role_official: str = ""
+    role_official_label_localized: dict[str, str] = field(default_factory=dict)
     role_start: str = ""
     role_period: str = ""
     metrics: dict[str, str] = field(default_factory=dict)
     allowed_numbers: list[str] = field(default_factory=list)
     experience_bullets: dict[str, list[str]] = field(default_factory=dict)
     bullet_keywords: dict[int, list[str]] = field(default_factory=dict)
+
+    # Default localized labels used when role_official_label_localized is empty
+    # or missing the requested language. Prevents EN label leaking into DE/IT CVs.
+    _DEFAULT_OFFICIAL_LABELS = {
+        "de": "Vertraglicher Titel",
+        "en": "Official Title",
+        "it": "Titolo contrattuale",
+    }
+
+    def official_label(self, lang_code: str) -> str:
+        """Localized prefix for the parenthetical, e.g. 'Vertraglicher Titel'."""
+        return (
+            self.role_official_label_localized.get(lang_code)
+            or self._DEFAULT_OFFICIAL_LABELS.get(lang_code, "Official Title")
+        )
+
+    def official_line(self, lang_code: str) -> str:
+        """Render the contract-title disclosure, e.g.
+        '(Vertraglicher Titel: Digital Sales Specialist)'.
+        Returns '' when role_official is unset, so callers can short-circuit."""
+        if not self.role_official:
+            return ""
+        return f"({self.official_label(lang_code)}: {self.role_official})"
 
 
 @dataclass
@@ -95,6 +122,7 @@ class CandidateProfile:
     achievements: dict[str, list[dict]] = field(default_factory=dict)
     achievement_keywords: dict[int, list[str]] = field(default_factory=dict)
     target: str = ""
+    projects: list[dict] = field(default_factory=list)
     search_terms: list[str] = field(default_factory=list)
     labels: dict[str, dict[str, str]] = field(default_factory=dict)
     languages_text: str = ""
@@ -219,6 +247,35 @@ class CandidateProfile:
         """Get soft skills for a language."""
         return self.soft_skills.get(lang_code, self.soft_skills.get("de", []))
 
+    def cv_projects(self, lang_code: str) -> list[dict]:
+        """Get projects with localized names, descriptions, and tags for CV display."""
+        result = []
+        for proj in self.projects:
+            name = proj.get("name_localized", {}).get(lang_code, proj.get("name", ""))
+            desc = proj.get("description_localized", {}).get(lang_code, "")
+            result.append({
+                "name": name,
+                "tech": proj.get("tech", ""),
+                "url": proj.get("url", ""),
+                "tags": proj.get("tags", []),
+                "description": desc,
+            })
+        return result
+
+    def relevant_projects(self, key_matches: list[str], lang_code: str, top_n: int = 1) -> list[dict]:
+        """Return projects sorted by tag overlap with job key_matches (for cover letter injection).
+
+        Only returns projects with at least 1 matching tag.
+        """
+        all_projects = self.cv_projects(lang_code)
+        km_lower = {w.lower() for w in key_matches}
+
+        def score(proj: dict) -> int:
+            return sum(1 for tag in proj["tags"] if tag.lower() in km_lower)
+
+        scored = sorted(all_projects, key=score, reverse=True)
+        return [p for p in scored if score(p) > 0][:top_n]
+
 
 # ---------------------------------------------------------------------------
 # ABOUTME.md parser
@@ -284,6 +341,8 @@ def _parse_aboutme(path: Path) -> CandidateProfile:
         phone=pi.get("phone", ""),
         linkedin=pi.get("linkedin", ""),
         linkedin_handle=pi.get("linkedin_handle", ""),
+        github=pi.get("github", ""),
+        github_handle=pi.get("github_handle", ""),
         location=pi.get("location", ""),
         location_localized=pi.get("location_localized", {}),
         availability=pi.get("availability", ""),
@@ -303,6 +362,8 @@ def _parse_aboutme(path: Path) -> CandidateProfile:
         company_anonymous=we.get("company_anonymous", ""),
         company_location=we.get("company_location", ""),
         role=we.get("role", ""),
+        role_official=we.get("role_official", ""),
+        role_official_label_localized=we.get("role_official_label_localized", {}),
         role_start=we.get("role_start", ""),
         role_period=we.get("role_period", ""),
         metrics=we.get("metrics", {}),
@@ -359,6 +420,10 @@ def _parse_aboutme(path: Path) -> CandidateProfile:
     profile.achievements = ac.get("achievements", {})
     raw_ak = ac.get("achievement_keywords", {})
     profile.achievement_keywords = {int(k): v for k, v in raw_ak.items()}
+
+    # --- Technical Projects ---
+    tp = sections.get("Technical Projects", {})
+    profile.projects = tp.get("projects", [])
 
     # --- Target Roles ---
     tr = sections.get("Target Roles", {})

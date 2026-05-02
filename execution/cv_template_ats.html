@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="{{ lang_code }}">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page {
+    size: A4;
+    margin: 15mm;
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: "Segoe UI", Arial, Helvetica, sans-serif;
+    font-size: 10pt;
+    color: #222;
+    line-height: 1.5;
+  }
+
+  .page {
+    max-width: 180mm;
+    margin: 0 auto;
+  }
+
+  h1 {
+    font-size: 16pt;
+    font-weight: 700;
+    color: #111;
+    margin-bottom: 1mm;
+  }
+
+  .subtitle {
+    font-size: 10pt;
+    color: #444;
+    margin-bottom: 3mm;
+  }
+
+  .contact-block {
+    font-size: 8.5pt;
+    color: #333;
+    margin-bottom: 1.5mm;
+    line-height: 1.6;
+  }
+
+  h2 {
+    font-size: 10pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #111;
+    border-bottom: 1px solid #333;
+    padding-bottom: 1mm;
+    margin-top: 4mm;
+    margin-bottom: 2.5mm;
+  }
+
+  .summary {
+    font-size: 9.5pt;
+    color: #333;
+    line-height: 1.45;
+    margin-bottom: 1mm;
+  }
+
+  .skills-line {
+    font-size: 9pt;
+    color: #333;
+    line-height: 1.5;
+  }
+
+  .achievement-item {
+    font-size: 9pt;
+    margin-bottom: 0.8mm;
+  }
+
+  .achievement-item strong {
+    font-weight: 700;
+  }
+
+  .entry {
+    margin-bottom: 2.5mm;
+  }
+
+  .entry-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  .entry-title {
+    font-weight: 700;
+    font-size: 10pt;
+    color: #111;
+  }
+
+  .entry-date {
+    font-size: 8.5pt;
+    color: #555;
+    white-space: nowrap;
+  }
+
+  .entry-company {
+    font-size: 9pt;
+    color: #555;
+    margin-bottom: 1.5mm;
+  }
+
+  .entry ul {
+    margin-left: 5mm;
+    padding-left: 0;
+  }
+
+  .entry li {
+    font-size: 8.5pt;
+    margin-bottom: 0.5mm;
+    color: #333;
+  }
+
+  .project {
+    margin-bottom: 2mm;
+  }
+
+  .project-name {
+    font-weight: 700;
+    font-size: 9pt;
+  }
+
+  .project-tech {
+    font-size: 8pt;
+    color: #555;
+  }
+
+  .project-desc {
+    font-size: 8pt;
+    color: #444;
+    margin-top: 0.3mm;
+  }
+
+  .project-url {
+    font-size: 8pt;
+    color: #333;
+  }
+
+  .cert-item {
+    margin-bottom: 1mm;
+  }
+
+  .cert-name {
+    font-size: 9pt;
+    font-weight: 600;
+  }
+
+  .cert-detail {
+    font-size: 8pt;
+    color: #555;
+  }
+
+  .lang-line {
+    font-size: 9pt;
+    color: #333;
+  }
+
+  .interests-line {
+    font-size: 9pt;
+    color: #333;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>{{ personal.name }}</h1>
+  <div class="subtitle">{{ subtitle }}</div>
+
+  <div class="contact-block">
+    {{ personal.email }} | {{ personal.phone }} | {{ labels.location_value }}<br>
+    LinkedIn: {{ personal.linkedin }} | GitHub: {{ personal.github }}<br>
+    {{ labels.date_of_birth }}: {{ cv_dob }} | {{ labels.nationality }}: {{ labels.nationality_value }} | {{ labels.permit }}: {{ labels.permit_value }}<br>
+    {{ labels.availability_label }}: {{ labels.availability_value }} | {{ labels.license_label }}: {{ labels.license_value }}
+  </div>
+
+  <h2>{{ labels.summary_heading }}</h2>
+  <p class="summary">{{ summary }}</p>
+
+  <h2>{{ labels.skills_heading }}</h2>
+  <p class="skills-line">{{ skills | join(", ") }}</p>
+
+  <h2>{{ labels.achievements_heading }}</h2>
+  {% for ach in achievements %}
+  <div class="achievement-item"><strong>{{ ach.number }}</strong> &mdash; {{ ach.label }}</div>
+  {% endfor %}
+
+  <h2>{{ labels.experience_heading }}</h2>
+  <div class="entry">
+    <div class="entry-header">
+      {# ATS CV: parenthetical inlined on the same line as the role for parser compatibility (ATS systems flatten <div>s and may split a separate paragraph into a stray field). Visual template uses a <div> block — keep the divergence intentional, do not normalize. #}
+      <span class="entry-title">{{ experience.role }}{% set official_line = experience.official_line(lang_code) %}{% if official_line %} {{ official_line }}{% endif %}</span>
+      <span class="entry-date">{{ experience.role_start }} &ndash; {{ labels.present }}</span>
+    </div>
+    <div class="entry-company">{{ experience.company }} &mdash; {{ experience.company_location }}</div>
+    <ul>
+      {% for bullet in experience_bullets %}
+      <li>{{ bullet }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  {% if projects %}
+  <h2>{{ labels.projects_heading }}</h2>
+  {% for proj in projects %}
+  <div class="project">
+    <span class="project-name">{{ proj.name }}</span>
+    <span class="project-tech"> | {{ proj.tech }}</span>
+    {% if proj.description %}
+    <div class="project-desc">{{ proj.description }}</div>
+    {% endif %}
+    <div class="project-url">{{ proj.url }}</div>
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <h2>{{ labels.education_heading }}</h2>
+  <div class="entry">
+    <div class="entry-header">
+      <span class="entry-title">{{ labels.matura_title }}</span>
+      <span class="entry-date">{{ edu_start }} &ndash; {{ edu_end }}</span>
+    </div>
+    <div class="entry-company">{{ labels.matura_school }}</div>
+  </div>
+
+  <h2>{{ labels.certifications_heading }}</h2>
+  {% for cert in certifications %}
+  <div class="cert-item">
+    <span class="cert-name">{{ cert.name }}</span>
+    <span class="cert-detail"> &mdash; {{ cert.issuer }}{% if cert.score %}, {{ cert.score }}{% endif %}</span>
+  </div>
+  {% endfor %}
+
+  <h2>{{ labels.languages_heading }}</h2>
+  <p class="lang-line">
+    {% for lang in languages %}{{ lang.name }} ({{ lang.level }}){% if not loop.last %}, {% endif %}{% endfor %}
+  </p>
+
+  <h2>{{ labels.interests_heading }}</h2>
+  <p class="interests-line">{{ interests | join(", ") }}</p>
+
+</div>
+</body>
+</html>

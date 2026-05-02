@@ -39,6 +39,8 @@ work_permit:
   de: "B-Bewilligung"
   en: "B permit"
   it: "Permesso B"
+github: "github.com/yourhandle"
+github_handle: "yourhandle"
 ```
 
 ## Work Experience
@@ -47,7 +49,12 @@ work_permit:
 company: "Your Company AG"
 company_anonymous: "a mid-size technology company"
 company_location: "Zurich, Switzerland"
-role: "Your Job Title"
+role: "Your Functional Role"          # what you actually do day-to-day
+role_official: ""                      # optional: contract title if different (e.g., for parenthetical disclosure on CV). Leave empty to render only `role`.
+role_official_label_localized:         # optional: localized prefix label. If you omit this field entirely, built-in defaults are used (DE/EN/IT supported via Experience.official_label).
+  de: "Vertraglicher Titel"
+  en: "Official Title"
+  it: "Titolo contrattuale"
 role_start: "January 2022"
 role_period: "~3 years"
 
@@ -213,6 +220,19 @@ achievement_keywords:
   0: ["keyword1", "keyword2"]
 ```
 
+## Technical Projects
+
+```yaml
+projects:
+  - name: "My Project"
+    name_localized:
+      de: "Mein Projekt"
+      en: "My Project"
+      it: "Il mio progetto"
+    tech: "Python, SQL, Power BI"
+    url: "github.com/yourhandle/your-project"
+```
+
 ## Target Roles
 
 ```yaml
@@ -248,6 +268,7 @@ labels:
     courses: "Kurse"
     achievements_heading: "Schlüsselerfolge"
     interests_heading: "Interessen"
+    projects_heading: "Technische Projekte"
   en:
     personal_info: "Personal Info"
     date_of_birth: "Date of Birth"
@@ -268,6 +289,7 @@ labels:
     courses: "Courses"
     achievements_heading: "Key Achievements"
     interests_heading: "Interests"
+    projects_heading: "Technical Projects"
   it:
     personal_info: "Dati Personali"
     date_of_birth: "Data di nascita"
@@ -288,6 +310,7 @@ labels:
     courses: "Corsi"
     achievements_heading: "Risultati Chiave"
     interests_heading: "Interessi"
+    projects_heading: "Progetti Tecnici"
 ```
 
 ## Privacy Rules

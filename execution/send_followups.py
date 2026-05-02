@@ -9,7 +9,7 @@ Timing: --days counts BUSINESS DAYS (Mon-Fri only), not calendar days.
 Example: Applied on Friday → 3 business days = Wednesday (skips Sat+Sun).
 
 Status guard: If status changes away from "Applied" (e.g. to "Interviewing",
-"Rejected") during the waiting window, the follow-up is NOT sent.
+"Rejected", "Expired", "Duplicate") during the waiting window, the follow-up is NOT sent.
 
 Input:  Google Sheet (reads Status, Date_Applied, Contact_Email, etc.)
 Output: Emails sent via Gmail + sheet updated (Follow_Up_Sent, Follow_Up_Date)
@@ -46,6 +46,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -417,6 +418,7 @@ def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dic
 
         eligible.append({
             "row_idx": row_idx,
+            "job_id": _safe_cell(row, "Job_ID"),  # Used as stable checkpoint key
             "title": _safe_cell(row, "Title"),
             "company": _safe_cell(row, "Company"),
             "location": _safe_cell(row, "Location"),
@@ -457,29 +459,34 @@ def _parse_email_response(raw: str, job: dict) -> dict | None:
     return None
 
 
-def generate_followup_email(job: dict, openrouter_key, gemini_key, company_cache: dict) -> dict:
+def generate_followup_email(job: dict, openrouter_key, gemini_key, company_cache: dict, researched_companies: dict) -> dict:
     """Generate a follow-up email using LLM. Retries once on failure. [H3][H7]"""
     language = detect_language(job["title"], job["description"])
 
     # [C2][H2] Get company context from cache with proper format + key handling
     company_context = _get_company_context(job["company"], company_cache)
 
-    # [M8] On-demand company research if not in cache
+    # [M4][M8] On-demand company research if not in cache — deduplicated per company
     if not company_context and job["company"]:
-        try:
-            from execution.web_search import research_company
-            result = research_company(
-                company_name=job["company"],
-                location=job.get("location", "Switzerland"),
-                job_description=job.get("description", ""),
-                job_url="",
-            )
-            if result and isinstance(result, dict):
-                company_context = result.get("description", "")
-                if company_context:
-                    log.info(f"  On-demand company research: found context for '{job['company']}'")
-        except Exception as e:
-            log.warning(f"  On-demand company research failed for '{job['company']}': {e}")
+        company_key = job["company"].strip().lower()
+        if company_key in researched_companies:
+            company_context = researched_companies[company_key]
+        else:
+            try:
+                from execution.web_search import research_company
+                result = research_company(
+                    company_name=job["company"],
+                    location=job.get("location", "Switzerland"),
+                    job_description=job.get("description", ""),
+                    job_url="",
+                )
+                if result and isinstance(result, dict):
+                    company_context = result.get("description", "")
+                    if company_context:
+                        log.info(f"  On-demand company research: found context for '{job['company']}'")
+            except Exception as e:
+                log.warning(f"  On-demand company research failed for '{job['company']}': {e}")
+            researched_companies[company_key] = company_context  # cache even if empty
 
     # Language-aware fallback when no contact person is known
     if job["contact_person"]:
@@ -591,12 +598,16 @@ def main():
     # Load company cache
     company_cache = _load_company_cache()
 
+    # [M4] Pre-cache company research per unique company to avoid redundant API calls
+    researched_companies: dict[str, str] = {}
+
     # Process each eligible job
     sent_count = 0
     skipped_checkpoint = 0
     for i, job in enumerate(eligible):
-        # [H4] Skip if already sent (crash-safe checkpoint)
-        checkpoint_key = (job["row_idx"], job["contact_email"])
+        # [H1] Use job_id (stable) as checkpoint key — not row_idx (shifts on row insert/delete)
+        job_id = job.get("job_id") or f"row_{job['row_idx']}"
+        checkpoint_key = (job_id, job["contact_email"])
         if checkpoint_key in sent_checkpoint:
             skipped_checkpoint += 1
             continue
@@ -607,7 +618,7 @@ def main():
 
         # Generate follow-up email
         try:
-            email = generate_followup_email(job, openrouter_key, gemini_key, company_cache)
+            email = generate_followup_email(job, openrouter_key, gemini_key, company_cache, researched_companies)
         except Exception as e:
             log.error(f"  Failed to generate email: {e}")
             continue
@@ -622,7 +633,7 @@ def main():
             try:
                 # STATUS RE-CHECK: Re-read the row right before sending to confirm
                 # status is still "Applied". If user changed it during the wait window
-                # (e.g. to "Interviewing", "Rejected"), do NOT send the follow-up.
+                # (e.g. to "Interviewing", "Rejected", "Expired", "Duplicate"), do NOT send the follow-up.
                 current_row = worksheet.row_values(job["row_idx"])
                 current_status = current_row[_col("Status")].strip() if _col("Status") < len(current_row) else ""
                 if current_status.lower() != "applied":
@@ -638,19 +649,27 @@ def main():
                 log.info(f"  Sheet marked: Follow_Up_Sent=Yes, Follow_Up_Date={today}")
 
                 # Now send the email (sheet already marked, so no duplicate on rerun)
-                send_gmail(gmail_service, job["contact_email"], email["subject"], email["body"])
-                log.info(f"  SENT to {job['contact_email']}")
-                sent_count += 1
+                try:
+                    send_gmail(gmail_service, job["contact_email"], email["subject"], email["body"])
+                    log.info(f"  SENT to {job['contact_email']}")
+                    sent_count += 1
 
-                # [H4] Save checkpoint after successful send
-                sent_checkpoint.add(checkpoint_key)
-                _save_followup_checkpoint(sent_checkpoint)
+                    # [H4] Save checkpoint after successful send
+                    sent_checkpoint.add(checkpoint_key)
+                    _save_followup_checkpoint(sent_checkpoint)
+
+                except HttpError as e:
+                    if e.resp.status == 429:
+                        log.error(f"  Gmail quota exceeded — stopping follow-up loop. Resume later.")
+                        break  # Stop the loop cleanly; sheet is marked but email not sent
+                    else:
+                        log.error(f"  Gmail API error (status {e.resp.status}): {e}")
+                        # Sheet is marked "Yes" but email failed — log clearly for manual review
+                        log.warning(f"  MANUAL ACTION NEEDED: '{job['title']}' at {job['company']} marked as sent but email failed. Check and resend manually.")
 
             except Exception as e:
-                log.error(f"  Failed: {e}")
-                # If sheet update succeeded but email failed, the sheet shows "Yes" but
-                # email wasn't sent. This is the safer failure mode (prevents duplicates).
-                # User can manually check and resend if needed.
+                log.error(f"  Failed (sheet update or status re-check): {e}")
+                # Email was NOT sent (failure occurred before send_gmail call)
         else:
             log.info("  [DRY RUN] Email NOT sent")
 

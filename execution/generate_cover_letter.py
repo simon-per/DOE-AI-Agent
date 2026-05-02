@@ -57,11 +57,21 @@ DEFAULT_MIN_SCORE = 6
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared
 from execution.language_detect import detect_language
-from execution.utils import sanitize_filename, strip_legal_suffixes, clean_job_title, generate_job_id
+from execution.utils import (
+    sanitize_filename,
+    strip_legal_suffixes,
+    clean_job_title,
+    generate_job_id,
+    enforce_revops_subtitle,
+    find_application_folder,
+    has_cover_letter_outputs,
+)
 
 # Profile loaded from ABOUTME.md (single source of truth)
 from execution.profile_loader import load_profile as _load_profile
 
+# Calibration: Qwen3 undershoots ~40-50 words in German. Prompt target 260-300 yields actual ~220-260 output.
+# Do NOT put this note inside the prompt — the model uses it as permission to write shorter.
 COVER_LETTER_PROMPT = """You are writing a professional cover letter for a Swiss job application.
 
 CANDIDATE PROFILE:
@@ -89,14 +99,14 @@ Mein technisches Profil stütze ich durch den Google Data Analytics Professional
 
 Für ein persönliches Gespräch stehe ich gerne zur Verfügung — meine Kündigungsfrist beträgt 45 Tage.\"
 
-(The style example above is ~150 words for brevity — your output must be 210-250 words, i.e. notably longer than the example.)
+(The style example above is ~150 words for brevity — your output must be 260-300 words, i.e. notably longer than the example.)
 
 ANTI-HALLUCINATION RULES (CRITICAL — violations cause interview failures):
 - You may ONLY use numbers and metrics that appear in the CANDIDATE PROFILE above.
 - METRIC SELECTION (MANDATORY — use EXACTLY 3 or 4, NEVER all 6):
   The candidate has 7 quantitative achievements. You MUST pick exactly 3 or 4 that are MOST relevant to THIS specific job. Leave the rest out entirely — do NOT mention them even without numbers.
   Available metrics:
-  A) 230,000+ CRM records managed
+  A) 400,000+ CRM records managed
   B) 1,000+ bulk data uploads executed
   C) 20% data integrity improvement
   D) 100+ CPQ product attributes configured
@@ -123,14 +133,14 @@ BANNED AI-GIVEAWAY WORDS (never use — recruiters use these to detect AI):
 
 INSTRUCTIONS:
 - Write in {language_name} ({language_code}). If not German, adapt the style example's directness to that language.
-- Length: 230-270 words. This is the ideal range — letters under 210 words appear too brief and reduce callbacks. Do NOT write less than 230 words. Count carefully.
+- Length: 260-300 words. This is the ideal range — letters under 220 words appear too brief and reduce callbacks. Do NOT write less than 260 words. Count carefully.
   When using fewer metrics (3-4), use the freed space for deeper qualitative descriptions — explain HOW you did things, not just WHAT. This keeps the letter substantive.
-  (Calibration note: Qwen3 undershoots ~20 words in German. Prompt target 230-270 yields actual 210-250 output.)
 - Tone: Direct, Swiss-professional, modest but confident. NOT aggressive American self-promotion. Every claim backed by a specific number from the profile or a tool name.
-- CRITICAL - Sentence length variation (prevents AI detection):
-  You MUST alternate between short (5-10 words) and long (20-30 words) sentences. After every long sentence, write a short one. After 2 medium sentences, write a very short one (3-6 words).
-  GOOD: "Daten treiben den Vertrieb. In meiner Rolle habe ich ueber 230.000 CRM-Datensaetze verwaltet und die Integritaet um 20 Prozent gesteigert — eine Grundlage fuer automatisierte Kampagnensteuerung. Das Ergebnis zaehlte. Durch gezielte Segmentierung und automatisierte E-Mail-Journeys konnte ich Vertriebsprozesse beschleunigen, die vorher manuell liefen."
+- Sentence length variation (prevents AI detection):
+  Mix short (5-12 words) and longer (18-30 words) sentences naturally. Avoid uniform sentence length.
+  GOOD: "Daten treiben den Vertrieb. In meiner Rolle habe ich ueber 400.000 CRM-Datensaetze verwaltet und die Integritaet um 20 Prozent gesteigert — eine Grundlage fuer automatisierte Kampagnensteuerung. Durch gezielte Segmentierung und automatisierte E-Mail-Journeys konnte ich Vertriebsprozesse beschleunigen, die vorher manuell liefen."
   BAD: "Ich habe CRM-Datensaetze verwaltet. Ich habe Massenuploads durchgefuehrt. Ich habe die Datenqualitaet verbessert." (all same length = AI-detected)
+  NEVER insert meta-commentary about writing style (e.g. "Short sentences work.", "Clarity matters."). Every sentence must be substantive content.
 - Structure (Problem-Solution format — highest conversion rate):
   1. OPENING (2-3 sentences, ~60 words): Identify a specific challenge or goal the company faces (from COMPANY CONTEXT or JOB DESCRIPTION), then connect YOUR experience as the solution. Show you researched them.
   2. BODY (4-5 sentences, ~140 words): Your 2-3 strongest concrete examples with REAL numbers from your profile that match THIS job. Mirror exact terminology from the job description (e.g. "Kundenstammdatenpflege" not "CRM data management", "Offertenwesen" not "quotation management").
@@ -143,7 +153,16 @@ INSTRUCTIONS:
 - Swiss German sign-off uses "Freundliche Grüsse" (NOT "Mit freundlichen Grüssen")
 
 CRITICAL: Return ONLY valid JSON:
-{{"text": "The cover letter text (paragraphs separated by \\n\\n)", "subtitle": "Short Professional Title (3-5 words)"}}"""
+{{"text": "The cover letter text (paragraphs separated by \\n\\n)", "subtitle": "Revenue Operations Specialist | <3-5 skill keywords matching this job's stack>"}}
+
+SUBTITLE RULES (must follow exactly):
+- Format: "Revenue Operations Specialist | <suffix>"
+- The prefix "Revenue Operations Specialist" is fixed — no translation, no synonyms (NOT "Spezialist", NOT "Sales Operations Specialist", NOT the literal job title).
+- The suffix is 3-5 short skill keywords from THIS job's tech stack.
+- Use ONLY " • " (bullet with surrounding spaces) as the separator between keywords.
+- Each keyword is ONE concept. NEVER join two distinct tools with a space (e.g. "SAP CPQ" is WRONG because SAP and CPQ are two different products in this profile — write "SAP • CPQ" or "SAP S/4HANA • CPQ" instead). The same applies to any other pair like "Power BI Excel" or "Dynamics SAP".
+- Prefer generic category names (CRM, BI, CPQ, Automation, Analytics) for visual cleanness. EXCEPTION: keep specific product names when they are recognized industry-standard keywords that ATS systems explicitly filter for — specifically "Power BI", "Excel", "SAP", "Salesforce", "Dynamics". For this candidate, "Power BI" should always be written in full (not "BI") because it is a Microsoft-certified credential and a high-ROI brand keyword.
+- Examples: "CRM • Power BI • Automation", "CRM • Power BI • CPQ • Automation", "SAP S/4HANA • CPQ • Process Design", "Dynamics 365 • Power BI • SQL"."""
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +491,7 @@ def _clean_title_for_subject(title: str) -> str:
 class CoverLetterPDF(FPDF):
     """Custom PDF with professional cover letter layout."""
 
-    def __init__(self, language_code: str = "de", subtitle: str = "Digital Sales Specialist | CRM | SAP | Power BI"):
+    def __init__(self, language_code: str = "de", subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI"):
         super().__init__()
         self.language_code = language_code
         self.subtitle = subtitle
@@ -549,7 +568,32 @@ def _greeting_for_contact(contact_name: str | None, language_code: str) -> str:
     return greeting.get(language_code, greeting["de"])
 
 
-def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Digital Sales Specialist | CRM | SAP | Power BI") -> Path:
+def _strip_trailing_signoff(text: str) -> str:
+    """Remove trailing sign-off and candidate name from body text.
+
+    The LLM sometimes includes sign-off despite prompt instructions not to.
+    Since generate_pdf/generate_docx append their own sign-off, duplicates occur.
+    """
+    signoff_phrases = [
+        "freundliche grüsse", "freundliche grüsse,", "freundliche gruesse",
+        "kind regards", "kind regards,", "best regards", "best regards,",
+        "cordiali saluti", "cordiali saluti,",
+        "mit freundlichen grüssen", "mit freundlichen grüssen,",
+    ]
+    candidate_name = _load_profile().personal.name.lower()
+
+    lines = text.rstrip().split("\n")
+    # Walk backwards and strip sign-off lines + candidate name + empty lines
+    while lines:
+        last = lines[-1].strip().lower()
+        if not last or last in signoff_phrases or last == candidate_name:
+            lines.pop()
+        else:
+            break
+    return "\n".join(lines)
+
+
+def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None) -> Path:
     """Generate a professional cover letter PDF."""
     pdf = CoverLetterPDF(language_code, subtitle=subtitle)
     pdf.set_auto_page_break(auto=True, margin=20)
@@ -557,7 +601,7 @@ def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, co
 
     # Date
     pdf.set_font("Arial", "", 10)
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = datetime.strptime(letter_date, "%Y-%m-%d").strftime("%d.%m.%Y") if letter_date else datetime.now().strftime("%d.%m.%Y")
     pdf.cell(0, 6, today, align="R", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
@@ -589,8 +633,9 @@ def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, co
     pdf.cell(0, 6, greeting, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
-    # Body text
+    # Body text (strip any LLM-generated sign-off to avoid duplicates)
     pdf.set_font("Arial", "", 10)
+    text = _strip_trailing_signoff(text)
     paragraphs = text.strip().split("\n\n")
     for paragraph in paragraphs:
         # Clean up any single newlines within a paragraph
@@ -617,7 +662,7 @@ def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, co
     return output_path
 
 
-def generate_docx(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Digital Sales Specialist | CRM | SAP | Power BI") -> Path:
+def generate_docx(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None) -> Path:
     """Generate a professional cover letter DOCX (editable Word document)."""
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -671,7 +716,7 @@ def generate_docx(text: str, job: dict, language_code: str, output_path: Path, c
     pPr.append(pBdr)
 
     # Date (right-aligned)
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = datetime.strptime(letter_date, "%Y-%m-%d").strftime("%d.%m.%Y") if letter_date else datetime.now().strftime("%d.%m.%Y")
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run(today)
@@ -713,7 +758,8 @@ def generate_docx(text: str, job: dict, language_code: str, output_path: Path, c
     run.font.size = Pt(10)
     p.space_after = Pt(4)
 
-    # Body paragraphs
+    # Body paragraphs (strip any LLM-generated sign-off to avoid duplicates)
+    text = _strip_trailing_signoff(text)
     paragraphs = text.strip().split("\n\n")
     for paragraph in paragraphs:
         paragraph = paragraph.replace("\n", " ").strip()
@@ -757,6 +803,9 @@ SAFE_YEAR_PATTERN = re.compile(r'^20[12]\d$')  # 2016-2029
 # Percentages: only these base numbers may appear with "%" (from profile metrics)
 # e.g. "20" is allowed as "20%" because profile has "20% data integrity improvement"
 _ALLOWED_PERCENTAGES = {"20"}
+# Product version numbers — always safe regardless of candidate profile
+# (e.g. "Dynamics 365", "Office 365", "SAP 2021", "Power Platform 2024")
+_SAFE_PRODUCT_NUMBERS = {"365", "360", "2016", "2019", "2021", "2023", "2024", "2025"}
 
 AI_GIVEAWAY_WORDS = {
     "en": [
@@ -789,6 +838,9 @@ def _validate_no_hallucinated_metrics(text: str, extra_context: str = "") -> lis
             if '%' in num:
                 context_percentages.add(clean_ctx)
                 context_percentages.add(num.rstrip('%+'))
+                # Also add to context_numbers — handles format mismatches where the LLM
+                # echoes a company context percentage but strips/adds formatting variants
+                context_numbers.add(clean_ctx)
             else:
                 context_numbers.add(clean_ctx)
                 context_numbers.add(num.rstrip('%+'))
@@ -818,8 +870,37 @@ def _validate_no_hallucinated_metrics(text: str, extra_context: str = "") -> lis
             continue
         if clean in context_numbers or num.rstrip('%+') in context_numbers:
             continue
+        if clean in _SAFE_PRODUCT_NUMBERS:
+            continue
         violations.append(num)
     return violations
+
+
+def _filter_meta_commentary(text: str) -> tuple[str, list[str]]:
+    """Remove meta-writing commentary that LLMs insert to manipulate burstiness scores.
+
+    Examples: "Short sentences work.", "Clarity matters.", "Less is more.",
+    "Results speak.", "Numbers tell the story."
+    These are writing-advice artifacts, not cover letter content.
+    """
+    # Match very short standalone sentences (2-5 words) that read as style commentary
+    # rather than substantive claims. Only remove if they don't contain numbers or
+    # domain-specific terms (those are likely real content).
+    meta_patterns = [
+        r'(?<=[.!?])\s+(?:Short sentences work|Clarity matters|Less is more|Results speak|'
+        r'Numbers tell the story|That matters|This counts|Details matter|Precision counts|'
+        r'Quality matters|Impact matters|Data speaks|Facts matter|Actions count|'
+        r'Kurze Sätze wirken|Klarheit zählt|Das zählt|Qualität zählt|Fakten sprechen'
+        r')\.?',
+    ]
+    found = []
+    for pat in meta_patterns:
+        matches = re.findall(pat, text, re.IGNORECASE)
+        if matches:
+            found.extend(m.strip() for m in matches)
+            text = re.sub(pat, '', text, flags=re.IGNORECASE)
+    text = re.sub(r'  +', ' ', text).strip()
+    return text, found
 
 
 def _filter_ai_giveaway_words(text: str, lang_code: str) -> tuple[str, list[str]]:
@@ -929,6 +1010,27 @@ def _validate_keyword_coverage(text: str, key_matches: list[str]) -> tuple[float
     return coverage, missing
 
 
+_FOREIGN_SCRIPT_RE = re.compile(
+    r'[\u4e00-\u9fff'   # CJK Unified Ideographs (Chinese/Japanese/Korean)
+    r'\u3040-\u30ff'    # Hiragana + Katakana
+    r'\u0600-\u06ff'    # Arabic
+    r'\u0590-\u05ff'    # Hebrew
+    r'\u0900-\u097f'    # Devanagari
+    r'\uff00-\uffef]'   # Fullwidth / Halfwidth forms
+)
+
+
+def _validate_no_foreign_script(text: str) -> bool:
+    """Return True if clean, False if non-Latin script detected (corruption signal)."""
+    match = _FOREIGN_SCRIPT_RE.search(text)
+    if match:
+        # Log the surrounding context for debugging
+        start = max(0, match.start() - 20)
+        end = min(len(text), match.end() + 20)
+        log.warning(f"  Non-Latin characters detected: ...{text[start:end]}...")
+    return not bool(match)
+
+
 def _validate_company_mention(text: str, company: str) -> bool:
     """Check that the company is mentioned in the cover letter body."""
     if not company:
@@ -1034,6 +1136,7 @@ def generate_cover_letter_for_job(
     openrouter_key: str | None,
     gemini_key: str | None,
     job: dict,
+    letter_date: str | None = None,
 ) -> dict:
     """Generate a cover letter for a single job. Returns result dict."""
     title = job.get("title", "Unknown")
@@ -1084,14 +1187,52 @@ def generate_cover_letter_for_job(
         language_code=lang_code,
     )
 
+    # Inject contextually relevant project hint (soft — LLM includes only if it fits naturally)
+    profile_obj = _load_profile()
+    relevant_projs = profile_obj.relevant_projects(key_matches, lang_code, top_n=1)
+    if relevant_projs:
+        p = relevant_projs[0]
+        if lang_code == "de":
+            proj_instruction = (
+                f"Mein Projekt '{p['name']}' ({p['url']}) zeigt, wie ich [relevante Fähigkeit] in der Praxis anwende."
+            )
+            project_hint = (
+                f"\n\nRELEVANT PROJECT (nur erwähnen, wenn es natürlich in den Fliesstext passt — NICHT als separaten Absatz!):\n"
+                f"Name: {p['name']}\nTechnologien: {p['tech']}\nURL: {p['url']}\n"
+                f"Beschreibung: {p['description']}\n"
+                f"Beispielsatz: \"{proj_instruction}\"\n"
+                f"Nur einflechten, wenn es einen konkreten Anspruch stärkt. "
+                f"Kürze dabei keine anderen Absätze, um die Projekterwähnung unterzubringen."
+            )
+        elif lang_code == "it":
+            project_hint = (
+                f"\n\nPROGETTO RILEVANTE (menzionare solo se si integra naturalmente — NON come paragrafo separato!):\n"
+                f"Nome: {p['name']}\nTecnologie: {p['tech']}\nURL: {p['url']}\n"
+                f"Descrizione: {p['description']}\n"
+                f"Solo se rafforza un'affermazione specifica. "
+                f"Non accorciare gli altri paragrafi per inserire la menzione del progetto."
+            )
+        else:  # en
+            project_hint = (
+                f"\n\nRELEVANT PROJECT (mention only if it fits naturally — do NOT add as a separate paragraph):\n"
+                f"Name: {p['name']}\nTech: {p['tech']}\nURL: {p['url']}\n"
+                f"Description: {p['description']}\n"
+                f"Example: \"My project '{p['name']}' ({p['url']}) demonstrates [specific skill] in practice.\"\n"
+                f"Only include if it strengthens a specific claim. "
+                f"Do not shorten other paragraphs to accommodate the project mention."
+            )
+        prompt += project_hint
+        log.info(f"  Project hint injected: {p['name']} ({p['url']})")
+
     # --------------- LLM generation with quality gate retry loop ---------------
     # Try up to 3 times, bumping temperature on failure to get varied output.
     # Track best attempt (fewest quality issues) as fallback.
     MAX_QUALITY_ATTEMPTS = 3
     best_text = None
-    best_subtitle = "Digital Sales Specialist | CRM | SAP | Power BI"
+    best_subtitle = enforce_revops_subtitle(None)
     best_quality = None  # dict tracking quality metrics
     best_score = -1  # higher = better
+    retry_extra = ""  # extra instruction injected on low-word-count retries
 
     for quality_attempt in range(MAX_QUALITY_ATTEMPTS):
         temperature = 0.3 + (quality_attempt * 0.1)  # 0.3, 0.4, 0.5
@@ -1099,21 +1240,25 @@ def generate_cover_letter_for_job(
         if quality_attempt > 0:
             log.warning(f"  Quality retry {quality_attempt + 1}/{MAX_QUALITY_ATTEMPTS} (temperature={temperature:.1f})")
 
-        # Call LLM
-        raw_response, provider = _call_llm(openrouter_key, gemini_key, prompt, temperature=temperature)
+        # Call LLM (retry_extra appended when previous attempt was too short)
+        raw_response, provider = _call_llm(openrouter_key, gemini_key, prompt + retry_extra, temperature=temperature)
         if quality_attempt == 0:
             log.info(f"  Provider: {provider} ({'anonymized' if provider == 'openrouter' else 'full profile'})")
 
         # Parse JSON response (with fallback for plain text)
-        subtitle = "Digital Sales Specialist | CRM | SAP | Power BI"
+        subtitle = enforce_revops_subtitle(None)
         cleaned = re.sub(r'^```(?:json)?\s*', '', raw_response.strip(), flags=re.MULTILINE)
         cleaned = re.sub(r'```\s*$', '', cleaned.strip(), flags=re.MULTILINE)
         text = cleaned
         try:
             result = json.loads(cleaned)
             text = result.get("text", cleaned)
-            subtitle = result.get("subtitle", subtitle)
-            log.info(f"  Subtitle: {subtitle}")
+            raw_subtitle = result.get("subtitle")
+            subtitle = enforce_revops_subtitle(raw_subtitle)
+            if raw_subtitle and raw_subtitle != subtitle:
+                log.info(f"  Subtitle normalized: {raw_subtitle!r} → {subtitle!r}")
+            else:
+                log.info(f"  Subtitle: {subtitle}")
         except (json.JSONDecodeError, KeyError):
             log.warning("  LLM returned plain text instead of JSON, using as-is")
 
@@ -1128,17 +1273,21 @@ def generate_cover_letter_for_job(
         text, ai_words_found = _filter_ai_giveaway_words(text, lang_code)
         if ai_words_found:
             log.info(f"  Removed AI giveaway words: {ai_words_found}")
-        # [H5] Always run grammar fix — LLM output can have errors independent of word removal (~100 tokens)
+        text, meta_found = _filter_meta_commentary(text)
+        if meta_found:
+            log.info(f"  Removed meta-commentary: {meta_found}")
         text = _fix_grammar_after_removal(text, openrouter_key, gemini_key)
 
         word_count = _validate_word_count(text)
         burstiness = _check_sentence_burstiness(text)
         keyword_coverage, missing_keywords = _validate_keyword_coverage(text, key_matches)
         company_mentioned = _validate_company_mention(text, company)
+        script_clean = _validate_no_foreign_script(text)
 
         # Track quality metrics
         quality = {
             "hallucinations": violations,
+            "script_clean": script_clean,
             "word_count": word_count,
             "burstiness": burstiness,
             "keyword_coverage": keyword_coverage,
@@ -1149,7 +1298,7 @@ def generate_cover_letter_for_job(
 
         # Score: higher = better (max 5). Critical = 0 pts, soft = partial credit.
         score = 0
-        score += 3 if not violations else 0              # hallucination = most critical
+        score += 3 if (not violations and script_clean) else 0  # hallucination/corruption = most critical
         if 200 <= word_count <= 260:
             score += 1                                   # ideal word count range
         elif 190 <= word_count <= 300:
@@ -1170,7 +1319,7 @@ def generate_cover_letter_for_job(
         # - Severely off word count (< 190 or > 300)
         # - Very low burstiness (< 3, obviously AI)
         # - Company name not mentioned (Swiss recruiters expect it)
-        critical_pass = not violations and 190 <= word_count <= 300 and burstiness >= 3 and company_mentioned
+        critical_pass = not violations and script_clean and 190 <= word_count <= 300 and burstiness >= 3 and company_mentioned
         if critical_pass:
             break
 
@@ -1178,6 +1327,8 @@ def generate_cover_letter_for_job(
             issues = []
             if violations:
                 issues.append(f"hallucinations: {violations}")
+            if not script_clean:
+                issues.append("non-Latin script detected")
             if word_count < 190 or word_count > 300:
                 issues.append(f"word count: {word_count}")
             if burstiness < 3:
@@ -1185,6 +1336,30 @@ def generate_cover_letter_for_job(
             if not company_mentioned:
                 issues.append(f"company '{company}' not mentioned")
             log.warning(f"  Critical quality issues: {', '.join(issues)} — regenerating...")
+
+            # Retry injections: targeted corrections for each failure mode
+            if not script_clean:
+                retry_extra += (
+                    "\n\nCRITICAL: Your previous response contained non-Latin characters (e.g. Chinese, Arabic). "
+                    "Write ONLY using standard Latin characters. No special scripts."
+                )
+            if not company_mentioned:
+                retry_extra += (
+                    f"\n\nCRITICAL: You MUST mention '{company}' by name in the letter body — this is mandatory. "
+                    f"Weave it naturally into your opening or body paragraph (e.g. 'Bei {company} sehe ich...' "
+                    f"or 'Die Position bei {company} bietet...'). Do not omit the company name."
+                )
+                log.warning(f"  Adding company name injection for next attempt: {company}")
+
+            # Floor injection: if word count too low, remind LLM on next attempt
+            if word_count < 210:
+                retry_extra = (
+                    f"\n\nCRITICAL CORRECTION: Your previous attempt was only {word_count} words — far too short. "
+                    f"You MUST write at least 260 words. Expand each body paragraph with one additional specific detail "
+                    f"(HOW you did it, what tool you used, what the result was). Do not skip this."
+                )
+                log.warning(f"  Adding word count floor injection for next attempt ({word_count} words was too short)")
+
             time.sleep(1.0)  # brief pause before retry
 
     # Use the best attempt
@@ -1195,20 +1370,28 @@ def generate_cover_letter_for_job(
     if best_score < 5:
         log.warning(f"  QUALITY WARNING: Best attempt scored {best_score}/5 after {quality_attempt + 1} tries — review before sending!")
 
+    # Log whether the project link made it into the final text (soft check)
+    if relevant_projs:
+        proj_url = relevant_projs[0]["url"]
+        if proj_url in (best_text or ""):
+            log.info(f"  [OK] Project link included in cover letter: {proj_url}")
+        else:
+            log.info(f"  [INFO] Project link not included (LLM chose not to): {proj_url}")
+
     # Generate PDF
     job_id = _get_job_id(job)
     safe_company = sanitize_filename(company) if company else "Unknown"
     safe_title = sanitize_filename(clean_job_title(title)) if title else "Unknown"
     folder_name = f"{job_id}_{safe_company}_{safe_title}"
     safe_name = sanitize_filename(_load_profile().personal.name)
-    output_path = OUTPUT_DIR / folder_name / f"Cover_Letter_{safe_name}_{safe_company}.pdf"
+    output_path = OUTPUT_DIR / folder_name / f"Cover_Letter_{safe_name}.pdf"
 
-    pdf_path = generate_pdf(text, job, lang_code, output_path, contact_name=contact_name, subtitle=subtitle)
+    pdf_path = generate_pdf(text, job, lang_code, output_path, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date)
     log.info(f"  PDF saved: {pdf_path}")
 
     # Generate DOCX (editable version)
     docx_output = output_path.with_suffix(".docx")
-    docx_path = generate_docx(text, job, lang_code, docx_output, contact_name=contact_name, subtitle=subtitle)
+    docx_path = generate_docx(text, job, lang_code, docx_output, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date)
     log.info(f"  DOCX saved: {docx_path}")
 
     return {
@@ -1233,11 +1416,106 @@ def generate_cover_letter_for_job(
     }
 
 
+def _load_ready_to_apply_from_sheet(sheet_name: str = "Swiss Job Search Pipeline") -> list[dict]:
+    """Read rows with Status=Ready_to_Apply from the Google Sheet.
+
+    Returns job dicts compatible with generate_cover_letter_for_job().
+    Tries to enrich description from scored_jobs.json on volume (full text);
+    falls back to the truncated sheet description if not found.
+    """
+    from execution.write_jobs_to_sheet import authenticate, _sheets_api_call
+
+    client = authenticate()
+    try:
+        ws = _sheets_api_call(client.open, sheet_name).sheet1
+    except Exception as e:
+        log.error(f"[sheet-triggered] Cannot open sheet '{sheet_name}': {e}")
+        return []
+
+    rows = _sheets_api_call(ws.get_all_values)
+    if not rows or len(rows) < 2:
+        return []
+
+    header = [h.strip() for h in rows[0]]
+
+    def col(name: str) -> int | None:
+        try:
+            return header.index(name)
+        except ValueError:
+            return None
+
+    ci = {name: col(name) for name in (
+        "Job_ID", "Title", "Company", "Location", "Source",
+        "Score", "Key Matches", "Key Gaps", "Description", "URL",
+        "Date Posted", "Status", "Reasoning",
+    )}
+
+    # Load scored_jobs.json for full descriptions (best-effort)
+    scored_by_id: dict[str, dict] = {}
+    if INPUT_FILE.exists():
+        try:
+            with open(INPUT_FILE, "r", encoding="utf-8") as f:
+                for j in json.load(f):
+                    scored_by_id[_get_job_id(j)] = j
+        except Exception:
+            pass
+
+    def cell(row: list, name: str) -> str:
+        idx = ci.get(name)
+        return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+    jobs = []
+    for row in rows[1:]:
+        status = cell(row, "Status").lower()
+        if status != "ready_to_apply":
+            continue
+
+        job_id = cell(row, "Job_ID")
+        url    = cell(row, "URL")
+        title  = cell(row, "Title")
+        company = cell(row, "Company")
+
+        # Prefer full description from scored_jobs.json
+        if job_id and job_id in scored_by_id:
+            base = scored_by_id[job_id]
+            description = base.get("description", cell(row, "Description"))
+        else:
+            description = cell(row, "Description")
+
+        try:
+            score = int(cell(row, "Score"))
+        except ValueError:
+            score = 0
+
+        jobs.append({
+            "job_id": job_id,
+            "title": title,
+            "company": company,
+            "location": cell(row, "Location"),
+            "source": cell(row, "Source"),
+            "url": url,
+            "description": description,
+            "score": score,
+            "key_matches": [k.strip() for k in cell(row, "Key Matches").split(",") if k.strip()],
+            "key_gaps": [k.strip() for k in cell(row, "Key Gaps").split(",") if k.strip()],
+            "reasoning": cell(row, "Reasoning"),
+            "date_posted": cell(row, "Date Posted"),
+        })
+
+    log.info(f"[sheet-triggered] Found {len(jobs)} Ready_to_Apply rows in '{sheet_name}'")
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate cover letters for scored jobs")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of cover letters (0 = all)")
     parser.add_argument("--min-score", type=int, default=DEFAULT_MIN_SCORE, help="Minimum score threshold (default: 6)")
     parser.add_argument("--reset-checkpoint", action="store_true", help="Clear checkpoint and re-generate all")
+    parser.add_argument("--letter-date", type=str, default=None, help="Override letter date (YYYY-MM-DD format, e.g. 2026-04-01)")
+    parser.add_argument("--job-id", type=str, default=None, help="Generate only for a specific job_id (e.g. J-ab2e15)")
+    parser.add_argument("--sheet-triggered", action="store_true",
+                        help="Read Ready_to_Apply rows from Sheet instead of scored_jobs.json. "
+                             "Updates Status → APPLYING after generation.")
     args = parser.parse_args()
 
     openrouter_key = os.getenv("OPEN_ROUTER_API_KEY")
@@ -1247,11 +1525,6 @@ def main():
         log.error("No API keys found. Set OPEN_ROUTER_API_KEY or GOOGLE_AI_STUDIO_API_KEY in .env")
         sys.exit(1)
 
-    if not INPUT_FILE.exists():
-        log.error(f"Input file not found: {INPUT_FILE}")
-        log.error("Run execution/evaluate_jobs.py first (Stage 2)")
-        sys.exit(1)
-
     # Load or reset checkpoint
     if args.reset_checkpoint and CHECKPOINT_FILE.exists():
         CHECKPOINT_FILE.unlink()
@@ -1259,14 +1532,35 @@ def main():
 
     checkpoint = _load_checkpoint()
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        scored_jobs = json.load(f)
+    # --sheet-triggered: read Ready_to_Apply rows directly from Sheet
+    if args.sheet_triggered:
+        scored_jobs = _load_ready_to_apply_from_sheet()
+        if not scored_jobs:
+            log.info("[sheet-triggered] No Ready_to_Apply rows. Nothing to do.")
+            return
+        log.info(f"[sheet-triggered] Processing {len(scored_jobs)} Ready_to_Apply job(s)")
+        eligible_jobs = scored_jobs
+    else:
+        if not INPUT_FILE.exists():
+            log.error(f"Input file not found: {INPUT_FILE}")
+            log.error("Run execution/evaluate_jobs.py first (Stage 2)")
+            sys.exit(1)
 
-    log.info(f"Loaded {len(scored_jobs)} scored jobs from {INPUT_FILE}")
+        with open(INPUT_FILE, "r", encoding="utf-8") as f:
+            scored_jobs = json.load(f)
 
-    # Filter by minimum score
-    eligible_jobs = [j for j in scored_jobs if j.get("score", 0) >= args.min_score]
-    log.info(f"Jobs scoring >= {args.min_score}: {len(eligible_jobs)}")
+        log.info(f"Loaded {len(scored_jobs)} scored jobs from {INPUT_FILE}")
+
+        # Filter by minimum score
+        eligible_jobs = [j for j in scored_jobs if j.get("score", 0) >= args.min_score]
+        log.info(f"Jobs scoring >= {args.min_score}: {len(eligible_jobs)}")
+
+    if args.job_id:
+        eligible_jobs = [j for j in eligible_jobs if _get_job_id(j) == args.job_id]
+        if not eligible_jobs:
+            log.error(f"Job ID {args.job_id} not found in scored_jobs.json (or below --min-score {args.min_score})")
+            sys.exit(1)
+        log.info(f"--job-id filter: targeting {args.job_id}")
 
     if args.limit > 0:
         eligible_jobs = eligible_jobs[:args.limit]
@@ -1284,19 +1578,36 @@ def main():
             log.warning(f"  - '{j.get('title', '?')}' (score: {j.get('score', '?')})")
         eligible_jobs = [j for j in eligible_jobs if j.get("company", "").strip()]
 
-    # Filter out already-processed jobs (checkpoint)
+    # Filter out already-processed jobs (checkpoint + folder-existence safety net)
     already_done = checkpoint.get("processed", {})
     pending_jobs = []
+    folder_synced = 0
     for job in eligible_jobs:
         job_id = _get_job_id(job)
         if job_id in already_done:
             log.debug(f"  Skipping (checkpoint): {job.get('title', '?')} at {job.get('company', '?')}")
-        else:
-            pending_jobs.append(job)
+            continue
+        existing_folder = find_application_folder(OUTPUT_DIR, job_id)
+        if existing_folder and has_cover_letter_outputs(existing_folder):
+            log.info(f"  Skipping (folder exists): {job.get('title', '?')} at {existing_folder.name}")
+            existing_pdf = next(iter(existing_folder.glob("Cover_Letter_*.pdf")), None)
+            already_done[job_id] = {
+                "title": job.get("title", ""),
+                "company": job.get("company", ""),
+                "pdf_path": str(existing_pdf) if existing_pdf else "",
+            }
+            folder_synced += 1
+            continue
+        pending_jobs.append(job)
+
+    if folder_synced > 0:
+        checkpoint["processed"] = already_done
+        _save_checkpoint(checkpoint)
+        log.info(f"Synced {folder_synced} pre-existing folder(s) to checkpoint (no LLM cost)")
 
     skipped = len(eligible_jobs) - len(pending_jobs)
     if skipped > 0:
-        log.info(f"Skipping {skipped} already-generated cover letters (checkpoint)")
+        log.info(f"Skipping {skipped} already-generated cover letters (checkpoint + folder dedup)")
 
     if not pending_jobs:
         log.info("All eligible jobs already have cover letters. Use --reset-checkpoint to re-generate.")
@@ -1310,7 +1621,7 @@ def main():
         log.info(f"[{i + 1}/{len(pending_jobs)}] Generating cover letter: {job.get('title', '?')} at {job.get('company', '?')} (score: {job.get('score', '?')})")
 
         try:
-            result = generate_cover_letter_for_job(openrouter_key, gemini_key, job)
+            result = generate_cover_letter_for_job(openrouter_key, gemini_key, job, letter_date=args.letter_date)
             results.append(result)
 
             # Save to checkpoint (includes subtitle + language for CV consistency)
@@ -1338,6 +1649,30 @@ def main():
                 )
             except Exception as e:
                 log.debug(f"  Sheet update skipped: {e}")
+
+            # Upload application folder to Google Drive
+            try:
+                from execution.drive_upload import upload_application_folder
+                pdf_path = result.get("pdf_path", "")
+                if pdf_path:
+                    drive_url = upload_application_folder(Path(pdf_path).parent)
+                    if drive_url:
+                        log.info(f"  Drive: {drive_url}")
+            except Exception as e:
+                log.debug(f"  Drive upload skipped: {e}")
+
+            # --sheet-triggered: update Status → APPLYING so CV stage picks it up
+            if args.sheet_triggered:
+                try:
+                    from execution.write_jobs_to_sheet import update_job_columns
+                    update_job_columns(
+                        sheet_name="Swiss Job Search Pipeline",
+                        job_url=job.get("url", ""),
+                        updates={"Status": "APPLYING"},
+                    )
+                    log.info(f"  Sheet: Status → APPLYING")
+                except Exception as e:
+                    log.debug(f"  Status update skipped: {e}")
         except Exception as e:
             log.error(f"  Failed: {e}")
             results.append({

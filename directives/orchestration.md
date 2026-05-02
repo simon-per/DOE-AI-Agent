@@ -1,7 +1,7 @@
 # Directive: Pipeline Orchestration
 
 ## Goal
-Run the 6-stage Swiss job application pipeline end-to-end. This is the master directive — read it first, then follow the stage-specific directives as needed.
+Run the 7-stage Swiss job application pipeline end-to-end. This is the master directive — read it first, then follow the stage-specific directives as needed.
 
 ## Pipeline Stages
 
@@ -12,7 +12,103 @@ Stage 3: Sheet      → Google Sheet (deliverable)
 Stage 4: Cover      → PDF + DOCX cover letters
 Stage 5: CV         → PDF + DOCX tailored CVs
 Stage 6: Follow-up  → Emails sent + sheet updated
+Stage 7: Swarm      → Browser-based auto-apply (HITL)
 ```
+
+## Execution Model: Cloud vs Local
+
+The full preparation pipeline (Stages 1–6) runs autonomously on Modal. Local
+execution is the rare-debug fallback only. Stage 7 (apply) stays local because
+you submit applications manually.
+
+| Where | Stages | Trigger |
+|---|---|---|
+| **Modal (cloud)** | 1+2+3 (scrape → evaluate → sheet) | Tue+Thu 17:00 CEST cron |
+| **Modal (cloud)** | **4+5 (cover letter + CV)** | **Every 2h cron** — picks up rows with `Status=Ready_to_Apply` |
+| **Modal (cloud)** | 6 (send follow-ups) | Mon/Wed/Fri 09:00 CEST cron |
+| **Modal (cloud)** | Maintenance: prune_stale_jobs | Daily 05:45 CEST cron |
+| **Local (HITL)** | 7 (apply) | Run manually — Simon submits each application |
+
+**Modal app:** `execution/modal_pipeline.py`
+**Deploy:** `modal deploy execution/modal_pipeline.py`
+**Manual trigger (cloud):** `modal run execution/modal_pipeline.py::pipeline_generate_applications`
+**Connectivity check (cloud):** `modal run execution/modal_pipeline.py::preflight`
+**Connectivity check (local):** `python execution/preflight.py`
+
+**One-time Modal setup:**
+1. `pip install modal && modal token new`
+2. In Modal dashboard → Secrets → create `doe-google-oauth` with:
+   - `TOKEN_JSON` = `base64 < token.json` (Sheets+Drive scope)
+   - `TOKEN_GMAIL_JSON` = `base64 < token_gmail.json` (Sheets+Drive+Gmail.send)
+   - `CREDENTIALS_JSON` = `base64 < credentials.json`
+3. Create `doe-api-keys` secret with all env vars from `.env`
+4. `modal deploy execution/modal_pipeline.py`
+
+## Reliability Hardening (Stages 4+5)
+
+The cloud function `pipeline_generate_applications()` invokes the same Python
+scripts as local, so quality gates and idempotency are identical by construction.
+On top of that, it adds:
+
+**Preflight (`execution/preflight.py`)** — runs as the FIRST step of every
+cloud invocation. 11 checks:
+1. Profile parse (`ABOUTME.md` → `CandidateProfile`)
+2. Sheets read (header columns present)
+3. Sheets write (round-trip via dedicated `_preflight` tab)
+4. Drive list (root `DOE Applications/` folder reachable)
+5. Drive create+upload+delete (cycle through a temp `_preflight_<ts>` folder)
+6. Gmail send (preflight ping email)
+7. OpenRouter ping (`max_tokens=5`)
+8. Gemini ping (`max_tokens=5`)
+9. Volume sanity (`.tmp` write/read) — cloud only
+10. Chromium launch — cloud only
+11. Bundled assets present (ABOUTME, cv_photo, both CV templates) — cloud only
+
+If any check fails, an alert email is sent to `simonobemair@gmail.com`, the
+LLM stages do not run, and Modal marks the run as failed.
+
+**Four dedup layers (in evaluation order):**
+1. Checkpoint files (`.tmp/cover_letter_checkpoint.json`, `cv_checkpoint.json`) — primary
+2. Sheet `--sheet-triggered` filter (`Status` column + `CV_Generated`) — script entry
+3. **Folder-existence safety net** — globs `.tmp/applications/{job_id}_*/` for
+   complete output sets (CL pdf+docx; CV pdf+docx + ATS pdf+docx). Catches the
+   case where a checkpoint was lost but the artifact survived on the volume.
+4. Drive name-dedup — `upload_application_folder()` skips files already in the
+   target Drive folder
+
+These run together. If layer 1 misses, layer 3 catches; if layer 3 misses,
+layer 4 prevents Drive duplicates. The same `job_id` cannot produce the same
+artifact twice across any combination of cron + manual runs.
+
+**Failure visibility:** every `_run()` call in `modal_pipeline.py` is wrapped
+so a non-zero subprocess exit triggers an email to `simonobemair@gmail.com`
+with the failing stage label and the last 40 lines of output. The exception
+is then re-raised so Modal also flags the run.
+
+**Concurrency protection:** all scheduled functions use `max_containers=1`,
+so a manual `modal run` cannot overlap a cron firing on the same function.
+
+**Granular checkpointing:** `volume.commit()` is called after each stage in
+multi-stage functions so partial progress (CL done, CV crashed) is not lost.
+
+## Cloud Smoke Test (run before any change to Stages 4–5)
+
+```bash
+# 1. Local preflight — fastest first signal
+python execution/preflight.py
+
+# 2. Cloud preflight — confirms secrets + image + volume
+modal run execution/modal_pipeline.py::preflight
+
+# 3. End-to-end: pick one row in the Sheet, set Status=Ready_to_Apply
+modal run execution/modal_pipeline.py::pipeline_generate_applications
+
+# 4. Idempotency check: trigger again immediately. Expect zero LLM calls,
+#    zero new Drive uploads, no sheet diff. Folder dedup should fire.
+modal run execution/modal_pipeline.py::pipeline_generate_applications
+```
+
+---
 
 ## Quick Start (Full Run)
 
@@ -34,6 +130,9 @@ python execution/generate_cv.py
 
 # Stage 6: Send follow-ups (after user marks jobs as "Applied" in sheet)
 python execution/send_followups.py --send
+
+# Stage 7: Auto-apply via browser swarm (after marking jobs "Ready_to_Apply" in sheet)
+python execution/run_swarm.py --limit 3
 ```
 
 ## Stage Details
@@ -114,6 +213,33 @@ python execution/send_followups.py --send
 - `--send` — actually send emails (without this, dry-run only)
 - `--days 5` — wait 5 days instead of default 3
 
+### Stage 7: Job Application Swarm (Multi-Agent)
+**Directive:** `directives/apply_swarm.md`
+**Script:** `execution/run_swarm.py`
+**Input:** Google Sheet (reads rows where Status=Ready_to_Apply, newest batch first)
+**Output:** Applications submitted + sheet updated (Status, Date_Applied, Application_Method)
+
+**Architecture:** Multiple isolated Claude Code agents, each with its own Chrome browser via Chrome DevTools MCP. No separate API calls — Claude Code (subscription) is the brain.
+**Prerequisites:** Stages 4+5 completed, user has set Status="Ready_to_Apply" in sheet, Chrome installed, `chrome-devtools-mcp` available via npx.
+**Job selection:** Freshness > Rating — newest scrape batch first, then by score descending.
+**Browser:** Headed Chrome with per-agent cloned profile (`.tmp/swarm/agent-N/profile/`) — selective cloning preserves logins.
+**Rate limiting:** Platform-aware — LinkedIn/Workday: 1 agent, Indeed/Glassdoor: 2, others: 3.
+**HITL:** Each agent is a live Claude Code session — asks human in terminal for unclear fields, always before Submit.
+
+**Status flow:** `Ready_to_Apply` → `APPLYING` → `Applied` / `PAUSED` / `FAILED`
+
+**Subcommands:**
+- `setup --agents 3 --limit 9` — create agent workspaces, assign jobs
+- `launch` — start Chrome instances on ports 9223+
+- `status` — aggregate agent logs
+- `kill` — terminate Chrome instances
+- `cleanup` — update sheet from agent logs, remove workspace
+
+**Common flags (setup):**
+- `--agents 3` — number of agents (1-5, default: 3)
+- `--limit 9` — max jobs total (default: 20, hard max: 20)
+- `--all-batches` — process all batches, not just the newest
+
 ## Error Recovery
 
 | Stage | Error | Recovery |
@@ -128,6 +254,10 @@ python execution/send_followups.py --send
 | 5 | Playwright not installed | `python -m playwright install chromium` |
 | 5 | JSON parse failure | Retries once, then uses safe defaults |
 | 6 | Gmail auth missing | Run once without `--send` to trigger OAuth flow |
+| 7 | Chrome not found | Install Chrome or update `CHROME_PATH` in `run_swarm.py` |
+| 7 | CAPTCHA / login wall | Agent pauses (`[PAUSED]` in log) — resolve in Chrome window manually |
+| 7 | CDP port unreachable | Run `kill` then `launch` again. Check firewall. |
+| 7 | chrome-devtools-mcp missing | `npm install -g chrome-devtools-mcp` or ensure npx works |
 
 ## Quality Thresholds
 
@@ -150,6 +280,11 @@ python execution/send_followups.py --send
   quality_report.json    # Stage 4 quality metrics
   cover_letter_checkpoint.json  # Stage 4 resume point
   cv_checkpoint.json     # Stage 5 resume point
+  browser_profile/       # Stage 7 persistent Chrome profile (login once, reuse)
+  swarm/                 # Stage 7 agent workspaces (setup creates, cleanup removes)
+    tasks.json           # Read-only task assignments
+    agent-N/             # Per-agent workspace (CLAUDE.md, .mcp.json, agent.log, profile/)
+    screenshots/         # Before-submit + confirmation screenshots
   applications/          # Stage 4+5 output
     {company}_{title}/
       Cover_Letter_*.pdf
@@ -165,9 +300,14 @@ python execution/send_followups.py --send
 - `directives/generate_cv.md` — Stage 5 details, template, bullet reordering
 - `directives/web_search.md` — Company research pipeline (used by Stage 4)
 - `directives/send_followups.md` — Stage 6 details, email templates, Gmail setup
+- `directives/apply_swarm.md` — Stage 7 details, browser tools, HITL rules
 - `directives/setup_google_auth.md` — Google OAuth setup for Sheets + Gmail
 
 ## Learnings (auto-updated)
+- Stages 4+5 run on Modal every 2 hours and use four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup). The same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap.
+- A preflight check runs before any cloud LLM stage. Failures are emailed to `simonobemair@gmail.com` and the run aborts before burning tokens.
+- `_write_oauth_files()` validates secret presence + base64 decode up front; missing/rotated secrets produce clear `Modal secret missing: <NAME>` errors instead of `binascii.Error`.
+- `volume.commit()` runs after every stage so partial progress (e.g. CL done, CV crashes) survives a mid-run failure.
 - Stages 4 and 5 auto-update the Google Sheet with generation status (CL_Generated, CL_Quality_Score, CV_Generated).
 - Checkpoints allow resuming Stages 4 and 5 after interruption without re-generating already-processed jobs.
 - Company research cache (.tmp/company_cache.json) persists across runs — most companies only need one SERP lookup ever.

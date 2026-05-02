@@ -45,6 +45,21 @@ python execution/generate_cover_letter.py --reset-checkpoint     # re-generate a
 - `--reset-checkpoint` clears checkpoint and re-generates all cover letters
 - Checkpoint saved after each successful generation (crash-safe)
 
+### Date Updates
+Use `execution/update_cover_letter_dates.py` to re-render existing cover letter PDF + DOCX files with a new date without re-running the LLM.
+
+```bash
+python -m execution.update_cover_letter_dates --letter-date 2026-04-29 --min-score 6
+python -m execution.update_cover_letter_dates --letter-date 2026-04-29 --min-score 6 --dry-run
+python -m execution.update_cover_letter_dates --letter-date 2026-04-29 --min-score 6 --source local  # offline fallback
+```
+
+- **Default source:** Google Sheet `Swiss Job Search Pipeline`, not `.tmp/scored_jobs.json`.
+- **Why:** The sheet is the application source of truth. Local scored JSON files are intermediate snapshots and can be stale or overwritten by later scrape/evaluation runs.
+- **Selection:** Sheet rows with `Score >= --min-score` and an existing `.tmp/applications/{Job_ID}_*/Cover_Letter_Simon_Oberpertinger_Mair.docx`.
+- **Safety:** The script renders PDF and DOCX to temporary files first, then replaces originals only after both render successfully. Any per-job error exits non-zero after logging.
+- **Local mode:** `--source local` is only for offline/legacy use and computes missing `Job_ID` values from title/company/URL.
+
 ### Language Detection
 Simple keyword-based detection:
 - Counts German, English, Italian keywords in job description
@@ -100,6 +115,11 @@ Same structure as PDF, generated with `python-docx`:
 - Uses key_matches from evaluation to focus on relevant skills
 - Professional but personable tone
 - Does NOT mention lack of university degree — focuses on value, not gaps
+
+### Privacy
+- OpenRouter/Qwen3 receives anonymized profile (no name, email, phone, employer name)
+- Google Gemini receives full profile
+- **`role_official` is CV-display-only and must never appear in LLM prompts.** Cover letters address the candidate's functional role, not the contract title. The contract title is intentionally stripped from both `profile_anonymous()` and `profile_full()`. If you add a new LLM-driven step, do NOT pass `role_official` to it.
 
 ## Dependencies
 - `fpdf2>=2.7.0` - PDF generation with Unicode support
@@ -165,3 +185,6 @@ The system retries LLM generation (up to 3 attempts, temperature +0.1 per retry)
 - **Contact regex expanded:** Max name length 40→60 chars, max parts 3→4. Handles compound Swiss-German surnames (e.g., "Hans-Peter von Müller-Thurgau").
 - **Word-boundary matching in URL validation:** `_validate_website_for_company()` uses `re.search(rf'\b{re.escape(w)}\b', text)` instead of `if w in text`. Prevents "SAP" matching "ASAP" etc.
 - **URL guessing includes .de:** Added `.de` TLD for German/Swiss-German companies alongside `.ch` and `.com`.
+- **Meta-commentary filter (2026-03-11):** LLMs (especially Qwen3) sometimes insert style meta-commentary to manipulate burstiness scores — e.g., "Short sentences work. Clarity matters." These are writing-advice artifacts, not cover letter content. `_filter_meta_commentary()` strips known patterns post-generation. The burstiness prompt was also softened to prevent the LLM from over-optimizing for sentence variation.
+- **Empty parentheses in titles (2026-03-11):** `clean_job_title()` in `utils.py` now strips empty `()` left after percentage removal (e.g., "Senior Specialist (80-100%)" → "Senior Specialist ()" → "Senior Specialist"). Previously appeared in subject lines as "Application for ... ()".
+- **Cover-letter date updates must be sheet-driven (2026-04-29):** `update_cover_letter_dates.py` previously read only `.tmp/scored_jobs.json`, which missed valid application folders when the JSON snapshot no longer contained older sheet rows (e.g., `J-8ce923`, `J-0fe4a7`). The script now defaults to the Google Sheet, matches folders by `Job_ID`, preserves existing DOCX subtitle/language/body, and keeps `--source local` only as an explicit offline fallback.

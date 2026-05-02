@@ -74,14 +74,29 @@ def _get_search_terms() -> list[str]:
     except Exception:
         # Fallback if ABOUTME.md can't be parsed
         return [
-            "CRM Specialist", "Dynamics 365", "Digital Sales Specialist",
-            "Sales Operations",
+            "Revenue Operations Specialist", "Sales Operations Specialist",
+            "CRM Specialist", "Dynamics 365", "Sales Operations",
         ]
 
 SEARCH_TERMS = _get_search_terms()
 
 LOCATION = "Switzerland"
-DEFAULT_HOURS_OLD = 720  # 30 days for initial/broad fetch
+DEFAULT_HOURS_OLD = 168  # 7 days — fresh-only by default; use --deep for 30-day backfill
+DEEP_HOURS_OLD = 720     # 30 days, opt-in via --deep
+
+# Domains excluded from scrape — aggregators, redirect-only, paywalled.
+# Matches exact domain OR any subdomain (e.g. "trabajo.org" catches "ch.trabajo.org").
+BLOCKED_DOMAINS = frozenset({
+    "jobleads.com",             # paid aggregator, can't apply without payment
+    "trabajo.org",              # always redirects to jobleads.com
+    "bebee.com",                # aggregator, hides company name → CV/cover letter can't be tailored
+    "experteer.com",            # paid premium-subscription aggregator, effectively paywalled
+    "experteer.ch",             # CH-TLD variant of experteer.com (paid)
+    "talents.studysmarter.de",  # expired listings / lead grab, not real openings
+    "rocken.jobs",              # lead-grab agency reposting other boards (per user policy)
+    "talent.com",               # redirects to jobleads.com (paid funnel)
+    "cosmoquick.com",           # user-excluded
+})
 
 # --- SERP API configuration ---
 SERPAPI_URL = "https://serpapi.com/search"
@@ -96,6 +111,25 @@ for _key_name in ("SERPAPI_API_KEY", "SERPAPI_API_KEY2"):
 
 _serpapi_lock = threading.Lock()
 _serpapi_call_count = 0
+
+# Per-run counters for the niche boards. If a source ran against relevant terms
+# but collected zero jobs overall, main() logs an error — turns silent schema
+# regressions (Next.js path change, card markup change) into an actionable alert.
+_niche_stats_lock = threading.Lock()
+_niche_stats: dict[str, dict[str, int]] = {
+    "jobs4sales": {"relevant_terms": 0, "jobs": 0},
+    "ictjobs": {"relevant_terms": 0, "jobs": 0},
+    "jobroom": {"relevant_terms": 0, "jobs": 0},
+    "jobsch": {"relevant_terms": 0, "jobs": 0},
+}
+
+
+def _bump_niche_stats(source: str, jobs_count: int) -> None:
+    """Record one relevant-term run for a niche source."""
+    with _niche_stats_lock:
+        s = _niche_stats[source]
+        s["relevant_terms"] += 1
+        s["jobs"] += jobs_count
 
 
 def _get_serpapi_key() -> str | None:
@@ -169,74 +203,130 @@ def _extract_salary(row) -> str | None:
     return None
 
 
-def scrape_jobroom(search_term: str) -> list[dict]:
-    """Scrape jobs from job-room.ch frontend search."""
-    jobs = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-        "Referer": "https://www.job-room.ch/",
-        "Origin": "https://www.job-room.ch",
-    }
+_JOBROOM_API = "https://www.job-room.ch/jobadservice/api/jobAdvertisements/_search"
+_JOBROOM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
+    "Origin": "https://www.job-room.ch",
+    "Referer": "https://www.job-room.ch/job-search",
+    "Content-Type": "application/json",
+}
 
-    search_url = "https://ob.job-room.ch/api/jobAdvertisements/_search"
-    payload = {
-        "page": 0,
-        "size": 50,
-        "body": {
-            "keywordsText": search_term,
-            "onlineSinceDays": 7,
-        },
-    }
 
-    for attempt in range(3):
+def scrape_jobroom_term(search_term: str, online_since_days: int, page_size: int = 50, max_pages: int = 3) -> list[dict]:
+    """Scrape job-room.ch (Swiss federal RAV/SECO board) for one search term.
+
+    The site's Angular SPA hits /jobadservice/api/jobAdvertisements/_search
+    with a JSON body. The endpoint accepts unauthenticated POSTs, so we
+    skip the browser entirely.
+    """
+    body = {
+        "workloadPercentageMin": 10,
+        "workloadPercentageMax": 100,
+        "permanent": None,
+        "companyName": None,
+        "onlineSince": online_since_days,
+        "displayRestricted": False,
+        "professionCodes": [],
+        "keywords": [search_term],
+        "communalCodes": [],
+        "cantonCodes": [],
+    }
+    jobs: list[dict] = []
+    for page_idx in range(max_pages):
+        params = {"page": page_idx, "size": page_size, "sort": "date_desc"}
         try:
-            log.info(f"[jobroom] Searching: '{search_term}' (attempt {attempt + 1})")
-            resp = requests.post(search_url, json=payload, headers=headers, timeout=30)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                results = data.get("result", data.get("content", []))
-                if isinstance(results, list):
-                    for item in results:
-                        job = _parse_jobroom_item(item)
-                        if job:
-                            jobs.append(job)
-                log.info(f"[jobroom] Found {len(jobs)} jobs for '{search_term}'")
-                break  # success
-            else:
-                log.warning(f"[jobroom] HTTP {resp.status_code} for '{search_term}'")
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
+            resp = requests.post(_JOBROOM_API, params=params, json=body, headers=_JOBROOM_HEADERS, timeout=20)
         except Exception as e:
-            log.warning(f"[jobroom] Error searching '{search_term}': {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
-
+            log.warning(f"[jobroom] request failed for '{search_term}' p{page_idx}: {e}")
+            break
+        if resp.status_code != 200:
+            log.warning(f"[jobroom] HTTP {resp.status_code} for '{search_term}' p{page_idx}")
+            break
+        try:
+            items = resp.json()
+        except Exception as e:
+            log.warning(f"[jobroom] non-JSON response for '{search_term}': {e}")
+            break
+        if not isinstance(items, list) or not items:
+            break
+        for item in items:
+            job = _parse_jobroom_item(item)
+            if job:
+                jobs.append(job)
+        if len(items) < page_size:
+            break
     return jobs
 
 
-def _parse_jobroom_item(item: dict) -> dict | None:
-    """Parse a job-room.ch search result item."""
-    try:
-        title = item.get("title", "") or item.get("jobTitle", "")
-        company = item.get("company", {}).get("name", "") if isinstance(item.get("company"), dict) else str(item.get("company", ""))
-        location_data = item.get("location", {})
-        if isinstance(location_data, dict):
-            city = location_data.get("city", "")
-            canton = location_data.get("cantonCode", "")
-            location = f"{city}, {canton}" if city and canton else (city or canton)
-        else:
-            location = str(location_data)
+def scrape_jobroom_all(search_terms: list[str], hours_old: int = DEFAULT_HOURS_OLD) -> list[dict]:
+    """Scrape job-room.ch across all given search terms (sequential)."""
+    online_since_days = max(1, (hours_old + 23) // 24)
+    all_jobs: list[dict] = []
+    for term in search_terms:
+        term_jobs = scrape_jobroom_term(term, online_since_days)
+        log.info(f"[jobroom] '{term}' → {len(term_jobs)} jobs")
+        all_jobs.extend(term_jobs)
+    _bump_niche_stats("jobroom", len(all_jobs))
+    return all_jobs
 
-        job_id = item.get("id", "")
-        url = f"https://www.job-room.ch/job-search/{job_id}" if job_id else ""
-        description = item.get("description", "") or item.get("jobDescription", "")
-        date_posted = item.get("publicationDate", None)
-        employment_type = item.get("workload", None)
+
+def _parse_jobroom_item(item: dict) -> dict | None:
+    """Parse a job-room.ch search result item.
+
+    Schema (POST .../jobAdvertisements/_search):
+        item.jobAdvertisement.jobContent.jobDescriptions[0].{title,description}
+        item.jobAdvertisement.jobContent.company.name
+        item.jobAdvertisement.jobContent.location.{city,cantonCode}
+        item.jobAdvertisement.jobContent.externalUrl  (canonical employer/aggregator link)
+        item.jobAdvertisement.publicationStartDate
+    """
+    try:
+        ad = item.get("jobAdvertisement") if isinstance(item, dict) else None
+        if not isinstance(ad, dict):
+            return None
+        content = ad.get("jobContent") or {}
+        descs = content.get("jobDescriptions") or []
+        if not descs:
+            return None
+        # Prefer DE description; fall back to first
+        d = next((x for x in descs if (x.get("languageIsoCode") or "").lower() == "de"), descs[0])
+
+        import html as _html
+        def _strip(s: str) -> str:
+            s = re.sub(r"<[^>]+>", "", s or "")
+            return _html.unescape(s)
+
+        title = _strip(d.get("title", ""))
+        description = _strip(d.get("description", ""))
+
+        company_obj = content.get("company") or {}
+        company = company_obj.get("name", "") if isinstance(company_obj, dict) else str(company_obj)
+
+        loc_list = content.get("location") or content.get("locations") or {}
+        if isinstance(loc_list, list) and loc_list:
+            loc_list = loc_list[0]
+        if isinstance(loc_list, dict):
+            city = loc_list.get("city", "")
+            canton = loc_list.get("cantonCode", "")
+            location = f"{city}, {canton}" if city and canton else (city or canton or "")
+        else:
+            location = str(loc_list) if loc_list else ""
+
+        # External URL is the canonical employer/aggregator link; fallback to job-room detail.
+        external_url = content.get("externalUrl") or ""
+        if external_url:
+            url = external_url
+        else:
+            ad_id = ad.get("id") or item.get("id") or ""
+            url = f"https://www.job-room.ch/job-search/{ad_id}" if ad_id else ""
+
+        date_posted = ad.get("publicationStartDate") or ad.get("createdTime")
+
+        emp = content.get("employment") or {}
+        workload_max = emp.get("workloadPercentageMax") if isinstance(emp, dict) else None
+        employment_type = f"{workload_max}%" if workload_max else None
 
         return normalize_job(
             title=title,
@@ -247,11 +337,512 @@ def _parse_jobroom_item(item: dict) -> dict | None:
             source="jobroom",
             date_posted=date_posted,
             salary=None,
-            employment_type=str(employment_type) if employment_type else None,
+            employment_type=employment_type,
         )
     except Exception as e:
         log.warning(f"[jobroom] Failed to parse item: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Niche Swiss boards (jobchannel network) — added 2026-04-22.
+# Direct listings on sales- and IT-specialized portals that complement the
+# Indeed/LinkedIn-heavy coverage from jobspy + SerpAPI.
+# ---------------------------------------------------------------------------
+
+_NICHE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+}
+
+# Search-term filter for niche boards. Boards are sales/IT-focused; running
+# dev-only terms wastes requests. Substring match against lowered term.
+_NICHE_RELEVANT_KEYWORDS = frozenset({
+    "crm", "dynamics", "sales", "cpq", "marketing", "vertrieb", "verkauf",
+    "berater", "salesforce", "hubspot", "revenue operations", "power bi",
+    "business analyst", "business intelligence", "customer success",
+    "e-commerce", "ecommerce", "application manager",
+})
+
+
+def _niche_term_is_relevant(search_term: str) -> bool:
+    """Cheap filter: only hit niche boards for terms in their wheelhouse."""
+    t = (search_term or "").lower()
+    return any(kw in t for kw in _NICHE_RELEVANT_KEYWORDS)
+
+
+def _extract_next_data(html: str) -> dict | None:
+    """Parse the Next.js __NEXT_DATA__ JSON payload embedded in the HTML."""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def scrape_jobs4sales(search_term: str, max_pages: int = 3) -> list[dict]:
+    """Scrape jobs4sales.ch — sales-specialized board (jobchannel network).
+
+    Listings are server-rendered inside a Next.js __NEXT_DATA__ JSON payload
+    at props.initialState.public.jobs.jobs — no HTML scraping needed.
+    """
+    if not _niche_term_is_relevant(search_term):
+        log.debug(f"[jobs4sales] skipping '{search_term}' — not in sales/CRM wheelhouse")
+        return []
+
+    jobs: list[dict] = []
+    domain = "jobs4sales.ch"
+
+    for page in range(1, max_pages + 1):
+        _rate_limit_domain(domain)
+        # jobs4sales does not URL-encode spaces the same way requests does,
+        # but requests.get with params= is the safe choice.
+        url = "https://jobs4sales.ch/en/jobs"
+        try:
+            resp = requests.get(
+                url,
+                params={"q": search_term, "page": page},
+                headers=_NICHE_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                log.warning(f"[jobs4sales] HTTP {resp.status_code} for '{search_term}' page {page}")
+                break
+            data = _extract_next_data(resp.text)
+            if not data:
+                log.warning(f"[jobs4sales] no __NEXT_DATA__ for '{search_term}'")
+                break
+            try:
+                state = data["props"]["initialState"]["public"]["jobs"]["jobs"]
+            except (KeyError, TypeError):
+                log.warning(f"[jobs4sales] unexpected payload shape for '{search_term}'")
+                break
+
+            page_jobs = state.get("jobs") or []
+            if not page_jobs:
+                break
+
+            for item in page_jobs:
+                norm = _parse_jobs4sales_item(item)
+                if norm:
+                    jobs.append(norm)
+
+            total = state.get("resultCount") or 0
+            page_size = state.get("pageSize") or 10
+            if page * page_size >= total:
+                break
+        except Exception as e:
+            log.warning(f"[jobs4sales] Error on '{search_term}' page {page}: {e}")
+            break
+
+    log.info(f"[jobs4sales] Found {len(jobs)} jobs for '{search_term}'")
+    _bump_niche_stats("jobs4sales", len(jobs))
+    return jobs
+
+
+def _parse_jobs4sales_item(item: dict) -> dict | None:
+    """Normalize a single jobs4sales listing from the Next.js payload."""
+    import html as _html
+    try:
+        job_id = item.get("jobId")
+        if not job_id:
+            return None
+        # JSON payload carries raw HTML entities (&ouml;, &amp;, ...) in plain-
+        # text fields; unescape so downstream CV/cover-letter generation sees
+        # real characters.
+        title = _html.unescape(item.get("title") or "")
+        company = _html.unescape(item.get("companyName") or "")
+        location = _html.unescape(item.get("location") or "")
+        date_posted = (item.get("datePosted") or "")[:10] or None  # ISO -> YYYY-MM-DD
+        workload = item.get("workload") or None
+        url = f"https://jobs4sales.ch/en/job/{job_id}"
+
+        # Listing omits description — Phase 2 (fetch_descriptions) fills it in.
+        return normalize_job(
+            title=title,
+            company=company,
+            location=location,
+            url=url,
+            description="",
+            source="jobs4sales",
+            date_posted=date_posted,
+            salary=None,
+            employment_type=str(workload) if workload else None,
+        )
+    except Exception as e:
+        log.warning(f"[jobs4sales] Failed to parse item: {e}")
+        return None
+
+
+# ictjobs.ch serves server-rendered listing cards with schema.org microdata.
+# Each card is wrapped in: <div class="offer publish"> ... </div><!--/.offer -->
+_ICTJOBS_CARD_RE = re.compile(
+    r'<div class="offer publish">(.*?)</div>\s*<!--/\.offer\s*-->',
+    re.DOTALL,
+)
+_ICTJOBS_TITLE_RE = re.compile(
+    r'<h2 itemprop="title"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>\s*(.*?)\s*</a>',
+    re.DOTALL,
+)
+_ICTJOBS_COMPANY_RE = re.compile(
+    r'<span class="author-text">\s*<a[^>]*>\s*(.*?)\s*</a>',
+    re.DOTALL,
+)
+_ICTJOBS_LOCATION_RE = re.compile(
+    r'<span class="label-in">.*?<span>\s*<a[^>]*>\s*(.*?)\s*</a>',
+    re.DOTALL,
+)
+_ICTJOBS_DATE_RE = re.compile(r'<time[^>]*datetime="([^"]+)"')
+
+
+def scrape_ictjobs(search_term: str) -> list[dict]:
+    """Scrape ictjobs.ch — IT-specialized board (jobchannel network).
+
+    Uses the ?fs= filter on the root URL. Response is HTML with listing cards
+    wrapped in <div class="offer publish"> — parsed via compiled regex.
+    """
+    if not _niche_term_is_relevant(search_term):
+        log.debug(f"[ictjobs] skipping '{search_term}' — not in IT/CRM wheelhouse")
+        return []
+
+    jobs: list[dict] = []
+    domain = "ictjobs.ch"
+    _rate_limit_domain(domain)
+
+    try:
+        resp = requests.get(
+            "https://ictjobs.ch/",
+            params={"fs": search_term},
+            headers=_NICHE_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log.warning(f"[ictjobs] HTTP {resp.status_code} for '{search_term}'")
+            return jobs
+
+        cards = _ICTJOBS_CARD_RE.findall(resp.text)
+        # Self-alarm: body contains listing markers but regex missed everything
+        # → markup likely changed. Catch silent regression early.
+        if not cards and 'class="offer publish"' in resp.text:
+            log.warning(
+                f"[ictjobs] card regex matched 0 blocks for '{search_term}' "
+                "despite 'offer publish' present in body — HTML structure may have changed"
+            )
+
+        for card in cards:
+            norm = _parse_ictjobs_card(card)
+            if norm:
+                jobs.append(norm)
+    except requests.RequestException as e:
+        log.warning(f"[ictjobs] Network error on '{search_term}': {e}")
+
+    log.info(f"[ictjobs] Found {len(jobs)} jobs for '{search_term}'")
+    _bump_niche_stats("ictjobs", len(jobs))
+    return jobs
+
+
+def _parse_ictjobs_card(card_html: str) -> dict | None:
+    """Normalize a single <div class='offer publish'> card."""
+    import html as _html
+    try:
+        m_title = _ICTJOBS_TITLE_RE.search(card_html)
+        if not m_title:
+            return None
+        raw_url = m_title.group(1).strip()
+        # Drop the ?fs=... search-filter suffix so the same job from different
+        # search terms dedupes on URL within a run.
+        url = raw_url.split("?", 1)[0]
+        title = _html.unescape(re.sub(r"\s+", " ", m_title.group(2)).strip())
+
+        m_company = _ICTJOBS_COMPANY_RE.search(card_html)
+        company = _html.unescape(re.sub(r"\s+", " ", m_company.group(1)).strip()) if m_company else ""
+
+        m_loc = _ICTJOBS_LOCATION_RE.search(card_html)
+        location = _html.unescape(re.sub(r"\s+", " ", m_loc.group(1)).strip()) if m_loc else ""
+
+        m_date = _ICTJOBS_DATE_RE.search(card_html)
+        date_posted = m_date.group(1) if m_date else None
+
+        return normalize_job(
+            title=title,
+            company=company,
+            location=location,
+            url=url,
+            description="",  # Phase 2 fetches descriptions
+            source="ictjobs",
+            date_posted=date_posted,
+            salary=None,
+            employment_type=None,
+        )
+    except Exception as e:
+        log.warning(f"[ictjobs] Failed to parse card: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# jobs.ch — largest CH job board. Public API at
+# https://www.jobs.ch/api/v1/public/search?query=...&page=N (no auth).
+# Response: {documents: [...], total_hits, num_pages, ...}.
+# Document fields used: title, company_name, place, preview, publication_date,
+# initial_publication_date, age (days), _links.detail_de.href.
+# ---------------------------------------------------------------------------
+_JOBSCH_API = "https://www.jobs.ch/api/v1/public/search"
+
+
+def scrape_jobsch_term(search_term: str, max_age_days: int, max_pages: int = 5) -> list[dict]:
+    """Scrape jobs.ch for one search term, dropping postings older than
+    `max_age_days` (the API exposes per-doc `age` in days)."""
+    jobs: list[dict] = []
+    for page_idx in range(1, max_pages + 1):
+        params = {"query": search_term, "page": page_idx}
+        try:
+            resp = requests.get(
+                _JOBSCH_API,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                timeout=20,
+            )
+        except Exception as e:
+            log.warning(f"[jobsch] request failed for '{search_term}' p{page_idx}: {e}")
+            break
+        if resp.status_code != 200:
+            log.warning(f"[jobsch] HTTP {resp.status_code} for '{search_term}' p{page_idx}")
+            break
+        try:
+            data = resp.json()
+        except Exception as e:
+            log.warning(f"[jobsch] non-JSON for '{search_term}': {e}")
+            break
+
+        docs = data.get("documents", [])
+        if not docs:
+            break
+
+        all_too_old = True
+        for doc in docs:
+            age = doc.get("age")
+            if isinstance(age, (int, float)) and age <= max_age_days:
+                all_too_old = False
+                job = _parse_jobsch_doc(doc)
+                if job:
+                    jobs.append(job)
+
+        # Results are sorted recency-first; once an entire page is over the
+        # age cutoff, deeper pages can't help.
+        if all_too_old:
+            break
+        if page_idx >= data.get("num_pages", page_idx):
+            break
+    return jobs
+
+
+def _parse_jobsch_doc(doc: dict) -> dict | None:
+    try:
+        title = doc.get("title", "") or ""
+        company = doc.get("company_name", "") or ""
+        location = doc.get("place", "") or ""
+        preview = doc.get("preview", "") or ""
+
+        links = doc.get("_links") or {}
+        url = ""
+        for key in ("detail_de", "detail_en", "detail_fr"):
+            link = links.get(key)
+            if isinstance(link, dict) and link.get("href"):
+                url = link["href"]
+                break
+        if not url:
+            slug = doc.get("slug") or doc.get("job_id")
+            if slug:
+                url = f"https://www.jobs.ch/de/stellenangebote/detail/{slug}/"
+
+        date_posted = doc.get("publication_date") or doc.get("initial_publication_date")
+
+        grades = doc.get("employment_grades") or []
+        if isinstance(grades, list) and len(grades) >= 1:
+            employment_type = f"{grades[0]}%" if len(grades) == 1 else f"{min(grades)}-{max(grades)}%"
+        else:
+            employment_type = None
+
+        return normalize_job(
+            title=title,
+            company=company,
+            location=location,
+            url=url,
+            description=preview,
+            source="jobsch",
+            date_posted=date_posted,
+            salary=None,
+            employment_type=employment_type,
+        )
+    except Exception as e:
+        log.warning(f"[jobsch] failed to parse doc: {e}")
+        return None
+
+
+def scrape_jobsch_all(search_terms: list[str], hours_old: int = DEFAULT_HOURS_OLD) -> list[dict]:
+    """Scrape jobs.ch across all given search terms (sequential)."""
+    max_age_days = max(1, (hours_old + 23) // 24)
+    all_jobs: list[dict] = []
+    for term in search_terms:
+        term_jobs = scrape_jobsch_term(term, max_age_days=max_age_days)
+        log.info(f"[jobsch] '{term}' → {len(term_jobs)} jobs")
+        all_jobs.extend(term_jobs)
+    _bump_niche_stats("jobsch", len(all_jobs))
+    return all_jobs
+
+
+# ---------------------------------------------------------------------------
+# Public ATS boards (Greenhouse / Lever) for known CH employers.
+# Curated list at execution/data/ch_ats_employers.json. These are the cleanest
+# possible source: structured JSON, dated, direct employer-controlled — no
+# aggregator pollution, no lead-grab.
+# ---------------------------------------------------------------------------
+_ATS_EMPLOYERS_FILE = PROJECT_ROOT / "execution" / "data" / "ch_ats_employers.json"
+_CH_LOCATION_TOKENS = (
+    "switzerland", "schweiz", "suisse", "svizzera", " ch ", ", ch", "ch,",
+    "zurich", "zürich", "zuerich", "geneva", "genève", "geneve", "basel",
+    "bern", "berne", "lausanne", "lugano", "luzern", "lucerne", "winterthur",
+    "st. gallen", "st gallen", "zug", "fribourg", "freiburg", "neuchâtel",
+    "neuchatel", "thun", "biel", "bienne", "schaffhausen", "remote ch",
+    "remote - switzerland", "emea (switzerland)",
+)
+
+
+def _is_ch_location(loc: str) -> bool:
+    if not loc:
+        return False
+    s = f" {loc.lower()} "
+    return any(tok in s for tok in _CH_LOCATION_TOKENS)
+
+
+def _load_ats_employers() -> dict:
+    if not _ATS_EMPLOYERS_FILE.exists():
+        return {}
+    try:
+        with open(_ATS_EMPLOYERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"[ats] failed to load employer list: {e}")
+        return {}
+
+
+def scrape_greenhouse(slug: str, company: str) -> list[dict]:
+    """Greenhouse Job Board API (public, unauthenticated)."""
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+    try:
+        resp = requests.get(url, timeout=20, headers={"Accept": "application/json"})
+    except Exception as e:
+        log.warning(f"[greenhouse] {company} request failed: {e}")
+        return []
+    if resp.status_code != 200:
+        log.warning(f"[greenhouse] {company} HTTP {resp.status_code}")
+        return []
+    try:
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[greenhouse] {company} non-JSON: {e}")
+        return []
+    jobs: list[dict] = []
+    import html as _html
+    for j in data.get("jobs", []):
+        location = (j.get("location") or {}).get("name", "")
+        if not _is_ch_location(location):
+            continue
+        title = j.get("title", "") or ""
+        content = j.get("content", "") or ""
+        desc = _html.unescape(re.sub(r"<[^>]+>", " ", content))
+        desc = re.sub(r"\s+", " ", desc).strip()
+        norm = normalize_job(
+            title=title,
+            company=company,
+            location=location,
+            url=j.get("absolute_url", ""),
+            description=desc,
+            source="greenhouse",
+            date_posted=j.get("updated_at") or j.get("created_at"),
+            salary=None,
+            employment_type=None,
+        )
+        if norm:
+            jobs.append(norm)
+    return jobs
+
+
+def scrape_lever(slug: str, company: str) -> list[dict]:
+    """Lever public postings API."""
+    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    try:
+        resp = requests.get(url, timeout=20, headers={"Accept": "application/json"})
+    except Exception as e:
+        log.warning(f"[lever] {company} request failed: {e}")
+        return []
+    if resp.status_code != 200:
+        log.warning(f"[lever] {company} HTTP {resp.status_code}")
+        return []
+    try:
+        postings = resp.json()
+    except Exception as e:
+        log.warning(f"[lever] {company} non-JSON: {e}")
+        return []
+    jobs: list[dict] = []
+    import html as _html
+    for p in postings if isinstance(postings, list) else []:
+        cats = p.get("categories") or {}
+        location = cats.get("location", "") or ""
+        if not _is_ch_location(location):
+            continue
+        body_html = (p.get("descriptionPlain") or p.get("description") or "")
+        desc = _html.unescape(re.sub(r"<[^>]+>", " ", body_html))
+        desc = re.sub(r"\s+", " ", desc).strip()
+        created_ms = p.get("createdAt")
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            date_posted = _dt.fromtimestamp(created_ms / 1000, tz=_tz.utc).isoformat() if created_ms else None
+        except Exception:
+            date_posted = None
+        norm = normalize_job(
+            title=p.get("text", "") or "",
+            company=company,
+            location=location,
+            url=p.get("hostedUrl", "") or p.get("applyUrl", ""),
+            description=desc,
+            source="lever",
+            date_posted=date_posted,
+            salary=None,
+            employment_type=cats.get("commitment"),
+        )
+        if norm:
+            jobs.append(norm)
+    return jobs
+
+
+def scrape_ats_boards_all() -> list[dict]:
+    """Iterate the curated CH ATS employer list (Greenhouse + Lever)."""
+    cfg = _load_ats_employers()
+    all_jobs: list[dict] = []
+    for entry in cfg.get("greenhouse", []):
+        slug = entry.get("slug")
+        company = entry.get("company") or slug
+        if not slug:
+            continue
+        gj = scrape_greenhouse(slug, company)
+        log.info(f"[greenhouse] {company} → {len(gj)} CH jobs")
+        all_jobs.extend(gj)
+    for entry in cfg.get("lever", []):
+        slug = entry.get("slug")
+        company = entry.get("company") or slug
+        if not slug:
+            continue
+        lj = scrape_lever(slug, company)
+        log.info(f"[lever] {company} → {len(lj)} CH jobs")
+        all_jobs.extend(lj)
+    return all_jobs
 
 
 def _try_extract_company(description: str) -> str:
@@ -316,6 +907,41 @@ def _clean_url(url: str) -> str:
     return url
 
 
+# talent.com/LinkedIn/etc. append aggregator-UI annotations like
+# "Zürich (+ 1 weiterer Standort)" / "Zurich (+ 2 other locations)" when a posting
+# lists multiple cities. Those don't belong in a CV/cover letter header.
+_LOCATION_MULTI_RE = re.compile(
+    r"\s*\(\s*\+\s*\d+\s*(?:weitere[rn]?|andere[rn]?|other|more)\s+"
+    r"(?:standort(?:e|en)?|ort(?:e|en)?|location[s]?)\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_location(location: str) -> str:
+    """Strip aggregator-UI annotations like '(+ 1 weiterer Standort)' from location."""
+    loc = (location or "").strip()
+    if not loc or loc == "nan":
+        return ""
+    loc = _LOCATION_MULTI_RE.sub("", loc).strip()
+    # Collapse internal whitespace
+    loc = re.sub(r"\s+", " ", loc)
+    return loc
+
+
+def _is_blocked_domain(url: str) -> bool:
+    """Return True if URL host matches or is a subdomain of any BLOCKED_DOMAINS entry."""
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower().lstrip(".")
+        if host.startswith("www."):
+            host = host[4:]
+        return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
+    except Exception:
+        return False
+
+
 # Controlled source vocabulary — maps raw source strings to canonical names
 _SOURCE_MAP = {
     "indeed": "indeed",
@@ -325,6 +951,11 @@ _SOURCE_MAP = {
     "jobspy": "jobspy",
     "jobroom": "jobroom",
     "serpapi": "serpapi",
+    "jobs4sales": "jobs4sales",
+    "ictjobs": "ictjobs",
+    "greenhouse": "greenhouse",
+    "lever": "lever",
+    "jobsch": "jobsch",
 }
 
 
@@ -382,6 +1013,11 @@ def normalize_job(
     # Clean URL (strip tracking params, validate format)
     clean = _clean_url(url)
 
+    # Drop blocked aggregator/redirect-only domains before any downstream work
+    if _is_blocked_domain(clean):
+        log.info(f"  Skipped blocked domain for '{title}' @ '{company}': {clean}")
+        return None
+
     # Try to extract company from description if missing
     if not company and desc_clean:
         company = _try_extract_company(desc_clean)
@@ -415,7 +1051,7 @@ def normalize_job(
         "job_id": generate_job_id(title, company, clean),
         "title": title,
         "company": company,
-        "location": "" if (location or "").strip() == "nan" else (location or "").strip(),
+        "location": _clean_location(location),
         "url": clean,
         "description": desc_clean[:5000],  # cap at 5000 chars
         "description_source": "original" if desc_clean else "empty",
@@ -620,11 +1256,12 @@ def scrape_single_term(
     if serp_pages > 0:
         jobs.extend(scrape_serpapi(search_term, seen or {}, max_pages=serp_pages))
 
-    # Job-Room disabled: SSL cert only valid for www.job-room.ch (not ob.job-room.ch).
-    # The www API returns empty 200s — Angular SPA requires browser-side CSRF tokens.
-    # Would need Playwright headless browser to scrape. Google Jobs already aggregates
-    # Job-Room listings via SerpAPI, so coverage gap is minimal.
-    # jobs.extend(scrape_jobroom(search_term))
+    # Niche Swiss boards (jobchannel network). Each function internally skips
+    # terms outside its sales/IT wheelhouse via _niche_term_is_relevant().
+    jobs.extend(scrape_jobs4sales(search_term))
+    jobs.extend(scrape_ictjobs(search_term))
+
+    # job-room.ch is scraped once for all terms in main() (shared Playwright instance).
 
     log.info(f"[{search_term}] Collected {len(jobs)} jobs total")
     return jobs
@@ -670,6 +1307,24 @@ def _normalize_company(company: str) -> str:
     # Collapse whitespace
     c = re.sub(r"\s+", " ", c).strip()
     return c
+
+
+def _normalize_location(location: str) -> str:
+    """Normalize a job location string for dedup.
+
+    Lowercases, strips country/canton suffixes and aggregator UI noise so
+    that 'Zürich, ZH, Schweiz' and 'Zurich' match.
+    """
+    if not location:
+        return ""
+    loc = location.lower().strip()
+    loc = re.sub(r"\(\+\s*\d+\s*\w+\s*standorte?\)", " ", loc)
+    loc = re.sub(r"\b(schweiz|switzerland|suisse|svizzera|ch)\b\.?", " ", loc)
+    loc = re.sub(r"\b(zh|be|bs|bl|lu|sg|gr|ti|vd|ge|fr|so|sh|tg|ag|ar|ai|gl|ow|nw|sz|ur|zg|ne|ju|vs)\b\.?", " ", loc)
+    loc = loc.replace("ü", "u").replace("ä", "a").replace("ö", "o")
+    loc = re.sub(r"[,;/]+", " ", loc)
+    loc = re.sub(r"\s+", " ", loc).strip()
+    return loc
 
 
 def _fuzzy_dedup_key(job: dict) -> str:
@@ -1000,18 +1655,26 @@ def _job_hash(job: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def load_seen_jobs() -> dict[str, str]:
+def load_seen_jobs() -> dict[str, dict]:
     """Load previously seen job hashes from disk.
 
-    Returns dict: hash -> first_seen ISO timestamp.
+    Returns dict: hash -> {"first_seen": ISO ts, "source": str|None}.
+    Migrates legacy entries (hash -> ISO string) on read.
     """
-    if SEEN_JOBS_FILE.exists():
-        with open(SEEN_JOBS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    if not SEEN_JOBS_FILE.exists():
+        return {}
+    with open(SEEN_JOBS_FILE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    out = {}
+    for h, v in raw.items():
+        if isinstance(v, str):
+            out[h] = {"first_seen": v, "source": None}
+        elif isinstance(v, dict):
+            out[h] = {"first_seen": v.get("first_seen", ""), "source": v.get("source")}
+    return out
 
 
-def save_seen_jobs(seen: dict[str, str]):
+def save_seen_jobs(seen: dict[str, dict]):
     """Persist seen job hashes to disk."""
     with open(SEEN_JOBS_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
@@ -1023,17 +1686,34 @@ def _job_hash_legacy(job: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _job_content_hash(job: dict) -> str:
+    """Content hash including normalized location.
+
+    Catches re-posts where title/company normalize identically and the
+    location matches, even when the URL has changed (tracking params,
+    new aggregator). Stored alongside _job_hash so seen-lookup matches
+    on either axis.
+    """
+    norm_title = _normalize_title(job.get("title", ""))
+    norm_company = _normalize_company(job.get("company", ""))
+    norm_loc = _normalize_location(job.get("location", ""))
+    raw = f"{norm_title}|{norm_company}|{norm_loc}"
+    return "c:" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def filter_new_jobs(jobs: list[dict], seen: dict[str, str]) -> list[dict]:
     """Filter out jobs we've already seen in previous runs.
 
-    Checks both new (normalized, no URL) and legacy (with URL) hashes
-    for backward compatibility with existing seen_jobs.json entries.
+    Checks new (normalized, no URL), content (+ location), and legacy
+    (with URL) hashes for backward compatibility with existing
+    seen_jobs.json entries.
     """
     new_jobs = []
     for job in jobs:
         h_new = _job_hash(job)
         h_legacy = _job_hash_legacy(job)
-        if h_new not in seen and h_legacy not in seen:
+        h_content = _job_content_hash(job)
+        if h_new not in seen and h_legacy not in seen and h_content not in seen:
             new_jobs.append(job)
     return new_jobs
 
@@ -1041,8 +1721,10 @@ def filter_new_jobs(jobs: list[dict], seen: dict[str, str]) -> list[dict]:
 def main():
     """Run the full scraping pipeline with parallel execution."""
     parser = argparse.ArgumentParser(description="Scrape Swiss job listings")
-    parser.add_argument("--hours-old", type=int, default=DEFAULT_HOURS_OLD,
-                        help=f"How far back to search in hours (default: {DEFAULT_HOURS_OLD} = ~30 days)")
+    parser.add_argument("--hours-old", type=int, default=None,
+                        help=f"How far back to search in hours (default: {DEFAULT_HOURS_OLD} = 7 days; --deep overrides to {DEEP_HOURS_OLD})")
+    parser.add_argument("--deep", action="store_true",
+                        help=f"Backfill mode: scrape last {DEEP_HOURS_OLD}h (~30 days) instead of the default {DEFAULT_HOURS_OLD}h")
     parser.add_argument("--reset-seen", action="store_true",
                         help="Clear the seen jobs history and start fresh")
     parser.add_argument("--serp-pages", type=int, default=DEFAULT_SERP_PAGES,
@@ -1051,7 +1733,18 @@ def main():
                         help="Skip SERP API entirely (only use python-jobspy)")
     parser.add_argument("--no-fetch-descriptions", action="store_true",
                         help="Skip fetching missing descriptions from job URLs")
+    parser.add_argument("--no-jobroom", action="store_true",
+                        help="Skip job-room.ch (Swiss federal RAV/SECO board).")
+    parser.add_argument("--no-jobsch", action="store_true",
+                        help="Skip jobs.ch (largest CH job board, public search API).")
+    parser.add_argument("--no-ats", action="store_true",
+                        help="Skip public ATS boards (Greenhouse + Lever curated CH employers).")
     args = parser.parse_args()
+
+    if args.hours_old is None:
+        args.hours_old = DEEP_HOURS_OLD if args.deep else DEFAULT_HOURS_OLD
+    elif args.deep:
+        log.warning(f"Both --hours-old={args.hours_old} and --deep given; using explicit --hours-old")
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1100,6 +1793,30 @@ def main():
     log.info(f"Parallel scraping completed in {elapsed:.1f}s")
     log.info(f"Total raw jobs collected: {len(all_jobs)}")
 
+    # job-room.ch — scraped once across all terms (direct API, sequential).
+    if not args.no_jobroom:
+        jr_start = time.time()
+        log.info(f"[jobroom] Scraping {len(SEARCH_TERMS)} terms...")
+        jr_jobs = scrape_jobroom_all(SEARCH_TERMS, hours_old=args.hours_old)
+        all_jobs.extend(jr_jobs)
+        log.info(f"[jobroom] Collected {len(jr_jobs)} jobs in {time.time() - jr_start:.1f}s")
+
+    # jobs.ch — largest CH board, public search API (sequential).
+    if not args.no_jobsch:
+        js_start = time.time()
+        log.info(f"[jobsch] Scraping {len(SEARCH_TERMS)} terms...")
+        js_jobs = scrape_jobsch_all(SEARCH_TERMS, hours_old=args.hours_old)
+        all_jobs.extend(js_jobs)
+        log.info(f"[jobsch] Collected {len(js_jobs)} jobs in {time.time() - js_start:.1f}s")
+
+    # Public ATS boards (Greenhouse / Lever) — curated CH employer list.
+    if not args.no_ats:
+        ats_start = time.time()
+        log.info("[ats] Scraping public ATS boards (Greenhouse + Lever)...")
+        ats_jobs = scrape_ats_boards_all()
+        all_jobs.extend(ats_jobs)
+        log.info(f"[ats] Collected {len(ats_jobs)} CH jobs in {time.time() - ats_start:.1f}s")
+
     unique_jobs = deduplicate(all_jobs)
     log.info(f"After deduplication: {len(unique_jobs)}")
 
@@ -1119,11 +1836,14 @@ def main():
     for job in new_jobs:
         job["scraped_at"] = scraped_at
 
-    # Update seen jobs history with all unique jobs (including skipped ones)
+    # Update seen jobs history with all unique jobs (including skipped ones).
+    # Store both the title+company hash and the title+company+location content
+    # hash so future runs can detect re-posts on either axis.
     for job in unique_jobs:
-        h = _job_hash(job)
-        if h not in seen:
-            seen[h] = scraped_at
+        src = job.get("source") or None
+        for h in (_job_hash(job), _job_content_hash(job)):
+            if h not in seen:
+                seen[h] = {"first_seen": scraped_at, "source": src}
     save_seen_jobs(seen)
     log.info(f"Updated seen jobs history: {len(seen)} total entries")
 
@@ -1136,6 +1856,19 @@ def main():
     # Log SERP API budget usage
     if _serpapi_call_count > 0:
         log.info(f"SERP API calls this run: {_serpapi_call_count} (budget: 500/month across 2 keys)")
+
+    # Niche-board health check: relevant terms ran but 0 jobs returned → probably
+    # a site-side markup change. Escalate to error so the user notices quickly.
+    for source, stats in _niche_stats.items():
+        if stats["relevant_terms"] > 0 and stats["jobs"] == 0:
+            log.error(
+                f"[{source}] 0 jobs across {stats['relevant_terms']} relevant terms — "
+                "likely markup change or site outage; inspect parser"
+            )
+        elif stats["relevant_terms"] > 0:
+            log.info(
+                f"[{source}] {stats['jobs']} jobs across {stats['relevant_terms']} relevant terms"
+            )
 
     return new_jobs
 

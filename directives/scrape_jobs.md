@@ -17,23 +17,24 @@ Scrape Swiss job listings matching the candidate profile, evaluate each for fit 
 - **Name:** Simon Oberpertinger Mair
 - **Age:** 22 (soon 23)
 - **Nationality:** Italian, relocating to Switzerland
-- **Experience:** ~3 years as Digital Sales Specialist at Durst Group AG
+- **Experience:** ~3 years as Revenue Operations Specialist (officially: Digital Sales Specialist) at Durst Group AG
 - **Skills:** Microsoft Dynamics CRM (advanced), SAP MM/SD, Power BI, SQL, Excel, CPQ configuration, marketing automation
 - **Certifications:** Google Data Analytics Professional Certificate, Microsoft Power BI Data Analyst Professional Certificate, SQL courses (Coursera)
 - **Languages:** German (native), English (C1), Italian (medium)
 - **Education:** Matura diploma (no bachelor/master)
 - **Interests:** AI workflows (n8n, Claude Code), automation, data-driven decisions
-- **Target roles:** CRM Specialist, Digital Sales Specialist, Sales Operations, Business Analyst (CRM-adjacent)
+- **Target roles:** Revenue Operations Specialist, Sales Operations Specialist, CRM Specialist, Business Analyst (CRM-adjacent)
 
 ## Search Configuration
 
 ### Search Terms
 ```
 # Core CRM / Sales (English)
+Revenue Operations Specialist
+Sales Operations Specialist
 CRM Specialist
 Dynamics 365
 Dynamics CRM
-Digital Sales Specialist
 Sales Operations
 Sales Analyst
 Business Analyst CRM
@@ -56,7 +57,17 @@ Revenue Operations
 ### Job Sources (priority order)
 1. **python-jobspy** - Wraps Indeed, LinkedIn, Glassdoor, Google (free, no API key)
 2. **SERP API** (Google Jobs) - Structured job data via Google Jobs index. 2 API keys × 250 free calls/month = 500 calls. Round-robin key rotation. Up to 3 pages/term (30 results). Smart pagination: stops early if all results on a page are already in `seen_jobs.json`.
-3. **Job-Room** (job-room.ch) - Swiss government portal. Currently **disabled** due to SSL hostname mismatch.
+3. **jobs4sales.ch** (jobchannel network, sales-specialized) - Next.js app; job listings served as JSON inside `__NEXT_DATA__` script tag. List URL: `https://jobs4sales.ch/en/jobs?q={term}&page={n}`. Detail URL: `https://jobs4sales.ch/en/job/{jobId}`. Up to 3 pages/term (30 results). `_niche_term_is_relevant()` filter skips terms outside the sales/CRM wheelhouse.
+4. **ictjobs.ch** (jobchannel network, IT-specialized) - Server-rendered HTML cards in `<div class="offer publish">`. Search via `?fs={term}` on root URL (not `?q=`). Listing URLs carry `?fs=` suffix — stripped in parser for clean dedup. Same niche-term filter as jobs4sales.
+5. **job-room.ch** (Swiss federal RAV/SECO board) - Direct API at `https://www.job-room.ch/jobadservice/api/jobAdvertisements/_search` (POST). Unauthenticated; no Playwright needed. Body: `{"keywords":[term],"onlineSince":<days>,"workloadPercentageMin":10,"workloadPercentageMax":100,...}`. Response is a list with `jobAdvertisement.jobContent.{jobDescriptions[0].title|description, company.name, location, externalUrl}`. Many results are syndicated to other boards (jobs.ch etc.) but `externalUrl` points to the canonical employer/aggregator listing — high-quality direct postings, no lead-grab. Scraped sequentially across all SEARCH_TERMS in `main()` (not in the per-term thread pool). Skip with `--no-jobroom`.
+6. **jobs.ch** (largest CH board) — Public search API at `https://www.jobs.ch/api/v1/public/search?query={term}&page={n}` (no auth). Returns JSON with `documents[]`. Per-doc: `title`, `company_name`, `place`, `preview`, `publication_date`, `initial_publication_date`, `age` (days), `_links.detail_de.href`, `employment_grades`. The `age` field is used to filter against `--hours-old` (rounded up to days); pagination stops as soon as a full page is over the cutoff (results sorted recency-first). Up to 5 pages/term. Skip with `--no-jobsch`.
+7. **Public ATS boards** (Greenhouse, Lever) — curated CH employer list at `execution/data/ch_ats_employers.json`. Endpoints: `https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true` and `https://api.lever.co/v0/postings/{slug}?mode=json`. Both unauthenticated, return JSON with dates and full descriptions. Only listings with a CH location pass the `_is_ch_location()` filter (canton/city tokens). **Verify slugs** before adding to the JSON: GET the endpoint and check for 200; many companies' careers-page text differs from their ATS slug. Skip with `--no-ats`.
+
+### Freshness Window
+- **Default:** 168h (7 days) — the recruiter shortlist for Swiss postings typically forms within ~7 days, so older listings have low conversion. Set via `DEFAULT_HOURS_OLD`.
+- **Backfill:** `--deep` flag bumps to 720h (30 days). Use when seeding `seen_jobs.json` for the first time or recovering after a long pause.
+- **Override:** `--hours-old N` sets an explicit value; if combined with `--deep`, the explicit value wins (and a warning is logged).
+- All sources receive the same window: jobspy `hours_old`, SERP API `&date_posted=` mapping, jobroom `onlineSince` (rounded up to days), niche boards / ATS boards filter client-side.
 
 ### SERP API Budget
 - 17 search terms × 3 pages = **51 calls per run** (max)
@@ -92,12 +103,37 @@ Revenue Operations
 - **Within-run (2 layers):**
   1. Exact URL match (normalized: lowercase, strip trailing `/`)
   2. Fuzzy title+company match — strips gender markers `(m/f/d)`, percentage `80-100%`, legal suffixes (AG, GmbH, SA, Ltd...), parenthetical qualifiers `(Schweiz)` etc.
-- **Cross-run:** `seen_jobs.json` stores SHA-256 hashes of **normalized** title+company (no URL), so the same job from Indeed and LinkedIn is recognized as already seen
+- **Cross-run:** `seen_jobs.json` stores **two hashes per job**:
+  - `_job_hash` — normalized title + company (no URL, no location). Catches the same role surfaced on different aggregators.
+  - `_job_content_hash` (`c:` prefix) — normalized title + company + location. Catches re-posts where the title was normalized inconsistently between runs but location matches.
+  - On lookup, a job is "seen" if **either** hash matches an existing entry; both hashes are stored on write. Backward compat: legacy URL-inclusive entries are still honored on read (`_job_hash_legacy`).
+  - Each entry now stores `{"first_seen": ts, "source": str}` so `execution/audit_aggregators.py` can compute per-source unique-hit ratios over a window. Pre-existing string-valued entries auto-migrate to `{"first_seen": <str>, "source": null}` on load.
 - Always keeps the listing with the longest description
 
 ### Rate Limiting
 - 2 second delay between requests to any single source
 - Respect robots.txt where applicable
+
+### Domain Blocklist
+Some sources surface URLs that are useless downstream (paid aggregators, redirect-only domains). Those are dropped in `normalize_job()` before any description fetch / evaluation / sheet write happens, via the `BLOCKED_DOMAINS` frozenset in `execution/scrape_jobs.py`.
+
+Matching: exact host **or** any subdomain — adding `"trabajo.org"` also blocks `ch.trabajo.org`, `www.trabajo.org`, etc.
+
+Currently blocked:
+- `jobleads.com` — paid aggregator, application requires payment
+- `trabajo.org` — always 301-redirects to `jobleads.com`
+- `bebee.com` — aggregator, hides company identity → CVs and cover letters can't be tailored, manual rewrite required per posting
+- `experteer.com` — paid premium-subscription aggregator, listings effectively paywalled
+- `talents.studysmarter.de` — expired listings / lead grab, not real openings
+- `talent.com` — consistently redirects to jobleads.com (paid funnel), added 2026-04-30
+- `cosmoquick.com` — user-excluded, added 2026-04-30
+
+**Policy:** block only (a) paid aggregators and (b) aggregators that strip company identity. Free aggregators that preserve the company name (jooble.org, whatjobs.com, learn4good.com) are **intentionally kept** — they occasionally surface listings the primary sources miss.
+
+**To extend:** append the bare domain (no scheme, no `www.`) to `BLOCKED_DOMAINS`. No other changes needed — the check runs for every scraped URL regardless of source (jobspy, SERP API, future scrapers).
+
+### Aggregator Audit
+`execution/audit_aggregators.py [--days 30]` reads `seen_jobs.json` and prints per-source job counts over the last N days. Use to decide whether a free aggregator (jooble.org, whatjobs.com, learn4good.com) is worth keeping — drop sources whose unique-hit share falls below ~5% of the total. Source data populates only after upgrading scrape runs (legacy entries from before the schema change show as "untagged").
 
 ## Stage 2: Evaluation
 
@@ -175,7 +211,7 @@ Before LLM evaluation, jobs are pre-filtered based on hard disqualifying criteri
 | Score | Title | Company | Location | Source | Key Matches | Key Gaps | Degree Required | Languages OK | Reasoning | Description | URL | Date Posted | Date Scraped | Status | Date_Applied | Application_Method | Contact_Person | Contact_Email | Follow_Up_Sent | Follow_Up_Date | Response_Date | Interview_Date | Notes |
 
 ### Application Tracking Columns (user-managed)
-- **Status**: New → Applied → Follow-Up_Sent → Interviewing → Rejected/No_Response/Offer
+- **Status**: New → Applied → Follow-Up_Sent → Interviewing → Rejected/No_Response/Offer/Expired/Duplicate
 - **Date_Applied**: User fills when applying (DD.MM.YYYY)
 - **Application_Method**: Portal, email, recruiter, etc.
 - **Contact_Person**: Auto-extracted from description (regex), user can override
@@ -229,3 +265,7 @@ Before LLM evaluation, jobs are pre-filtered based on hard disqualifying criteri
 - **Normalization validation:** `normalize_job()` logs warnings for empty company/description fields so downstream stages know what to expect.
 - **Checkpoint ID collision fix:** `_get_job_id()` in evaluate_jobs.py now includes URL SHA-256 hash: `{company}_{title}_{url_hash[:8]}`. Prevents collision when same company posts similar-titled jobs.
 - **LLM response schema validation:** evaluate_jobs.py validates score (int, clamped 1-10), reasoning (str), key_matches (list), key_gaps (list) from LLM JSON. Catches malformed responses instead of silently producing incomplete evaluations.
+- **jobs4sales.ch scraper (2026-04-22):** Next.js app — listings served as JSON in `<script id="__NEXT_DATA__">`. Navigate `props.initialState.public.jobs.jobs.jobs[]`. Fields: `jobId`, `title`, `companyName`, `location`, `datePosted` (ISO), `workload`. Pagination via `?page=N` (10/page). Stop when `page * pageSize >= resultCount`. Descriptions fetched in Phase 2 via detail URL `jobs4sales.ch/en/job/{jobId}`.
+- **ictjobs.ch scraper (2026-04-22):** Server-rendered HTML. Search param is `fs=` (not `q=` — `?q=CRM` returns unfiltered homepage, `?fs=CRM` returns filtered results). Each listing wrapped in `<div class="offer publish">...</div><!--/.offer -->`. Title+URL in `<h2 itemprop="title"><a href="...">`, company in `<span class="author-text">`, location after `<span class="label-in">`, date in `<time datetime="YYYY-MM-DD">`. Strip `?fs=` query from detail URLs before normalize — otherwise the same job from different search terms won't dedupe.
+- **Niche board term filter:** `_niche_term_is_relevant()` in scrape_jobs.py skips dev-only and off-profile terms before hitting jobchannel boards. Saves ~30% of HTTP requests on the ~28 configured search terms without losing signal.
+- **Aggregator blocklist policy (2026-04-22):** block only (a) paid aggregators and (b) those that strip company identity. Free aggregators that preserve company name (talent.com, jooble.org, whatjobs.com, learn4good.com) are intentionally allowed — they occasionally surface unique listings. Added `experteer.com` (paid premium) and `talents.studysmarter.de` (expired/lead-grab) to BLOCKED_DOMAINS.

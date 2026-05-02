@@ -85,6 +85,7 @@ Static: education, certs, languages, photo, personal info.
 - OpenRouter/Qwen3 receives anonymized profile (no name, email, phone, employer name)
 - Google Gemini receives full profile
 - Photo and PII are only in the PDF output, never sent to LLMs
+- **`role_official` is CV-display-only and must never appear in LLM prompts.** `Experience.official_line()` is the only authorized rendering path. If you add a new LLM-driven step, do NOT pass `role_official` to it — the contract title is intentionally stripped from both `profile_anonymous()` and `profile_full()`.
 
 ## Dependencies
 - `playwright>=1.40.0` - HTML to PDF via headless Chromium
@@ -118,3 +119,4 @@ After `pip install playwright`, run: `python -m playwright install chromium`
 - **Title cleaning not applied to folders:** Folder names use the raw `{company}_{title}` for uniqueness. Only the PDF/DOCX subject line is cleaned (done in Stage 4). Folder names with URLs/percentages look messy but are functionally harmless.
 - **Line-height for German (2026-02-11):** Body `line-height: 1.45` was too tight for German text (longer words, more umlauts). Increased to `line-height: 1.55` in `cv_template.html`.
 - **Photo path from env:** `CV_PHOTO_PATH` env var overrides the hardcoded photo path. Falls back to `.tmp/CV_picture 24.06.2025_sizeAdjusted.jpg`. Logs warning if photo not found.
+- **Empty parentheses in titles (2026-03-11):** Fixed in `clean_job_title()` — strips `()` left after percentage removal. Affects folder names and subject lines.
