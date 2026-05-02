@@ -546,11 +546,38 @@ class CoverLetterPDF(FPDF):
 
 
     # Contact extraction consolidated into execution/extract_contacts.py
-from execution.extract_contacts import extract_contact_person as _extract_contact
+from execution.extract_contacts import extract_contact_person as _extract_contact, detect_honorific
 
 
-def _greeting_for_contact(contact_name: str | None, language_code: str) -> str:
-    """Generate appropriate greeting based on whether we have a contact name."""
+def _last_name(full_name: str) -> str:
+    """Best-effort lastname extraction. 'Frau Anna Müller' → 'Müller', 'Dr. Anna Müller' → 'Müller'.
+
+    Strips honorifics + academic titles, then takes the last whitespace-separated token.
+    """
+    if not full_name:
+        return ""
+    # Strip honorifics + common titles from the front
+    cleaned = re.sub(
+        r"^\s*(Frau|Herr|Ms\.?|Mr\.?|Mrs\.?|Sig\.?(?:ra)?|Dott\.?(?:ssa)?|Dr\.?|Prof\.?)\s+",
+        "",
+        full_name.strip(),
+        flags=re.IGNORECASE,
+    )
+    parts = cleaned.split()
+    return parts[-1] if parts else ""
+
+
+def _greeting_for_contact(
+    contact_name: str | None,
+    language_code: str,
+    gender_hint: str | None = None,
+) -> str:
+    """Generate appropriate greeting based on whether we have a contact name + gender.
+
+    Backwards-compat: callers passing only (contact_name, language_code) — the historical
+    signature — get exactly the same output as before. The new `gender_hint` opt-in
+    upgrades the salutation to formal "Sehr geehrte Frau Müller," when known.
+    """
     if not contact_name:
         fallback = {
             "de": "Sehr geehrte Damen und Herren,",
@@ -559,7 +586,26 @@ def _greeting_for_contact(contact_name: str | None, language_code: str) -> str:
         }
         return fallback.get(language_code, fallback["de"])
 
-    # We have a name but don't know gender — use neutral formulations
+    # If gender is known (Frau / Herr / Ms / Mr), use the formal "Sehr geehrte Frau {Lastname}"
+    # form which recruiters in DACH expect from a serious application.
+    last = _last_name(contact_name)
+    hint_lower = (gender_hint or "").strip().lower()
+    if last and hint_lower in ("frau", "ms", "mrs"):
+        formal = {
+            "de": f"Sehr geehrte Frau {last},",
+            "en": f"Dear Ms. {last},",
+            "it": f"Gentile Sig.ra {last},",
+        }
+        return formal.get(language_code, formal["de"])
+    if last and hint_lower in ("herr", "mr"):
+        formal = {
+            "de": f"Sehr geehrter Herr {last},",
+            "en": f"Dear Mr. {last},",
+            "it": f"Gentile Sig. {last},",
+        }
+        return formal.get(language_code, formal["de"])
+
+    # No gender hint — fall back to neutral "Guten Tag" form (existing behavior)
     greeting = {
         "de": f"Guten Tag {contact_name},",
         "en": f"Dear {contact_name},",
@@ -593,7 +639,7 @@ def _strip_trailing_signoff(text: str) -> str:
     return "\n".join(lines)
 
 
-def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None) -> Path:
+def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None, gender_hint: str | None = None) -> Path:
     """Generate a professional cover letter PDF."""
     pdf = CoverLetterPDF(language_code, subtitle=subtitle)
     pdf.set_auto_page_break(auto=True, margin=20)
@@ -628,7 +674,7 @@ def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, co
     pdf.ln(4)
 
     # Greeting (personalized if contact name found)
-    greeting = _greeting_for_contact(contact_name, language_code)
+    greeting = _greeting_for_contact(contact_name, language_code, gender_hint=gender_hint)
     pdf.set_font("Arial", "", 10)
     pdf.cell(0, 6, greeting, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
@@ -662,7 +708,7 @@ def generate_pdf(text: str, job: dict, language_code: str, output_path: Path, co
     return output_path
 
 
-def generate_docx(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None) -> Path:
+def generate_docx(text: str, job: dict, language_code: str, output_path: Path, contact_name: str | None = None, subtitle: str = "Revenue Operations Specialist | CRM • SAP • Power BI", letter_date: str | None = None, gender_hint: str | None = None) -> Path:
     """Generate a professional cover letter DOCX (editable Word document)."""
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -752,7 +798,7 @@ def generate_docx(text: str, job: dict, language_code: str, output_path: Path, c
     p.space_after = Pt(8)
 
     # Greeting
-    greeting = _greeting_for_contact(contact_name, language_code)
+    greeting = _greeting_for_contact(contact_name, language_code, gender_hint=gender_hint)
     p = doc.add_paragraph()
     run = p.add_run(greeting)
     run.font.size = Pt(10)
@@ -1160,6 +1206,11 @@ def generate_cover_letter_for_job(
 
     # Try to find a contact person name: regex first (free), LLM fallback (cheap)
     contact_name = _extract_contact(description, openrouter_key=openrouter_key, gemini_key=gemini_key)
+    # Best-effort gender hint for the salutation — purely additive: if missing, the
+    # greeting falls back to today's neutral "Guten Tag {name}," form.
+    gender_hint = detect_honorific(description) if contact_name else None
+    if gender_hint:
+        log.info(f"  Honorific detected: {gender_hint}")
 
     # Research company for personalization (cached, cheap)
     job_url = job.get("url", "")
@@ -1386,12 +1437,12 @@ def generate_cover_letter_for_job(
     safe_name = sanitize_filename(_load_profile().personal.name)
     output_path = OUTPUT_DIR / folder_name / f"Cover_Letter_{safe_name}.pdf"
 
-    pdf_path = generate_pdf(text, job, lang_code, output_path, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date)
+    pdf_path = generate_pdf(text, job, lang_code, output_path, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date, gender_hint=gender_hint)
     log.info(f"  PDF saved: {pdf_path}")
 
     # Generate DOCX (editable version)
     docx_output = output_path.with_suffix(".docx")
-    docx_path = generate_docx(text, job, lang_code, docx_output, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date)
+    docx_path = generate_docx(text, job, lang_code, docx_output, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date, gender_hint=gender_hint)
     log.info(f"  DOCX saved: {docx_path}")
 
     return {

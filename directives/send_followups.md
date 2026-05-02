@@ -1,7 +1,10 @@
-# Directive: Follow-Up Email Automation
+# Directive: Follow-Up Email Automation (Multi-Touch)
 
 ## Goal
-Automatically send personalized follow-up emails for jobs where the user has applied but not received a response within 3-5 days. Increases response rate by 15-25%.
+Send a sequence of three personalized follow-up emails per applied job, at 3 / 6 / 12
+business days after `Date_Applied`. Multi-touch sequences typically double-to-triple
+reply rates compared to a single follow-up — and Phase 2's Stage 4.5 contact discovery
+means most rows actually have a real `Contact_Email` to reach.
 
 ## Pipeline Position
 **Stage 6** — runs after user manually updates Google Sheet status to "Applied"
@@ -31,13 +34,32 @@ Automatically send personalized follow-up emails for jobs where the user has app
 
 ## Configuration
 
-- **Minimum wait**: 3 days after application (configurable via `--days`)
-- **Maximum wait**: 14 days (configurable via `--max-days`, avoids emailing ancient applications)
-- **DRY RUN by default**: Must pass `--send` flag to actually send emails
+- **Cadence (fixed)**: 3 / 6 / 12 business days since `Date_Applied`. Each row may
+  receive up to 3 touches total. After touch 3, no further follow-ups are sent —
+  `prune_stale_jobs` eventually moves the row to `No_Response`.
+- **Maximum wait**: 30 calendar days (configurable via `--max-days`). Sanity guard
+  for very stale rows; covers touch 3 (12 bd ≈ 17 cal days) plus weekend slack.
+- **DRY RUN by default**: must pass `--send` to actually send emails
+- **Cron (cloud)**: Mon-Fri 08:00 CET (06:00 UTC) — daily, weekdays only
 - **LLM**: OpenRouter (Qwen3 235B) primary, Gemini 3 Flash fallback
 - **Temperature**: 0.3 (slightly creative but consistent)
 - **Rate limit**: 5s between email sends
 - **Sender**: Configured via Gmail OAuth (the authenticated account)
+
+## Three touch templates (selected by `touch_index` in the job dict)
+
+- **Touch 1** — gentle ping (3 bd). Existing template, byte-identical to pre-Phase 2.
+  `FOLLOWUP_PROMPT` in `send_followups.py`.
+- **Touch 2** — value-add angle (6 bd). Less "checking in", more "here's something
+  useful". Open with a concrete value-add (relevant insight from background, brief
+  thought about a public company priority, or offer to share a case study link).
+  Softer ask. `FOLLOWUP_PROMPT_TOUCH_2`.
+- **Touch 3** — soft close (12 bd). Final touch. Polite, gracious, signals continued
+  availability without pressure. `FOLLOWUP_PROMPT_TOUCH_3`.
+
+All three share the same quality gate (15–200 word body, 5–120 char subject, JSON
+parse + retry at temperature 0.5). The structural switch is purely the prompt;
+Gmail send / sheet write logic is identical across touches.
 
 ## Script: `execution/send_followups.py`
 
@@ -47,17 +69,22 @@ Automatically send personalized follow-up emails for jobs where the user has app
 ### Usage
 ```bash
 python execution/send_followups.py                    # DRY RUN (prints emails, doesn't send)
-python execution/send_followups.py --send             # Actually send follow-up emails
-python execution/send_followups.py --days 5           # Wait 5 days instead of 3
-python execution/send_followups.py --max-days 21      # Allow up to 21 days old
+python execution/send_followups.py --send             # Actually send the touches due today
+python execution/send_followups.py --max-days 21      # Skip rows older than 21 calendar days
 python execution/send_followups.py --sheet-name "X"   # Custom sheet name
 ```
 
-### Eligibility Criteria
-A job row is eligible for follow-up when ALL conditions are met:
+### Eligibility Criteria (per-row, per-run)
+A row triggers a touch when ALL conditions are met:
 1. `Status` = "Applied"
-2. `Follow_Up_Sent` = "No"
-3. `Date_Applied` is at least `--days` days ago (default: 3)
+2. Has `Contact_Email` (valid format)
+3. No `Response_Date` set
+4. `Date_Applied` is parseable
+5. Calendar age ≤ `--max-days` (default 30)
+6. **Some touch is due today** — `_due_touch_index(date_applied, touch_count, today)`
+   returns 1 / 2 / 3, not None. The function reads `Follow_Up_Count` (with backfill
+   from `Follow_Up_Sent="Yes"` for legacy rows) and compares elapsed business days
+   against the next threshold (3 / 6 / 12).
 4. `Date_Applied` is at most `--max-days` days ago (default: 14)
 5. `Response_Date` is empty (no response received yet)
 6. `Contact_Email` is not empty

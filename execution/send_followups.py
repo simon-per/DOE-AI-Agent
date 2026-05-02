@@ -95,7 +95,17 @@ _DEFAULT_COL_INDICES = {
     "Follow_Up_Sent": 20,
     "Follow_Up_Date": 21,
     "Response_Date": 22,
+    # Multi-touch follow-up bookkeeping (Phase 2 — auto-created if absent in header)
+    "Follow_Up_Count": 30,
+    "Follow_Up_Last_Date": 31,
 }
+
+# Multi-touch follow-up cadence (business days since Date_Applied).
+# Touch 1 = the existing 3-bd "gentle ping" (today's behavior, byte-identical prompt).
+# Touch 2 = value-add angle (6 bd).
+# Touch 3 = soft close (12 bd). After this, no further touches — let prune_stale_jobs
+# move the row to No_Response on its own schedule.
+_TOUCH_THRESHOLDS_BD = (3, 6, 12)
 
 # Will be populated at runtime from the header row
 _col_indices: dict[str, int] = {}
@@ -198,6 +208,126 @@ BANNED PHRASES:
 
 Respond with ONLY valid JSON:
 {{"subject": "Brief subject line in {language}", "body": "The email body text"}}"""
+
+
+# Touch 2 — value-add angle, sent ~6 business days after Date_Applied.
+# Different from Touch 1: less "checking in", more "here's something useful".
+FOLLOWUP_PROMPT_TOUCH_2 = """Write a SECOND follow-up email for a job application — value-add angle.
+
+CONTEXT:
+- Candidate: """ + SENDER_NAME + """ (""" + _profile.experience.role + """, CRM/SAP/Power BI experience)
+- Applied for: {title} at {company}
+- Applied on: {date_applied}
+- Contact person: {contact_person}
+- Company info: {company_context}
+- This is the SECOND email — first follow-up was sent some days ago and didn't get a reply.
+
+RULES:
+- Language: {language} (match the job posting language)
+- Length: 4-6 sentences MAXIMUM
+- Tone: Professional, confident, NOT desperate. Add value, don't beg.
+- Open with one concrete value-add: a relevant insight from your background, a brief
+  thought about a publicly known company priority, or an offer to share a relevant
+  case study / portfolio link. Pick what fits the company info above.
+- Make the ask softer than the first email — "happy to share more if useful".
+- Acknowledge they're busy without being apologetic.
+- Swiss style: No "ß" (use "ss"), no clichés.
+- If German: Use "Guten Tag" greeting.
+
+BANNED PHRASES:
+- "Ich wollte nochmal nachfragen..." (rote)
+- "Falls Sie meine vorige E-Mail übersehen haben..." (passive-aggressive)
+- "Just following up..." (lazy)
+- "Bumping this..." (informal)
+
+Respond with ONLY valid JSON:
+{{"subject": "Brief subject line in {language}", "body": "The email body text"}}"""
+
+
+# Touch 3 — soft close, sent ~12 business days after Date_Applied.
+# Last touch. Signals availability, leaves the door open.
+FOLLOWUP_PROMPT_TOUCH_3 = """Write a THIRD and FINAL follow-up email for a job application — soft close.
+
+CONTEXT:
+- Candidate: """ + SENDER_NAME + """ (""" + _profile.experience.role + """, CRM/SAP/Power BI experience)
+- Applied for: {title} at {company}
+- Applied on: {date_applied}
+- Contact person: {contact_person}
+- Company info: {company_context}
+- This is the THIRD email; previous two went unanswered. This is the final touch —
+  graceful, not bitter.
+
+RULES:
+- Language: {language} (match the job posting language)
+- Length: 3-5 sentences MAXIMUM
+- Tone: Polite, professional, gracious. Acknowledge timing may not be right.
+- Open with a phrase like "Letzte kurze Nachricht meinerseits" (DE) or "One last note from me" (EN) — signal you respect their time.
+- State you remain available and reachable.
+- Leave the door explicitly open for a future conversation.
+- Do NOT pressure, guilt, or imply a deadline.
+- Swiss style: No "ß" (use "ss"), no clichés.
+- If German: Use "Guten Tag" greeting.
+
+BANNED PHRASES:
+- "Schade, dass..." (negative)
+- "Ich gebe Ihnen eine letzte Chance..." (presumptuous)
+- "Da ich nichts gehört habe..." (passive-aggressive)
+- "I assume you're not interested..." (defeatist)
+
+Respond with ONLY valid JSON:
+{{"subject": "Brief subject line in {language}", "body": "The email body text"}}"""
+
+
+def _get_touch_count(row: list) -> int:
+    """Read Follow_Up_Count from a sheet row with backwards-compat backfill.
+
+    Existing rows from before Phase 2 have empty Follow_Up_Count. We treat:
+      - empty Follow_Up_Count + Follow_Up_Sent="Yes" → 1 (touch 1 already sent)
+      - empty Follow_Up_Count + Follow_Up_Sent="No"/empty → 0 (none sent)
+      - numeric Follow_Up_Count → that value (clamped to [0, 3])
+
+    This means rows mid-flight on the day we deploy multi-touch see touch 2 next
+    instead of touch 1 again — exactly the behavior we want.
+    """
+    raw = _safe_cell(row, "Follow_Up_Count")
+    if raw:
+        try:
+            n = int(raw)
+            return max(0, min(3, n))
+        except (ValueError, TypeError):
+            pass
+    legacy_sent = _safe_cell(row, "Follow_Up_Sent").lower() == "yes"
+    return 1 if legacy_sent else 0
+
+
+def _due_touch_index(date_applied, touch_count: int, today) -> int | None:
+    """Return 1, 2, or 3 if the next touch is due today; otherwise None.
+
+    Cadence (business days since Date_Applied):
+        touch 1 due at 3 bd  (touch_count == 0)
+        touch 2 due at 6 bd  (touch_count == 1)
+        touch 3 due at 12 bd (touch_count == 2)
+    No 4th touch — touch_count >= 3 returns None.
+    """
+    if touch_count >= 3:
+        return None
+    if touch_count < 0 or touch_count > 2:
+        return None
+    bd = _business_days_between(date_applied, today)
+    threshold = _TOUCH_THRESHOLDS_BD[touch_count]
+    if bd < threshold:
+        return None
+    return touch_count + 1
+
+
+def _prompt_for_touch(touch_index: int) -> str:
+    """Pick the prompt template matching the touch number."""
+    if touch_index == 2:
+        return FOLLOWUP_PROMPT_TOUCH_2
+    if touch_index == 3:
+        return FOLLOWUP_PROMPT_TOUCH_3
+    # Touch 1 (or any unexpected value — defensive default)
+    return FOLLOWUP_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +464,18 @@ def send_gmail(gmail_service, to_email: str, subject: str, body: str):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dict]:
-    """Find jobs eligible for follow-up from Google Sheet."""
+def find_eligible_jobs(worksheet, max_days: int = 30) -> list[dict]:
+    """Find jobs eligible for any of the 3 follow-up touches.
+
+    Multi-touch logic (Phase 2): each row may receive up to 3 touches at 3 / 6 / 12
+    business days since Date_Applied. Eligibility for THIS run is decided per row by
+    `_due_touch_index(date_applied, touch_count, today)` — that's the only filter
+    that depends on cadence; the other filters (status, email, response) are unchanged.
+
+    `max_days` (calendar) is a sanity guard so very old rows don't trigger a touch 3
+    long after they should have been pruned. Default 30 covers a 12-bd touch 3 with
+    plenty of slack for weekends/holidays.
+    """
     global _col_indices
     all_data = worksheet.get_all_values()
     if len(all_data) <= 1:
@@ -355,15 +495,10 @@ def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dic
         status = _safe_cell(row, "Status")
         date_applied_str = _safe_cell(row, "Date_Applied")
         contact_email = _safe_cell(row, "Contact_Email")
-        follow_up_sent = _safe_cell(row, "Follow_Up_Sent")
         response_date = _safe_cell(row, "Response_Date")
 
         # Must be "Applied" status
         if status.lower() != "applied":
-            continue
-
-        # Must NOT have already sent a follow-up
-        if follow_up_sent.lower() == "yes":
             continue
 
         # Must NOT have received a response
@@ -383,7 +518,7 @@ def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dic
             log.warning(f"  Row {row_idx}: Invalid email format '{contact_email}' for '{title}', skipping")
             continue
 
-        # [M7] Must have Date_Applied and be >= min_days ago
+        # [M7] Must have Date_Applied
         if not date_applied_str or not date_applied_str.strip():
             continue
 
@@ -401,15 +536,24 @@ def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dic
                 log.warning(f"  Row {row_idx}: Could not parse date '{date_applied_str}'")
                 continue
 
-            biz_days = _business_days_between(date_applied, today)
             calendar_days = (today - date_applied).days
-            if biz_days < min_days:
-                title = _safe_cell(row, "Title") or "?"
-                log.info(f"  '{title}' — {biz_days} business days since applied (need {min_days}), skipping")
-                continue
             if calendar_days > max_days:
                 title = _safe_cell(row, "Title") or "?"
                 log.info(f"  '{title}' — applied {calendar_days} calendar days ago (>{max_days}, too old), skipping")
+                continue
+
+            # Multi-touch eligibility — read existing touch count (with backfill) and
+            # compute which touch (if any) is due today. None → not yet / already done.
+            touch_count = _get_touch_count(row)
+            touch_index = _due_touch_index(date_applied, touch_count, today)
+            biz_days = _business_days_between(date_applied, today)
+            if touch_index is None:
+                title = _safe_cell(row, "Title") or "?"
+                if touch_count >= 3:
+                    log.info(f"  '{title}' — already received 3 touches, skipping")
+                else:
+                    next_threshold = _TOUCH_THRESHOLDS_BD[touch_count]
+                    log.info(f"  '{title}' — {biz_days} bd elapsed; touch {touch_count + 1} due at {next_threshold} bd")
                 continue
 
         except Exception as e:
@@ -427,6 +571,8 @@ def find_eligible_jobs(worksheet, min_days: int, max_days: int = 14) -> list[dic
             "contact_email": contact_email,
             "date_applied": date_applied_str,
             "days_since": biz_days,
+            "touch_count": touch_count,    # 0 / 1 / 2 — touches BEFORE this run
+            "touch_index": touch_index,    # 1 / 2 / 3 — the touch we're about to send
         })
 
     return eligible
@@ -460,7 +606,12 @@ def _parse_email_response(raw: str, job: dict) -> dict | None:
 
 
 def generate_followup_email(job: dict, openrouter_key, gemini_key, company_cache: dict, researched_companies: dict) -> dict:
-    """Generate a follow-up email using LLM. Retries once on failure. [H3][H7]"""
+    """Generate a follow-up email using LLM. Retries once on failure. [H3][H7]
+
+    Selects the prompt template based on `job["touch_index"]` (1/2/3) — touch 1 uses
+    the original prompt byte-for-byte, touches 2 + 3 use new value-add and soft-close
+    variants. Quality gate (word count, JSON parse) is identical across all three.
+    """
     language = detect_language(job["title"], job["description"])
 
     # [C2][H2] Get company context from cache with proper format + key handling
@@ -498,7 +649,9 @@ def generate_followup_email(job: dict, openrouter_key, gemini_key, company_cache
     else:
         contact = "Hiring Manager"
 
-    prompt = FOLLOWUP_PROMPT.format(
+    touch_index = job.get("touch_index", 1) or 1
+    prompt_template = _prompt_for_touch(touch_index)
+    prompt = prompt_template.format(
         title=job["title"],
         company=job["company"],
         date_applied=job["date_applied"],
@@ -542,13 +695,20 @@ def generate_followup_email(job: dict, openrouter_key, gemini_key, company_cache
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Send follow-up emails for applied jobs")
+    parser = argparse.ArgumentParser(description="Send multi-touch follow-up emails for applied jobs")
     parser.add_argument("--send", action="store_true", help="Actually send emails (default: dry run)")
-    parser.add_argument("--days", type=int, default=3, help="Minimum days since application (default: 3)")
-    parser.add_argument("--max-days", type=int, default=14, help="Maximum days since application (default: 14)")
+    parser.add_argument("--max-days", type=int, default=30,
+                        help="Skip rows older than this many calendar days (default: 30, "
+                             "covers touch 3 at 12 bd plus weekend slack)")
     parser.add_argument("--sheet-name", default="Swiss Job Search Pipeline", help="Name of the Google Sheet")
     parser.add_argument("--reset-checkpoint", action="store_true", help="Clear follow-up checkpoint and recheck all")
+    # Backwards-compat: accepted but ignored. Cadence is fixed at 3/6/12 business days.
+    parser.add_argument("--days", type=int, default=None,
+                        help=argparse.SUPPRESS)  # legacy single-touch flag — no longer used
     args = parser.parse_args()
+    if args.days is not None:
+        log.warning(f"--days={args.days} is ignored — multi-touch cadence is fixed at "
+                    f"{_TOUCH_THRESHOLDS_BD} business days.")
 
     if not args.send:
         log.info("=" * 60)
@@ -580,9 +740,12 @@ def main():
 
     worksheet = spreadsheet.sheet1
 
-    # Find eligible jobs
-    log.info(f"Scanning sheet for jobs applied >= {args.days} business days ago (max {args.max_days} calendar days) with Contact_Email...")
-    eligible = find_eligible_jobs(worksheet, min_days=args.days, max_days=args.max_days)
+    # Find eligible jobs (multi-touch — each row checked against its individual touch count)
+    log.info(
+        f"Scanning sheet for follow-up touches at {_TOUCH_THRESHOLDS_BD} business days "
+        f"(max {args.max_days} calendar days, must have Contact_Email)..."
+    )
+    eligible = find_eligible_jobs(worksheet, max_days=args.max_days)
 
     if not eligible:
         log.info("No jobs eligible for follow-up.")
@@ -605,14 +768,17 @@ def main():
     sent_count = 0
     skipped_checkpoint = 0
     for i, job in enumerate(eligible):
-        # [H1] Use job_id (stable) as checkpoint key — not row_idx (shifts on row insert/delete)
+        # [H1] Use job_id (stable) as checkpoint key — not row_idx (shifts on row insert/delete).
+        # Include touch_index so a row can be deduplicated *per touch*: re-running the script
+        # the same day won't re-send touch N, but touch N+1 (a future run) is still allowed.
         job_id = job.get("job_id") or f"row_{job['row_idx']}"
-        checkpoint_key = (job_id, job["contact_email"])
+        touch_index = job["touch_index"]
+        checkpoint_key = (job_id, job["contact_email"], touch_index)
         if checkpoint_key in sent_checkpoint:
             skipped_checkpoint += 1
             continue
 
-        log.info(f"\n[{i + 1}/{len(eligible)}] {job['title']} at {job['company']}")
+        log.info(f"\n[{i + 1}/{len(eligible)}] [TOUCH {touch_index}/3] {job['title']} at {job['company']}")
         log.info(f"  Applied: {job['date_applied']} ({job['days_since']} business days ago)")
         log.info(f"  Email: {job['contact_email']}")
 
@@ -645,8 +811,18 @@ def main():
                 today = datetime.now().strftime("%d.%m.%Y")
                 # Column indices are 1-based in gspread update
                 worksheet.update_cell(job["row_idx"], _col("Follow_Up_Sent") + 1, "Yes")
-                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Date") + 1, today)
-                log.info(f"  Sheet marked: Follow_Up_Sent=Yes, Follow_Up_Date={today}")
+                # Phase 2: track the touch number and date of *this* touch separately.
+                # Follow_Up_Date stays at the FIRST touch date for backwards compat
+                # (existing dashboards / prune_stale_jobs read it).
+                if touch_index == 1:
+                    worksheet.update_cell(job["row_idx"], _col("Follow_Up_Date") + 1, today)
+                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Count") + 1, str(touch_index))
+                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Last_Date") + 1, today)
+                log.info(
+                    f"  Sheet marked: Follow_Up_Count={touch_index}, "
+                    f"Follow_Up_Last_Date={today}"
+                    + (f", Follow_Up_Date={today}" if touch_index == 1 else "")
+                )
 
                 # Now send the email (sheet already marked, so no duplicate on rerun)
                 try:

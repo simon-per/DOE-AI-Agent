@@ -294,14 +294,18 @@ def pipeline_scrape_write() -> None:
 
 
 @app.function(
-    schedule=modal.Cron("0 7 * * 1,3,5"),  # Mon / Wed / Fri 09:00 CEST
+    # Mon-Fri 06:00 UTC = 08:00 CEST (summer) / 07:00 CET (winter).
+    # Multi-touch flow checks each row against 3/6/12-bd thresholds and only sends
+    # what's actually due — running daily means a touch fires on the first business
+    # day after its threshold instead of waiting up to 2 days for the next M/W/F.
+    schedule=modal.Cron("0 6 * * 1-5"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=600,
     max_containers=1,
 )
 def pipeline_send_followups() -> None:
-    """Stage 6: send follow-up emails for Applied jobs."""
+    """Stage 6: send multi-touch follow-up emails (3 / 6 / 12 business days)."""
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     _run("send_followups.py", "--send", stage_label="send_followups")
@@ -324,6 +328,24 @@ def pipeline_prune() -> None:
 
 
 @app.function(
+    # Sun 16:00 UTC = 18:00 CEST (summer) / 17:00 CET (winter).
+    # Sent on Sunday evening so the metrics cover the full Mon–Sun window and the
+    # candidate sees them before Monday's working day starts.
+    schedule=modal.Cron("0 16 * * 0"),
+    volumes={str(TMP_DIR): volume},
+    secrets=secrets,
+    timeout=300,
+    max_containers=1,
+)
+def pipeline_weekly_digest() -> None:
+    """Email a weekly pipeline digest (read-only on the sheet)."""
+    _write_oauth_files()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    _run("weekly_digest.py", stage_label="weekly_digest")
+    volume.commit()
+
+
+@app.function(
     schedule=modal.Cron("0 */2 * * *"),    # Every 2 hours
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
@@ -332,7 +354,7 @@ def pipeline_prune() -> None:
     max_containers=1,
 )
 def pipeline_generate_applications() -> None:
-    """Stage 4+5: cover letter + CV for Ready_to_Apply rows → Google Drive.
+    """Stage 4 + 4.5 + 5: cover letter + CV + contact discovery for Ready_to_Apply rows.
 
     Polls the Sheet every 2 hours. Skips rows already in APPLYING/Applied.
     Generated PDFs/DOCXs are uploaded to Google Drive (DOE Applications/).
@@ -344,7 +366,8 @@ def pipeline_generate_applications() -> None:
       2. preflight: verify every API surface BEFORE any LLM call
       3. cover-letter stage → commit (CL checkpoint persists even if CV fails)
       4. CV stage → commit
-      5. notify success → commit
+      5. contact-discovery stage 4.5 → commit (free email lookup, fail-soft)
+      6. notify success → commit
     """
     os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
     _write_oauth_files()
@@ -353,6 +376,11 @@ def pipeline_generate_applications() -> None:
     _run("generate_cover_letter.py", "--sheet-triggered", stage_label="generate_cover_letter")
     volume.commit()
     _run("generate_cv.py", "--sheet-triggered", stage_label="generate_cv")
+    volume.commit()
+    # Stage 4.5: free contact-email discovery for the rows we just generated docs for.
+    # discover_contacts.py is fail-soft (always exits 0), so a slow site can't abort the
+    # pipeline — at worst, those rows ship with empty Contact_Email and the next run retries.
+    _run("discover_contacts.py", "--sheet-triggered", stage_label="discover_contacts")
     volume.commit()
     _notify_applications_ready()
     volume.commit()

@@ -86,6 +86,16 @@ HEADERS = [
     "CL_Generated",
     "CL_Quality_Score",
     "CV_Generated",
+    # Auto-populated by Stage 4.5 (discover_contacts.py)
+    "Contact_Source",        # Posting | Impressum | Google | Pattern | NOT_FOUND | Manual
+    "Contact_Confidence",    # high | medium | low
+    # Auto-populated by Stage 6 (send_followups.py) — multi-touch tracking
+    "Follow_Up_Count",       # 0 / 1 / 2 / 3 (number of touches sent)
+    "Follow_Up_Last_Date",   # Date of most recent touch (DD.MM.YYYY)
+    # Manual outcome tracking — feeds the weekly digest
+    "Response_Received",     # Yes / No (blank = unknown)
+    "Response_Type",         # Auto-reject | Recruiter | Interview | Offer | Ghosted
+    "Outcome_Notes",         # Free-text notes on the outcome
 ]
 
 # URL column index (0-based) for deduplication

@@ -744,3 +744,144 @@ def research_company(
     cache[cache_key] = result
     _save_company_cache(cache)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Contact discovery — SerpAPI source for discover_contacts.py (Source 3)
+# ---------------------------------------------------------------------------
+
+def search_company_contacts(
+    domain: str,
+    company_name: str,
+    max_serp_calls: int = 2,
+) -> list[dict]:
+    """Find HR / recruiter contacts for a company via Google search snippets.
+
+    Strategy:
+        1. `site:linkedin.com/in "{company_name}" ("Talent" OR "Recruiter" OR "HR")` —
+           returns LinkedIn profiles whose headline mentions HR-adjacent roles.
+        2. `"@{domain}" ("HR" OR "Recruiting" OR "Talent")` — returns directory pages,
+           press releases, etc. that may carry an explicit recruiter email.
+
+    Each query costs 1 SERP credit. Capped at `max_serp_calls` (default 2 = ~$0.005).
+
+    Returns:
+        List of contact dicts: `[{"name", "email", "title", "source_url", "source": "google"}, …]`.
+        `email` is None for LinkedIn snippets (only name + title parseable).
+        Empty list on any failure or no SerpAPI key.
+    """
+    domain_clean = (domain or "").strip().lower().lstrip("@").lstrip("/")
+    if not domain_clean and not company_name:
+        return []
+
+    queries: list[str] = []
+    if company_name:
+        queries.append(
+            f'site:linkedin.com/in "{company_name}" ("Talent" OR "Recruiter" OR "HR" OR "People")'
+        )
+    if domain_clean:
+        queries.append(f'"@{domain_clean}" ("HR" OR "Recruiting" OR "Talent")')
+
+    queries = queries[:max_serp_calls]
+    if not queries:
+        return []
+
+    raw_hits: list[dict] = []
+    for q in queries:
+        results = search_google(q, num_results=3)
+        for r in results:
+            raw_hits.append({
+                "title": r.get("title", ""),
+                "snippet": r.get("snippet", ""),
+                "link": r.get("link", ""),
+                "query": q,
+            })
+
+    if not raw_hits:
+        log.info(f"  search_company_contacts: no SERP hits for {company_name} / {domain_clean}")
+        return []
+
+    # LLM-parse the snippets in one batch — cheaper than per-result calls
+    return _llm_parse_contact_serp_hits(raw_hits, company_name, domain_clean)
+
+
+def _llm_parse_contact_serp_hits(
+    hits: list[dict],
+    company_name: str,
+    domain: str,
+) -> list[dict]:
+    """Distill SERP snippets into structured contacts. Errors → []."""
+    if not hits:
+        return []
+
+    # Build a compact prompt — title + snippet + link, indexed
+    formatted = "\n\n".join(
+        f"[{i}]\nTitle: {h['title']}\nSnippet: {h['snippet']}\nURL: {h['link']}"
+        for i, h in enumerate(hits[:6])
+    )
+
+    prompt = (
+        f"From these Google search results about people at {company_name} ({domain}), "
+        "extract contact-relevant individuals (HR, recruiters, hiring managers, talent, "
+        "people / culture roles). Return ONLY valid JSON:\n"
+        '{"contacts": [{"name": "...", "email": "...", "title": "...", "source_index": 0}, ...]}\n\n'
+        "Rules:\n"
+        "- name: full name as it appears in the snippet, or null\n"
+        f"- email: only if it explicitly contains '@{domain}' (skip otherwise — LinkedIn snippets "
+        "  rarely include real emails). null if absent.\n"
+        "- title: their role / job title, or null\n"
+        "- source_index: which numbered result (0,1,2,...) supplied this person\n"
+        "- Return at most 4 entries. Skip entries that look like job postings or company pages.\n"
+        "- If nothing useful is found, return {\"contacts\": []}.\n\n"
+        f"Search results:\n{formatted}"
+    )
+
+    try:
+        from execution.llm_client import call_llm, parse_json_response
+        response, provider = call_llm(
+            os.getenv("OPEN_ROUTER_API_KEY"),
+            os.getenv("GOOGLE_AI_STUDIO_API_KEY"),
+            prompt,
+            temperature=0.1,
+            max_tokens=500,
+            json_mode=True,
+        )
+        data = parse_json_response(response) or {}
+        raw_contacts = data.get("contacts") or []
+        out: list[dict] = []
+        for entry in raw_contacts[:4]:
+            if not isinstance(entry, dict):
+                continue
+            name = (entry.get("name") or "").strip() if isinstance(entry.get("name"), str) else None
+            email = (entry.get("email") or "").strip() if isinstance(entry.get("email"), str) else None
+            title = (entry.get("title") or "").strip() if isinstance(entry.get("title"), str) else None
+            # Coerce sentinel strings to None
+            for placeholder in ("null", "none", "n/a", ""):
+                if name and name.lower() == placeholder:
+                    name = None
+                if email and email.lower() == placeholder:
+                    email = None
+                if title and title.lower() == placeholder:
+                    title = None
+            # Strip emails not on the right domain (LLM hallucination guard)
+            if email and domain and f"@{domain}" not in email.lower():
+                email = None
+            if not (name or email):
+                continue
+            idx = entry.get("source_index")
+            source_url = ""
+            if isinstance(idx, int) and 0 <= idx < len(hits):
+                source_url = hits[idx].get("link", "")
+            out.append({
+                "name": name,
+                "email": email,
+                "title": title,
+                "source_url": source_url,
+                "source": "google",
+            })
+        if out:
+            log.info(f"  search_company_contacts: {len(out)} contact(s) via {provider}")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"  LLM parse of SERP contacts failed: {type(exc).__name__}: {exc}")
+        return []

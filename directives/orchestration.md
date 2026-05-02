@@ -6,27 +6,30 @@ Run the 7-stage Swiss job application pipeline end-to-end. This is the master di
 ## Pipeline Stages
 
 ```
-Stage 1: Scrape     → raw_jobs.json
-Stage 2: Evaluate   → scored_jobs.json
-Stage 3: Sheet      → Google Sheet (deliverable)
-Stage 4: Cover      → PDF + DOCX cover letters
-Stage 5: CV         → PDF + DOCX tailored CVs
-Stage 6: Follow-up  → Emails sent + sheet updated
-Stage 7: Swarm      → Browser-based auto-apply (HITL)
+Stage 1:   Scrape     → raw_jobs.json
+Stage 2:   Evaluate   → scored_jobs.json
+Stage 3:   Sheet      → Google Sheet (deliverable)
+Stage 4:   Cover      → PDF + DOCX cover letters (gender-aware salutation)
+Stage 4.5: Contacts   → Discover Contact_Email + Contact_Person from 5 free sources
+Stage 5:   CV         → PDF + DOCX tailored CVs
+Stage 6:   Follow-up  → 3-touch sequence (3 / 6 / 12 business days)
+Stage 7:   Swarm      → Browser-based auto-apply (HITL)
++ Weekly digest       → Reply-rate metrics emailed every Sunday evening
 ```
 
 ## Execution Model: Cloud vs Local
 
-The full preparation pipeline (Stages 1–6) runs autonomously on Modal. Local
-execution is the rare-debug fallback only. Stage 7 (apply) stays local because
-you submit applications manually.
+The full preparation pipeline (Stages 1–6 + Stage 4.5 + weekly digest) runs
+autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
+(apply) stays local because you submit applications manually.
 
 | Where | Stages | Trigger |
 |---|---|---|
 | **Modal (cloud)** | 1+2+3 (scrape → evaluate → sheet) | Tue+Thu 17:00 CEST cron |
-| **Modal (cloud)** | **4+5 (cover letter + CV)** | **Every 2h cron** — picks up rows with `Status=Ready_to_Apply` |
-| **Modal (cloud)** | 6 (send follow-ups) | Mon/Wed/Fri 09:00 CEST cron |
+| **Modal (cloud)** | **4 + 4.5 + 5 (CL + contacts + CV)** | **Every 2h cron** — picks up rows with `Status=Ready_to_Apply` |
+| **Modal (cloud)** | 6 (send follow-ups, multi-touch) | Mon-Fri 08:00 CEST cron |
 | **Modal (cloud)** | Maintenance: prune_stale_jobs | Daily 05:45 CEST cron |
+| **Modal (cloud)** | Weekly digest | Sun 18:00 CEST cron |
 | **Local (HITL)** | 7 (apply) | Run manually — Simon submits each application |
 
 **Modal app:** `execution/modal_pipeline.py`
@@ -202,16 +205,76 @@ python execution/run_swarm.py --limit 3
 
 **Common flags:** Same as Stage 4.
 
-### Stage 6: Send Follow-Ups
+### Stage 4.5: Discover Contacts
+**Script:** `execution/discover_contacts.py`
+**Input:** Google Sheet (rows with `Status=APPLYING` and empty `Contact_Email`)
+**Output:** Sheet columns `Contact_Person`, `Contact_Email`, `Contact_Source`, `Contact_Confidence`
+
+**Five free sources, tried in order; first email wins:**
+1. **Posting LLM extract** (`extract_contacts.py:extract_contacts_from_posting`) — strict JSON
+   pull of name + email + title + honorific from the job description.
+2. **Impressum / Kontakt scrape** (`contact_scraper.py:scrape_company_contacts`) — Playwright
+   visits `/impressum`, `/kontakt`, `/team`, etc. (Swiss/DE/AT legal req → highest hit rate
+   for SMEs). LLM second-pass for structured contacts.
+3. **Google search via SerpAPI** (`web_search.py:search_company_contacts`) — `site:linkedin.com/in`
+   queries scoped to recruiters / talent / HR; capped at 2 SERP credits per company.
+4. **Email pattern + SMTP RCPT verify** (`email_verifier.py:verify_pattern`) — generates
+   `firstname.lastname@`, `f.lastname@`, etc., MX-resolves the domain, probes via SMTP
+   `RCPT TO`. Skips accept-all providers (Gmail/Outlook) → returns first pattern as low-conf
+   guess instead of false-positive verify.
+5. **NOT_FOUND** — sheet flagged so user can spot-check the worst 10% manually.
+
+**Cache:** results stored in `.tmp/company_cache.json` per-company entry (30-day TTL).
+**Failure mode:** every error path swallowed; the script always exits 0 so a slow
+website / blocked port 25 / DNS hiccup cannot abort the parent pipeline. Worst case:
+column reads `Contact_Source=NOT_FOUND` and the next 2-hour run retries the row.
+
+**Cover letter integration:** when discovery returns an honorific (`Frau` / `Herr`), the
+post-LLM `_greeting_for_contact()` in `generate_cover_letter.py` upgrades the salutation
+to the formal `Sehr geehrte Frau {Lastname},` form. No LLM prompt change. Falls back
+byte-for-byte to today's neutral salutation when no honorific is detected.
+
+**Common flags:**
+- `--sheet-triggered` — cloud default (filter to Status=APPLYING + empty Contact_Email)
+- `--limit N` — process at most N rows
+- `--dry-run` — log discoveries without writing to the sheet
+- `--reset-cache` — ignore cached `contact_*` keys, rediscover
+
+### Stage 6: Send Follow-Ups (multi-touch)
 **Directive:** `directives/send_followups.md`
 **Script:** `execution/send_followups.py`
-**Input:** Google Sheet (reads rows where Status=Applied, Date_Applied >= 3 days ago, Follow_Up_Sent=No)
-**Output:** Gmail emails sent + sheet updated (Follow_Up_Sent=Yes, Follow_Up_Date)
+**Input:** Google Sheet — rows where Status=Applied, has Contact_Email, no Response_Date
+**Output:** Gmail emails sent + sheet updated (`Follow_Up_Sent=Yes`, `Follow_Up_Count`,
+`Follow_Up_Last_Date`; `Follow_Up_Date` written on touch 1 only)
 
-**Prerequisites:** User must manually set Status="Applied", Date_Applied, and Contact_Email in the sheet.
+**3-touch cadence (business days since `Date_Applied`):**
+- **Touch 1** — 3 bd: gentle ping (existing template, byte-identical)
+- **Touch 2** — 6 bd: value-add angle (mention a relevant insight or offer to share more)
+- **Touch 3** — 12 bd: soft close (final note, leaves the door open, signals availability)
+
+**Cron:** Mon-Fri 08:00 CET. Each daily run picks up only the touches that came due that
+day; running again the same day is a no-op (touch_count already incremented).
+
+**Backwards-compat:** rows from before Phase 2 with empty `Follow_Up_Count` and
+`Follow_Up_Sent=Yes` are interpreted as `touch_count=1` (touch 1 already done) → next
+run sends touch 2.
+
+**Prerequisites:** Status="Applied" + Date_Applied. Contact_Email is now usually filled
+by Stage 4.5; user only needs to check the NOT_FOUND rows manually.
+
 **Common flags:**
 - `--send` — actually send emails (without this, dry-run only)
-- `--days 5` — wait 5 days instead of default 3
+- `--max-days 30` — skip rows older than this many calendar days (default 30)
+- `--reset-checkpoint` — clear local checkpoint and recheck all rows
+
+### Weekly digest (no manual trigger)
+**Script:** `execution/weekly_digest.py`
+**Cron:** Sun 18:00 CET — read-only on the sheet, sends one plaintext email
+**Output:** Reply rate by score band, by Contact_Source, by has-contact-name vs not;
+follow-up touch distribution; top 5 quality scores this week; trend vs prior 4 weeks.
+**Why it matters:** without outcome data, every "improvement" is a vibes call. After 2–3
+weeks of digests, the data tells you which Phase 2 lever (contact discovery vs multi-touch
+vs salutation) actually moved your reply rate. Phase 3 tuning is informed by this signal.
 
 ### Stage 7: Job Application Swarm (Multi-Agent)
 **Directive:** `directives/apply_swarm.md`

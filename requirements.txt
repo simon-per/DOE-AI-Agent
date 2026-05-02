@@ -18,6 +18,9 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 python-jobspy>=1.1.0
 
+# DNS lookups (used by email_verifier for MX records)
+dnspython>=2.4
+
 # Data processing
 pandas>=2.0.0
 pyyaml>=6.0
