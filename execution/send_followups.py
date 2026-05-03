@@ -62,13 +62,24 @@ TMP_DIR = PROJECT_ROOT / ".tmp"
 COMPANY_CACHE_FILE = TMP_DIR / "company_cache.json"
 FOLLOWUP_CHECKPOINT_FILE = TMP_DIR / "followup_checkpoint.json"  # [H4] Crash-safe checkpoint
 CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
-TOKEN_FILE = PROJECT_ROOT / "token_gmail.json"  # Separate token for Gmail scope
+# Two separate tokens — Google's reauth flow only consents to the scopes baked
+# into each token at issue time, so we keep them split:
+#   token.json       → Sheets + Drive (issued by write_jobs_to_sheet.py)
+#   token_gmail.json → Gmail send only (issued by reauth_gmail.py)
+SHEETS_TOKEN_FILE = PROJECT_ROOT / "token.json"
+GMAIL_TOKEN_FILE  = PROJECT_ROOT / "token_gmail.json"
+TOKEN_FILE = GMAIL_TOKEN_FILE  # back-compat alias for any legacy reference
 
-SCOPES = [
+SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+]
+GMAIL_SCOPES = [
+    "https://mail.google.com/",
     "https://www.googleapis.com/auth/gmail.send",
 ]
+# back-compat — some external callers may import SCOPES
+SCOPES = SHEETS_SCOPES + GMAIL_SCOPES
 
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared
@@ -197,7 +208,7 @@ RULES:
 - Reference the specific role and company
 - Express continued interest
 - Offer to provide additional information
-- Swiss style: No "ß" (use "ss"), no generic clichés
+- Swiss German style: replace "ß" with "ss" — but keep ä, ö, ü as REAL umlauts (NEVER write ae, oe, ue). No generic clichés.
 - If German: Use "Guten Tag" greeting (not "Sehr geehrte Damen und Herren")
 - Do NOT mention specific skills unless directly relevant
 
@@ -231,7 +242,7 @@ RULES:
   case study / portfolio link. Pick what fits the company info above.
 - Make the ask softer than the first email — "happy to share more if useful".
 - Acknowledge they're busy without being apologetic.
-- Swiss style: No "ß" (use "ss"), no clichés.
+- Swiss German style: replace "ß" with "ss" — but keep ä, ö, ü as REAL umlauts (NEVER write ae, oe, ue). No clichés.
 - If German: Use "Guten Tag" greeting.
 
 BANNED PHRASES:
@@ -265,7 +276,7 @@ RULES:
 - State you remain available and reachable.
 - Leave the door explicitly open for a future conversation.
 - Do NOT pressure, guilt, or imply a deadline.
-- Swiss style: No "ß" (use "ss"), no clichés.
+- Swiss German style: replace "ß" with "ss" — but keep ä, ö, ü as REAL umlauts (NEVER write ae, oe, ue). No clichés.
 - If German: Use "Guten Tag" greeting.
 
 BANNED PHRASES:
@@ -356,34 +367,63 @@ def _save_followup_checkpoint(sent: set):
 # Authentication
 # ---------------------------------------------------------------------------
 
-def authenticate():
-    """Authenticate with Google Sheets + Gmail using OAuth 2.0."""
-    creds = None
+def _load_or_refresh(token_path: Path, scopes: list[str], label: str) -> Credentials:
+    """Load creds from token_path, refresh if expired, fail loudly if missing or under-scoped.
 
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    Sheets and Gmail OAuth tokens are split (different scopes, different files).
+    Each is loaded independently here so a refresh on one doesn't fight the other.
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            log.info("Refreshing expired token...")
-            creds.refresh(Request())
+    The `scopes` arg passed to `from_authorized_user_file` is just the *requested*
+    superset; Google returns whatever scopes the token was originally granted at
+    consent time. If the token was issued with fewer scopes, the refresh succeeds
+    silently and the underscoped credential then fails much later inside the
+    actual API call with a less obvious error. Validate the granted scopes
+    explicitly so a token rotation that drops a scope blows up loudly here.
+    """
+    if not token_path.exists():
+        log.error(f"{label} token missing at {token_path}")
+        if label == "Gmail":
+            log.error("Run: python execution/reauth_gmail.py")
         else:
-            if not CREDENTIALS_FILE.exists():
-                log.error(f"credentials.json not found at {CREDENTIALS_FILE}")
-                log.error("See directives/send_followups.md for setup instructions")
-                sys.exit(1)
-            log.info("Starting OAuth flow (browser will open)...")
-            log.info("You will need to grant Gmail send permission.")
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(TOKEN_FILE, "w") as f:
+            log.error("Run: python execution/write_jobs_to_sheet.py (will trigger OAuth)")
+        sys.exit(1)
+    creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+    if creds.expired and creds.refresh_token:
+        log.info(f"Refreshing expired {label} token...")
+        creds.refresh(Request())
+        with open(token_path, "w") as f:
             f.write(creds.to_json())
-        log.info("Token saved.")
+    granted = set(creds.scopes or [])
+    needed  = set(scopes)
+    if granted and not needed.issubset(granted):
+        missing = sorted(needed - granted)
+        log.error(f"{label} token at {token_path} is missing scopes: {missing}")
+        log.error(f"Granted: {sorted(granted)}")
+        if label == "Gmail":
+            log.error("Re-issue with full scopes: python execution/reauth_gmail.py")
+        else:
+            log.error("Re-issue: python execution/write_jobs_to_sheet.py (delete token.json first)")
+        sys.exit(1)
+    return creds
 
-    sheets_client = gspread.authorize(creds)
-    gmail_service = build("gmail", "v1", credentials=creds)
-    return sheets_client, gmail_service, creds
+
+def authenticate():
+    """Authenticate with Google Sheets + Gmail using two separate OAuth tokens.
+
+    Sheets/Drive lives in token.json, Gmail send lives in token_gmail.json.
+    Both must already exist — interactive consent is handled by the dedicated
+    helpers (write_jobs_to_sheet.py for Sheets, reauth_gmail.py for Gmail).
+
+    Returns (sheets_client, gmail_service, gmail_creds). The third element is
+    the Gmail credentials object — kept for back-compat with the previous
+    single-cred return signature; some downstream code uses it for refresh checks.
+    """
+    sheets_creds = _load_or_refresh(SHEETS_TOKEN_FILE, SHEETS_SCOPES, "Sheets")
+    gmail_creds  = _load_or_refresh(GMAIL_TOKEN_FILE,  GMAIL_SCOPES,  "Gmail")
+
+    sheets_client = gspread.authorize(sheets_creds)
+    gmail_service = build("gmail", "v1", credentials=gmail_creds)
+    return sheets_client, gmail_service, gmail_creds
 
 
 # ---------------------------------------------------------------------------
@@ -721,11 +761,14 @@ def main():
         FOLLOWUP_CHECKPOINT_FILE.unlink()
         log.info("Follow-up checkpoint cleared")
 
+    # OpenRouter is the only path now — Google-AI-Studio direct was retired.
+    # gemini_key is kept as a placeholder so the existing call_llm signature
+    # doesn't have to change at every call site (it's accepted-but-ignored).
     openrouter_key = os.getenv("OPEN_ROUTER_API_KEY")
-    gemini_key = os.getenv("GOOGLE_AI_STUDIO_API_KEY")
+    gemini_key = None
 
-    if not openrouter_key and not gemini_key:
-        log.error("No API keys found. Set OPEN_ROUTER_API_KEY or GOOGLE_AI_STUDIO_API_KEY in .env")
+    if not openrouter_key:
+        log.error("OPEN_ROUTER_API_KEY not set in .env")
         sys.exit(1)
 
     # Authenticate

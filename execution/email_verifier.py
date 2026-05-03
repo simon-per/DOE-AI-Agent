@@ -113,19 +113,30 @@ def generate_patterns(first: str, last: str, domain: str) -> list[str]:
 
 
 def _resolve_mx(domain: str) -> list[str]:
-    """Return MX hostnames for `domain`, lowest preference first. Empty list on failure.
+    """Return MX hostnames for `domain`, lowest preference first. Empty list on DNS failure.
 
     Uses dnspython with explicit timeouts so a stuck DNS server can't hang the pipeline.
+
+    A missing `dnspython` install is treated as a hard config error, not a soft DNS
+    miss — otherwise every domain silently looks like "no MX records" and Source 4
+    of the contact-discovery waterfall always returns empty without anyone noticing.
     """
     try:
         import dns.resolver
+    except ImportError as exc:
+        raise RuntimeError(
+            "dnspython is not installed. Run `pip install -r requirements.txt` "
+            "(dnspython is required for contact-email verification)."
+        ) from exc
+
+    try:
         resolver = dns.resolver.Resolver()
         resolver.timeout = 3.0   # per-server timeout
         resolver.lifetime = 5.0  # total timeout including retries
         answers = resolver.resolve(domain, "MX")
         ranked = sorted(answers, key=lambda r: r.preference)
         return [str(r.exchange).lower().rstrip(".") + "." for r in ranked]
-    except Exception as exc:  # noqa: BLE001 — DNS fails in many ways, all benign here
+    except Exception as exc:  # noqa: BLE001 — actual DNS lookup fails in many ways, all benign here
         log.debug(f"  MX lookup failed for {domain}: {type(exc).__name__}: {exc}")
         return []
 

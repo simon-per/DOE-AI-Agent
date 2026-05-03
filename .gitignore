@@ -47,3 +47,9 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local planning / session-export scratch files (may include personal context)
+model-routing-plan.md
+model-routing-session.txt
+*-session.txt
+*-plan-local.md

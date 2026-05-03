@@ -359,13 +359,21 @@ def _confidence_for_source(label: str | None) -> str:
 # Sheet integration
 # ---------------------------------------------------------------------------
 
-def _eligible_rows(rows: list[list[str]], header: list[str], sheet_triggered: bool) -> list[dict]:
+def _eligible_rows(
+    rows: list[list[str]],
+    header: list[str],
+    sheet_triggered: bool,
+    allowed_statuses: set[str] | None = None,
+) -> list[dict]:
     """Filter sheet rows to those needing contact discovery.
 
     Eligibility:
-      - Status = APPLYING (sheet_triggered) or any row with a Description (manual mode)
-      - Contact_Email is empty (don't overwrite manually-set values)
       - URL is non-empty (we need a row identifier)
+      - Contact_Email is empty (don't overwrite manually-set values)
+      - Status filter:
+          * `sheet_triggered=True` → only Status=APPLYING (cloud cron behavior)
+          * `allowed_statuses` set  → only rows whose Status (case-insensitive) is in that set
+          * neither                → no status filter (legacy permissive default)
     """
     out = []
     col = {name: i for i, name in enumerate(header)}
@@ -380,8 +388,13 @@ def _eligible_rows(rows: list[list[str]], header: list[str], sheet_triggered: bo
         if not cell(row, "URL"):
             continue
         status = cell(row, "Status")
-        if sheet_triggered and status.lower() != "applying":
-            continue
+        status_lower = status.lower()
+        if sheet_triggered:
+            if status_lower != "applying":
+                continue
+        elif allowed_statuses is not None:
+            if status_lower not in allowed_statuses:
+                continue
         if cell(row, "Contact_Email"):
             continue  # Don't overwrite an existing email
         out.append({
@@ -412,6 +425,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Discover contact emails for APPLYING rows")
     parser.add_argument("--sheet-triggered", action="store_true",
                         help="Filter rows to Status=APPLYING (cloud-pipeline default)")
+    parser.add_argument("--statuses", default="",
+                        help="Comma-separated statuses to filter (case-insensitive). "
+                             "Use `--statuses Applied` to backfill emailless Applied rows. "
+                             "Default: no status filter (every row without Contact_Email is eligible). "
+                             "Ignored if --sheet-triggered is set.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Process at most N eligible rows")
     parser.add_argument("--dry-run", action="store_true",
@@ -419,6 +437,15 @@ def main() -> int:
     parser.add_argument("--reset-cache", action="store_true",
                         help="Ignore cached contact_* keys; force fresh discovery")
     args = parser.parse_args()
+
+    allowed_statuses: set[str] | None
+    if args.statuses.strip():
+        allowed_statuses = {s.strip().lower() for s in args.statuses.split(",") if s.strip()}
+        if args.sheet_triggered:
+            log.warning("--statuses ignored when --sheet-triggered is set "
+                        "(cron path enforces Status=APPLYING)")
+    else:
+        allowed_statuses = None
 
     log.info(f"discover_contacts starting (sheet_triggered={args.sheet_triggered}, "
              f"limit={args.limit}, dry_run={args.dry_run}, reset_cache={args.reset_cache})")
@@ -443,7 +470,7 @@ def main() -> int:
         return 0
 
     header = [h.strip() for h in all_rows[0]]
-    eligible = _eligible_rows(all_rows[1:], header, args.sheet_triggered)
+    eligible = _eligible_rows(all_rows[1:], header, args.sheet_triggered, allowed_statuses)
     if args.limit is not None:
         eligible = eligible[: args.limit]
 

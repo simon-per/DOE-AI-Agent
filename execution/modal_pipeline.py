@@ -122,7 +122,12 @@ _REQUIRED_OAUTH_SECRETS: dict[str, Path] = {
     "TOKEN_GMAIL_JSON": WORKSPACE / "token_gmail.json",
     "CREDENTIALS_JSON": WORKSPACE / "credentials.json",
 }
-_REQUIRED_API_KEYS = ("OPEN_ROUTER_API_KEY", "GOOGLE_AI_STUDIO_API_KEY")
+_REQUIRED_API_KEYS = ("OPEN_ROUTER_API_KEY",)
+# GOOGLE_AI_STUDIO_API_KEY was dropped from required keys on 2026-05-03 — the
+# Gemini-via-Google-AI-Studio direct path was retired. Gemini-3-Flash now
+# reaches us through OpenRouter (cover-letter stage), so a single OpenRouter
+# key covers all three models. The leftover GOOGLE_AI_STUDIO_API_KEY entry in
+# the doe-api-keys Modal secret is safe to delete on the next rotation cycle.
 
 
 def _write_oauth_files() -> None:
@@ -304,11 +309,19 @@ def pipeline_scrape_write() -> None:
     timeout=600,
     max_containers=1,
 )
-def pipeline_send_followups() -> None:
-    """Stage 6: send multi-touch follow-up emails (3 / 6 / 12 business days)."""
+def pipeline_send_followups(dry_run: bool = False) -> None:
+    """Stage 6: send multi-touch follow-up emails (3 / 6 / 12 business days).
+
+    Cron schedule (no args) always sends. Pass `dry_run=True` via
+    `modal run ... --dry-run` for a side-effect-free smoke test in cloud — runs
+    the full eligibility scan + LLM generation but skips the Gmail send and
+    sheet write. Useful for verifying OAuth + per-stage routing without firing
+    real outbound mail.
+    """
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("send_followups.py", "--send", stage_label="send_followups")
+    args = [] if dry_run else ["--send"]
+    _run("send_followups.py", *args, stage_label="send_followups")
     volume.commit()
 
 

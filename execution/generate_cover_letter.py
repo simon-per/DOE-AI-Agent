@@ -170,8 +170,16 @@ SUBTITLE RULES (must follow exactly):
 # ---------------------------------------------------------------------------
 
 def _call_llm(openrouter_key: str | None, gemini_key: str | None, prompt: str, temperature: float = 0.3) -> tuple[str, str]:
-    """Call LLM and return (response_text, provider_name). Uses max_tokens=1000 for cover letters."""
-    return _call_llm_shared(openrouter_key, gemini_key, prompt, temperature=temperature, max_tokens=1000)
+    """Call LLM and return (response_text, provider_name). Uses max_tokens=1000 for cover letters.
+
+    Routes to MODEL_COVER_LETTER (gemini-3-flash-preview) — best ranked on
+    German + Instruction Following + Creative Writing in the LMArena
+    categories that predict cover-letter quality. Falls back to Qwen on failure.
+    """
+    return _call_llm_shared(
+        openrouter_key, gemini_key, prompt,
+        temperature=temperature, max_tokens=1000, stage="cover_letter",
+    )
 
 
 def _get_profile_for_provider(openrouter_key: str | None) -> str:

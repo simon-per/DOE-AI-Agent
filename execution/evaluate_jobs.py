@@ -355,10 +355,9 @@ def main():
         sys.exit(1)
 
     if openrouter_key:
-        from execution.llm_client import OPENROUTER_MODEL
-        log.info(f"Primary model: {OPENROUTER_MODEL} (OpenRouter)")
-    if gemini_key:
-        log.info(f"{'Fallback' if openrouter_key else 'Primary'} model: Gemini 3 Flash (Google AI Studio)")
+        from execution.llm_client import MODEL_CHEAP, MODEL_FALLBACK
+        log.info(f"Primary model: {MODEL_CHEAP} (OpenRouter)")
+        log.info(f"Fallback model: {MODEL_FALLBACK} (OpenRouter)")
 
     if not INPUT_FILE.exists():
         log.error(f"Input file not found: {INPUT_FILE}")

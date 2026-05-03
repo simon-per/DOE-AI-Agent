@@ -107,7 +107,7 @@ def check_sheets_read() -> None:
     if not rows:
         raise RuntimeError(f"Spreadsheet '{SPREADSHEET_NAME}' is empty (no header row)")
     header = [h.strip() for h in rows[0]]
-    expected = ["Status", "CL_Generated", "CV_Generated", "CL_Quality_Score", "Contact_Email"]
+    expected = ["Status", "URL", "CL_Generated", "CV_Generated", "CL_Quality_Score", "Contact_Email"]
     missing = [c for c in expected if c not in header]
     if missing:
         raise RuntimeError(f"Required columns missing from header: {missing}")
@@ -223,30 +223,58 @@ def check_gmail_send() -> None:
         raise RuntimeError("send_email() returned False (see stderr above for details)")
 
 
-def check_openrouter() -> None:
-    """Hit the OpenRouter completion endpoint with a 5-token ping."""
+def _check_openrouter_model(model: str) -> None:
+    """Hit the OpenRouter completion endpoint with a small ping for one model.
+
+    max_tokens=200: thinking models (DeepSeek-v4-flash) can spend 100-200
+    tokens on hidden reasoning before emitting any content. Lower budgets
+    produced stochastic empty responses (~10% miss rate). 200 tokens at
+    deepseek's $0.28/M output rate is ~$0.00006 per ping, negligible.
+    """
     from execution.llm_client import call_openrouter, get_openrouter_key
 
     api_key = get_openrouter_key()
     if not api_key:
         raise RuntimeError("OPEN_ROUTER_API_KEY not set in env")
-    response = call_openrouter(api_key, prompt="ping", temperature=0.0, max_tokens=5)
+    response = call_openrouter(api_key, prompt="say hi", temperature=0.0, max_tokens=200, model=model)
     if not response or not response.strip():
-        raise RuntimeError(f"OpenRouter returned empty response: {response!r}")
-    log.info(f"  OpenRouter responded ({len(response)} char(s))")
+        raise RuntimeError(f"OpenRouter ({model}) returned empty response: {response!r}")
+    log.info(f"  {model} responded ({len(response)} char(s))")
 
 
-def check_gemini() -> None:
-    """Hit the Gemini completion endpoint with a 5-token ping."""
-    from execution.llm_client import call_gemini, get_gemini_key
+def check_openrouter_cover_letter() -> None:
+    """Ping the cover-letter primary model (gemini-3-flash-preview by default)."""
+    from execution.llm_client import MODEL_COVER_LETTER
+    _check_openrouter_model(MODEL_COVER_LETTER)
 
-    api_key = get_gemini_key()
-    if not api_key:
-        raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not set in env")
-    response = call_gemini(api_key, prompt="ping", temperature=0.0, max_tokens=5)
-    if not response or not response.strip():
-        raise RuntimeError(f"Gemini returned empty response: {response!r}")
-    log.info(f"  Gemini responded ({len(response)} char(s))")
+
+def check_openrouter_cheap() -> None:
+    """Ping the cheap-stage primary model (deepseek-v4-flash by default)."""
+    from execution.llm_client import MODEL_CHEAP
+    _check_openrouter_model(MODEL_CHEAP)
+
+
+def check_openrouter_fallback() -> None:
+    """Ping the universal fallback model (qwen3-235b-a22b-2507 by default)."""
+    from execution.llm_client import MODEL_FALLBACK
+    _check_openrouter_model(MODEL_FALLBACK)
+
+
+def check_dns_resolver_import() -> None:
+    """Confirm dnspython is installed.
+
+    `email_verifier._resolve_mx` raises a clear RuntimeError if dnspython is
+    missing, but that only fires the first time a contact-discovery row hits
+    Source 4. Catch it here, before the LLM stage burns tokens.
+    """
+    try:
+        import dns.resolver  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "dnspython is not installed — contact-email verification (Source 4 of "
+            "discover_contacts) will silently produce zero hits. Run: "
+            "pip install -r requirements.txt"
+        ) from exc
 
 
 def check_profile_parse() -> None:
@@ -334,14 +362,16 @@ def main() -> int:
     results: list[dict] = []
 
     # Order matters: cheap → expensive, so we fail fast on auth issues
-    results.append(_run_check("Profile parse (ABOUTME.md)", check_profile_parse))
+    results.append(_run_check("Profile parse (ABOUTME.md)",  check_profile_parse))
+    results.append(_run_check("dnspython import",            check_dns_resolver_import))
     results.append(_run_check("Sheets API: read",            check_sheets_read))
     results.append(_run_check("Sheets API: write",           check_sheets_write))
     results.append(_run_check("Drive API: list",             check_drive_list))
     results.append(_run_check("Drive API: create+upload+delete", check_drive_write_cycle))
     results.append(_run_check("Gmail API: send",             check_gmail_send))
-    results.append(_run_check("OpenRouter LLM: ping",        check_openrouter))
-    results.append(_run_check("Gemini LLM: ping",            check_gemini))
+    results.append(_run_check("OpenRouter LLM: cover_letter model", check_openrouter_cover_letter))
+    results.append(_run_check("OpenRouter LLM: cheap model",        check_openrouter_cheap))
+    results.append(_run_check("OpenRouter LLM: fallback model",     check_openrouter_fallback))
 
     if args.cloud:
         results.append(_run_check("Volume sanity (.tmp write/read)", check_volume_sanity))
