@@ -53,6 +53,14 @@ COMPANY_CACHE_FILE = TMP_DIR / "company_cache.json"
 CHECKPOINT_FILE = TMP_DIR / "cover_letter_checkpoint.json"
 
 DEFAULT_MIN_SCORE = 6
+MAX_HALLUCINATION_REJECTS_ACROSS_RUNS = 3  # after this many hard-rejects across runs, give up on the job
+
+
+class HallucinationRejectError(Exception):
+    """Raised when the cover letter still contains hallucinated numbers after all quality retries.
+    Caller does NOT checkpoint as 'processed', but increments a hallucination_retries counter.
+    Once the counter hits MAX_HALLUCINATION_REJECTS_ACROSS_RUNS, the job is marked FAILED so it
+    stops consuming LLM budget every run."""
 
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared
@@ -70,8 +78,9 @@ from execution.utils import (
 # Profile loaded from ABOUTME.md (single source of truth)
 from execution.profile_loader import load_profile as _load_profile
 
-# Calibration: Qwen3 undershoots ~40-50 words in German. Prompt target 260-300 yields actual ~220-260 output.
-# Do NOT put this note inside the prompt — the model uses it as permission to write shorter.
+# Calibration: Gemini-3-Flash-Preview overshoots ~30-50 words. Prompt target 200-230 yields actual ~230-260 output.
+# (Old note: Qwen3 undershoots — true if MODEL_COVER_LETTER is reverted to Qwen.)
+# Do NOT put this note inside the prompt — the model uses it as permission to deviate.
 COVER_LETTER_PROMPT = """You are writing a professional cover letter for a Swiss job application.
 
 CANDIDATE PROFILE:
@@ -99,9 +108,10 @@ Mein technisches Profil stütze ich durch den Google Data Analytics Professional
 
 Für ein persönliches Gespräch stehe ich gerne zur Verfügung — meine Kündigungsfrist beträgt 45 Tage.\"
 
-(The style example above is ~150 words for brevity — your output must be 260-300 words, i.e. notably longer than the example.)
+(The style example above is ~150 words for brevity — your output must be 200-230 words, i.e. moderately longer than the example.)
 
 ANTI-HALLUCINATION RULES (CRITICAL — violations cause interview failures):
+- YEARS OF EXPERIENCE: EXACTLY 3. The candidate has 3 years of professional experience — never write "4 years", "5 years", or any other number. Never round up. Never write "über 3 Jahre" / "more than 3 years" / "rund 4 Jahre". Use only "3 Jahre" / "3 years" / "tre anni". This is a hard fact — getting it wrong destroys credibility in interviews.
 - You may ONLY use numbers and metrics that appear in the CANDIDATE PROFILE above.
 - METRIC SELECTION (MANDATORY — use EXACTLY 3 or 4, NEVER all 6):
   The candidate has 7 quantitative achievements. You MUST pick exactly 3 or 4 that are MOST relevant to THIS specific job. Leave the rest out entirely — do NOT mention them even without numbers.
@@ -133,7 +143,7 @@ BANNED AI-GIVEAWAY WORDS (never use — recruiters use these to detect AI):
 
 INSTRUCTIONS:
 - Write in {language_name} ({language_code}). If not German, adapt the style example's directness to that language.
-- Length: 260-300 words. This is the ideal range — letters under 220 words appear too brief and reduce callbacks. Do NOT write less than 260 words. Count carefully.
+- Length: 200-230 words. This is the ideal range — letters under 200 words appear too brief, letters over 260 lose attention. Count carefully and stay within the range.
   When using fewer metrics (3-4), use the freed space for deeper qualitative descriptions — explain HOW you did things, not just WHAT. This keeps the letter substantive.
 - Tone: Direct, Swiss-professional, modest but confident. NOT aggressive American self-promotion. Every claim backed by a specific number from the profile or a tool name.
 - Sentence length variation (prevents AI detection):
@@ -878,8 +888,31 @@ AI_GIVEAWAY_WORDS = {
 }
 
 
+_PRODUCT_NAME_PATTERNS = [
+    # Strip recognized product names so embedded digits don't get extracted as "fabricated".
+    # Order matters: longest match first.
+    re.compile(r'\bSAP\s*S[/\s\-]?4\s*HANA\b', re.IGNORECASE),  # SAP S/4HANA, SAP S 4HANA, S-4HANA
+    re.compile(r'\bS[/\s\-]?4\s*HANA\b', re.IGNORECASE),         # S/4HANA without "SAP" prefix
+    re.compile(r'\bIndustri[ey]\s*4\.0\b', re.IGNORECASE),       # Industrie 4.0 / Industry 4.0
+    re.compile(r'\bWeb\s*3\.0\b', re.IGNORECASE),                # Web 3.0
+]
+
+
+def _strip_product_names(text: str) -> str:
+    """Remove recognized product names from text before number extraction.
+    Prevents false positives where embedded digits in product names (e.g. '4' in 'S/4HANA')
+    are flagged as fabricated metrics."""
+    for pat in _PRODUCT_NAME_PATTERNS:
+        text = pat.sub(' ', text)
+    return text
+
+
 def _validate_no_hallucinated_metrics(text: str, extra_context: str = "") -> list[str]:
     """Find numbers in generated text that aren't in the candidate profile or company context."""
+    # Strip product names from BOTH text and context so embedded digits aren't extracted.
+    text = _strip_product_names(text)
+    extra_context = _strip_product_names(extra_context) if extra_context else extra_context
+
     # Extract numbers from company context (these are valid to mention)
     context_numbers = set()
     context_percentages = set()  # Track percentages separately — "30 employees" ≠ "30%"
@@ -1410,14 +1443,31 @@ def generate_cover_letter_for_job(
                 )
                 log.warning(f"  Adding company name injection for next attempt: {company}")
 
+            # Hallucination-specific injection: name the offending numbers and remind years anchor
+            if violations:
+                retry_extra += (
+                    f"\n\nCRITICAL CORRECTION: Your previous attempt invented these numbers that are NOT in the candidate profile: {violations}. "
+                    f"REMOVE every one of them. Specifically: the candidate has EXACTLY 3 years of experience (never write 4 or 5). "
+                    f"Use only numbers from the metric list (A-G in the anti-hallucination rules). "
+                    f"If a sentence relies on a number you cannot back up, rewrite it qualitatively without the number."
+                )
+                log.warning(f"  Adding hallucination correction injection: {violations}")
+
             # Floor injection: if word count too low, remind LLM on next attempt
-            if word_count < 210:
-                retry_extra = (
-                    f"\n\nCRITICAL CORRECTION: Your previous attempt was only {word_count} words — far too short. "
-                    f"You MUST write at least 260 words. Expand each body paragraph with one additional specific detail "
-                    f"(HOW you did it, what tool you used, what the result was). Do not skip this."
+            if word_count < 200:
+                retry_extra += (
+                    f"\n\nCRITICAL CORRECTION: Your previous attempt was only {word_count} words — too short. "
+                    f"You MUST write at least 210 words (target range 200-230). Expand one body paragraph with one additional specific detail "
+                    f"(HOW you did it, what tool you used, what the result was). Do not exceed 230 words."
                 )
                 log.warning(f"  Adding word count floor injection for next attempt ({word_count} words was too short)")
+            elif word_count > 260:
+                retry_extra += (
+                    f"\n\nCRITICAL CORRECTION: Your previous attempt was {word_count} words — too long. "
+                    f"You MUST cut to 200-230 words. Drop the weakest body sentence or merge two adjacent sentences. "
+                    f"Do NOT remove the company-name mention or the closing line."
+                )
+                log.warning(f"  Adding word count ceiling injection for next attempt ({word_count} words was too long)")
 
             time.sleep(1.0)  # brief pause before retry
 
@@ -1428,6 +1478,18 @@ def generate_cover_letter_for_job(
 
     if best_score < 5:
         log.warning(f"  QUALITY WARNING: Best attempt scored {best_score}/5 after {quality_attempt + 1} tries — review before sending!")
+
+    # Hard reject: refuse to write a cover letter that still contains hallucinated numbers.
+    # Better to skip (and retry on next run) than to send a letter with fabricated facts.
+    remaining_hallucinations = (best_quality or {}).get("hallucinations") or []
+    if remaining_hallucinations:
+        log.error(
+            f"  HARD REJECT: Hallucinated numbers persist after {MAX_QUALITY_ATTEMPTS} retries: "
+            f"{remaining_hallucinations}. Skipping PDF/DOCX generation; will be retried on next run."
+        )
+        raise HallucinationRejectError(
+            f"Hallucinated numbers {remaining_hallucinations} remained after {MAX_QUALITY_ATTEMPTS} retries"
+        )
 
     # Log whether the project link made it into the final text (soft check)
     if relevant_projs:
@@ -1639,12 +1701,21 @@ def main():
 
     # Filter out already-processed jobs (checkpoint + folder-existence safety net)
     already_done = checkpoint.get("processed", {})
+    halluc_retries = checkpoint.get("hallucination_retries", {})
     pending_jobs = []
     folder_synced = 0
+    skipped_halluc_giveup = 0
     for job in eligible_jobs:
         job_id = _get_job_id(job)
         if job_id in already_done:
             log.debug(f"  Skipping (checkpoint): {job.get('title', '?')} at {job.get('company', '?')}")
+            continue
+        if halluc_retries.get(job_id, 0) >= MAX_HALLUCINATION_REJECTS_ACROSS_RUNS:
+            log.warning(
+                f"  Skipping (hallucination giveup, {halluc_retries[job_id]} rejects): "
+                f"{job.get('title','?')} at {job.get('company','?')}"
+            )
+            skipped_halluc_giveup += 1
             continue
         existing_folder = find_application_folder(OUTPUT_DIR, job_id)
         if existing_folder and has_cover_letter_outputs(existing_folder):
@@ -1732,6 +1803,20 @@ def main():
                     log.info(f"  Sheet: Status → APPLYING")
                 except Exception as e:
                     log.debug(f"  Status update skipped: {e}")
+        except HallucinationRejectError as e:
+            # Track cross-run reject count so a model with persistent bias doesn't
+            # burn LLM budget every pipeline run forever.
+            job_id = _get_job_id(job)
+            halluc_retries = checkpoint.setdefault("hallucination_retries", {})
+            halluc_retries[job_id] = halluc_retries.get(job_id, 0) + 1
+            count = halluc_retries[job_id]
+            log.error(f"  Failed (hallucination reject {count}/{MAX_HALLUCINATION_REJECTS_ACROSS_RUNS}): {e}")
+            _save_checkpoint(checkpoint)
+            results.append({
+                "title": job.get("title", "?"),
+                "company": job.get("company", "?"),
+                "error": f"hallucination_reject (attempt {count})",
+            })
         except Exception as e:
             log.error(f"  Failed: {e}")
             results.append({

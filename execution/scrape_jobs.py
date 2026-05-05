@@ -3,7 +3,7 @@ Stage 1: Scrape Swiss job listings from multiple sources.
 Output: .tmp/raw_jobs.json
 
 Sources:
-- python-jobspy (Indeed, LinkedIn, Glassdoor, Google)
+- python-jobspy (Indeed, Glassdoor, Google; LinkedIn opt-in via DOE_ENABLE_LINKEDIN=1)
 - SERP API Google Jobs — structured data, 500 calls/month (2 keys × 250)
 - job-room.ch frontend search (Swiss government portal) [disabled: SSL issues]
 
@@ -81,7 +81,7 @@ def _get_search_terms() -> list[str]:
 SEARCH_TERMS = _get_search_terms()
 
 LOCATION = "Switzerland"
-DEFAULT_HOURS_OLD = 168  # 7 days — fresh-only by default; use --deep for 30-day backfill
+DEFAULT_HOURS_OLD = 72   # 3 days — Tue/Thu cadence; fresh > volume. Use --deep for 30-day backfill.
 DEEP_HOURS_OLD = 720     # 30 days, opt-in via --deep
 
 # Domains excluded from scrape — aggregators, redirect-only, paywalled.
@@ -144,24 +144,33 @@ def _get_serpapi_key() -> str | None:
 
 
 def scrape_jobspy(search_term: str, hours_old: int = DEFAULT_HOURS_OLD) -> list[dict]:
-    """Scrape jobs using python-jobspy (Indeed, LinkedIn, Glassdoor, Google)."""
+    """Scrape jobs using python-jobspy (Indeed, Glassdoor, Google).
+
+    LinkedIn is opt-in via env var DOE_ENABLE_LINKEDIN=1 — disabled by default
+    because cloud egress (Modal) gets 429-walled. SerpAPI Google-for-Jobs path
+    still surfaces LinkedIn-aggregated listings either way.
+    """
     try:
         from jobspy import scrape_jobs
     except ImportError:
         log.warning("python-jobspy not installed. Run: pip install python-jobspy")
         return []
 
+    sites = ["indeed", "glassdoor", "google"]
+    if os.environ.get("DOE_ENABLE_LINKEDIN") == "1":
+        sites.insert(1, "linkedin")
+
     jobs = []
     try:
         log.info(f"[jobspy] Searching: '{search_term}' in {LOCATION} (last {hours_old}h)")
         results = scrape_jobs(
-            site_name=["indeed", "linkedin", "glassdoor", "google"],
+            site_name=sites,
             search_term=search_term,
             location=LOCATION,
             results_wanted=25,
             hours_old=hours_old,
             country_indeed="Switzerland",
-            linkedin_fetch_description=True,
+            linkedin_fetch_description=("linkedin" in sites),
         )
 
         for _, row in results.iterrows():

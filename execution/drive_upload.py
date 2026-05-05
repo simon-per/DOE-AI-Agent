@@ -112,31 +112,35 @@ def upload_application_folder(local_folder: Path) -> str:
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     sub_id  = _get_or_create_folder(service, local_folder.name, parent_id=root_id)
 
-    # Get existing file names in subfolder to avoid re-uploading
+    # Map existing names → fileId so we can update in place (re-rendered PDFs
+    # with new letter dates must overwrite, not be skipped).
     existing = service.files().list(
         q=f"'{sub_id}' in parents and trashed = false",
-        fields="files(name)",
+        fields="files(id, name)",
     ).execute()
-    existing_names = {f["name"] for f in existing.get("files", [])}
+    existing_by_name = {f["name"]: f["id"] for f in existing.get("files", [])}
 
-    uploaded = []
+    created, updated = 0, 0
     for file_path in sorted(files_to_upload):
-        if file_path.name in existing_names:
-            log.debug(f"[drive] skip (already exists): {file_path.name}")
-            continue
         mime = _MIME_MAP.get(file_path.suffix.lower(), "application/octet-stream")
         media = MediaFileUpload(str(file_path), mimetype=mime, resumable=False)
-        service.files().create(
-            body={"name": file_path.name, "parents": [sub_id]},
-            media_body=media,
-            fields="id",
-        ).execute()
-        uploaded.append(file_path.name)
-        log.info(f"[drive] uploaded: {file_path.name}")
+        existing_id = existing_by_name.get(file_path.name)
+        if existing_id:
+            service.files().update(
+                fileId=existing_id,
+                media_body=media,
+            ).execute()
+            updated += 1
+            log.info(f"[drive] updated: {file_path.name}")
+        else:
+            service.files().create(
+                body={"name": file_path.name, "parents": [sub_id]},
+                media_body=media,
+                fields="id",
+            ).execute()
+            created += 1
+            log.info(f"[drive] uploaded: {file_path.name}")
 
     folder_url = f"https://drive.google.com/drive/folders/{sub_id}"
-    if uploaded:
-        log.info(f"[drive] {len(uploaded)} file(s) → {folder_url}")
-    else:
-        log.info(f"[drive] all files already present: {folder_url}")
+    log.info(f"[drive] {created} new + {updated} updated → {folder_url}")
     return folder_url

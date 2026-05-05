@@ -2,8 +2,9 @@
 
 Verifies every external API surface the pipeline depends on, end-to-end.
 
-Run before any production deploy. `pipeline_generate_applications` (Modal)
-also runs this as its first step on every invocation, so a missing scope
+Run before any production deploy. The Modal cron functions (`pipeline_full`
+on Tue/Thu and `pipeline_generate_applications` on the 6h fallback schedule)
+also run this as their first step on every invocation, so a missing scope
 or rotated token surfaces in the alert email *before* the LLM stage burns
 tokens or generates partially-broken artifacts.
 

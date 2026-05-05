@@ -43,7 +43,7 @@ if not "!RC!"=="0" (
 )
 
 >>"!LOG!" echo [%TIME%] --- update_cover_letter_dates START ---
-"!PY!" -m execution.update_cover_letter_dates --letter-date !LETTER_DATE! --min-score 6 >>"!LOG!" 2>&1
+"!PY!" -m execution.update_cover_letter_dates --letter-date !LETTER_DATE! --min-score 7 >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- update_cover_letter_dates END rc=!RC! ---
 

@@ -439,6 +439,16 @@ def main():
     if args.limit:
         candidates = candidates[: args.limit]
 
+    # Lazy import — keeps --source local fully offline. Imported once outside the
+    # loop so a missing googleapiclient surfaces immediately, not per-row.
+    upload_application_folder = None
+    if not args.dry_run:
+        try:
+            from execution.drive_upload import upload_application_folder as _uaf
+            upload_application_folder = _uaf
+        except Exception as e:
+            log.warning(f"Drive upload disabled (import failed): {e}")
+
     updated = 0
     errored = []
     for job in candidates:
@@ -484,6 +494,12 @@ def main():
             )
             updated += 1
             log.info(f"[OK  ] {jid} | score={job.get('score')} | {fld.name[:80]}")
+
+            if upload_application_folder is not None:
+                try:
+                    upload_application_folder(fld)
+                except Exception as drive_err:
+                    log.warning(f"[drive] {jid}: re-upload failed - {drive_err}")
         except Exception as e:
             log.error(f"[ERR ] {jid}: render failed - {e}")
             errored.append((jid, str(e)))

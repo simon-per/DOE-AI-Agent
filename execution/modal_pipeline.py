@@ -2,13 +2,27 @@
 Cloud-scheduled pipeline runner on Modal (serverless).
 
 Runs all automatable stages 24/7 without the local PC needing to be on:
-  - Tue + Thu 17:00 CET: scrape_jobs → evaluate_jobs → write_jobs_to_sheet
-  - Every 2 hours:       generate cover letters + CVs for Ready_to_Apply rows
-                         → upload to Google Drive → email notification
-  - Mon / Wed / Fri 09:00 CET: send_followups --send
-  - Daily 05:45 CET: prune_stale_jobs --yes
+  - Tue + Thu 18:00 CEST: pipeline_full — end-to-end parity with the local
+                          scripts/pipeline_full.cmd (prune → scrape → evaluate
+                          → write_sheet → cover_letter --min-score 7 → cv
+                          --min-score 7 → update_dates → discover_contacts).
+                          No manual sheet gate; selection is by score threshold.
+  - Every 6 hours:        pipeline_generate_applications — fallback that polls
+                          the Sheet for any rows the user manually flips to
+                          Ready_to_Apply (e.g. for re-generation).
+  - Mon-Fri 06:00 UTC:    send_followups --send
+  - Daily 04:00 UTC:      pipeline_daily_maintenance — prune stale rows AND
+                          re-stamp every score>=7 cover letter to TODAY,
+                          pushing refreshed PDF/DOCX to Drive so the user
+                          always opens an up-to-date letter.
+  - Sun 16:00 UTC:        weekly digest email
 
 Stage 7 (run_swarm / apply) stays local — requires Chrome + human review.
+
+Status flow after a pipeline_full run: rows land at Status="New" with
+CL_Generated=Yes / CV_Generated=Yes / Contact_Email filled where found.
+The user flips Status → Ready_to_Apply manually before running the local
+swarm, which then progresses APPLYING → Applied.
 
 Reliability hardening (see .claude/plans/hi-how-are-you-enchanted-tulip.md):
   - Defensive secret validation (clear errors instead of binascii cracks)
@@ -28,12 +42,13 @@ Volume:
   doe-tmp  →  mounted at /root/workspace/.tmp/ (persists caches between runs)
 
 Images:
-  image                — lightweight: scrape / evaluate / sheet / followups / prune
-  image_with_playwright — adds Playwright Chromium for CV PDF rendering (Stage 5)
+  image                — lightweight: followups / prune / weekly digest
+  image_with_playwright — adds Playwright Chromium for CV PDF rendering;
+                          used by pipeline_full + pipeline_generate_applications
 
 Deploy:   modal deploy execution/modal_pipeline.py
 Dry-run:  modal run execution/modal_pipeline.py::preflight
-          modal run execution/modal_pipeline.py::pipeline_generate_applications
+          modal run execution/modal_pipeline.py::pipeline_full
 """
 
 from __future__ import annotations
@@ -43,7 +58,9 @@ import binascii
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import modal
 
@@ -174,6 +191,26 @@ def _send_email(subject: str, body: str, to: str = ALERT_EMAIL) -> bool:
     return _send(subject, body, to)
 
 
+def _mirror_tmp() -> None:
+    """Mirror top-level .tmp/ files → Drive (DOE Data/) for local visibility.
+
+    Called once at the end of each cron function so the user can browse pipeline
+    state via Drive for Desktop without `modal volume get`. Best-effort — never
+    raises; mirror failure must not break the parent stage.
+
+    The double try/except (here + inside mirror_tmp_to_drive_safe) is deliberate:
+    the inner one catches Drive/network failures during the mirror itself; this
+    outer one guards against import-time failure (e.g. broken module in a
+    deploy, or a future image that drops googleapiclient).
+    """
+    try:
+        sys.path.insert(0, str(WORKSPACE))
+        from execution.tmp_drive_mirror import mirror_tmp_to_drive_safe
+        mirror_tmp_to_drive_safe(TMP_DIR)
+    except Exception as exc:  # noqa: BLE001 — visibility-only, non-fatal
+        print(f"[tmp-mirror] import/call failed: {exc}", file=sys.stderr)
+
+
 def _run(script: str, *args: str, stage_label: str | None = None) -> None:
     """Run an execution script as a subprocess, streaming output live.
 
@@ -276,26 +313,70 @@ def _notify_applications_ready() -> None:
 # ---------------------------------------------------------------------------
 
 # CET = UTC+1 (winter) / CEST = UTC+2 (summer).
-# Targets: 17:00 CET → 15:00 UTC in summer, 16:00 UTC in winter.
-# Using 15:00 UTC — fires at 17:00 during CEST season (Mar–Oct).
+# Targets: 18:00 CEST → 16:00 UTC in summer, 17:00 UTC in winter.
+# Using 16:00 UTC — fires at 18:00 during CEST season (Mar–Oct).
 
 @app.function(
-    schedule=modal.Cron("0 15 * * 2,4"),   # Tue + Thu 17:00 CEST
+    schedule=modal.Cron("0 16 * * 2,4"),   # Tue + Thu 18:00 CEST
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=7200,
+    timeout=14400,                         # 4 h — full scrape+score+gen budget
+    image=image_with_playwright,           # CV stage needs Chromium
     max_containers=1,
 )
-def pipeline_scrape_write() -> None:
-    """Stage 1-3: scrape → evaluate → write to Google Sheet."""
+def pipeline_full() -> None:
+    """End-to-end Modal pipeline matching scripts/pipeline_full.cmd.
+
+    Runs every stage in the local pipeline back-to-back, no manual sheet gate:
+      preflight → prune → scrape (full description fetch) → evaluate
+      → write_sheet → generate_cover_letter --min-score 7
+      → generate_cv --min-score 7 → update_cover_letter_dates
+      → discover_contacts (cloud-only extra) → notify → mirror
+
+    Selection is by score threshold (--min-score 7) reading scored_jobs.json
+    from the volume — matches local behavior. Status stays at 'New' after
+    generation (CL/CV columns flip to 'Yes'); the user gates Ready_to_Apply
+    manually before running the local swarm.
+
+    Per-stage volume.commit() preserves partial progress on mid-run failure.
+    On any stage's non-zero exit _run() emails the alert mailbox and raises.
+    """
+    os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("scrape_jobs.py", "--no-fetch-descriptions", stage_label="scrape_jobs")
+
+    # Letter date in Swiss time (cron fires at 16:00 UTC = 18:00 CEST, so
+    # UTC and CEST share the same calendar date — but use the explicit zone
+    # so this stays correct if the schedule ever moves near midnight UTC).
+    today = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y-%m-%d")
+
+    _run("preflight.py", "--cloud", stage_label="preflight")
+    _run("prune_stale_jobs.py", "--yes", stage_label="prune_stale_jobs")
+    volume.commit()
+    _run("scrape_jobs.py", stage_label="scrape_jobs")
     volume.commit()
     _run("evaluate_jobs.py", stage_label="evaluate_jobs")
     volume.commit()
     _run("write_jobs_to_sheet.py", stage_label="write_jobs_to_sheet")
     volume.commit()
+    _run("generate_cover_letter.py", "--min-score", "7", stage_label="generate_cover_letter")
+    volume.commit()
+    _run("generate_cv.py", "--min-score", "7", stage_label="generate_cv")
+    volume.commit()
+    _run(
+        "update_cover_letter_dates.py",
+        "--letter-date", today,
+        "--min-score", "7",
+        stage_label="update_cover_letter_dates",
+    )
+    volume.commit()
+    # Stage 4.5: free contact-email discovery (fail-soft, always exits 0).
+    # Local pipeline skips this; Modal keeps it as a free quality-of-life extra.
+    _run("discover_contacts.py", stage_label="discover_contacts")
+    volume.commit()
+
+    _notify_applications_ready()
+    _mirror_tmp()
 
 
 @app.function(
@@ -323,21 +404,45 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     args = [] if dry_run else ["--send"]
     _run("send_followups.py", *args, stage_label="send_followups")
     volume.commit()
+    _mirror_tmp()
 
 
 @app.function(
-    schedule=modal.Cron("45 3 * * *"),     # Daily 05:45 CEST
+    # Daily 04:00 UTC = 06:00 CEST (summer) / 05:00 CET (winter).
+    # One combined maintenance pass before the user wakes up:
+    #   1. prune stale Sheet rows
+    #   2. re-stamp every score>=7 cover letter to today's date and push the
+    #      refreshed PDF/DOCX to Drive
+    # Combined to stay under Modal's 5-cron cap on the current plan.
+    schedule=modal.Cron("0 4 * * *"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=300,
+    timeout=1800,
+    image=image_with_playwright,           # PDF render needs Chromium
     max_containers=1,
 )
-def pipeline_prune() -> None:
-    """Maintenance: delete stale rows from Google Sheet."""
+def pipeline_daily_maintenance() -> None:
+    """Daily prune + cover-letter date re-stamp.
+
+    Stage 1: prune_stale_jobs.py --yes — drop expired rows from the Sheet.
+    Stage 2: update_cover_letter_dates.py --letter-date TODAY --min-score 7 —
+             re-render PDF + DOCX with today's date and push refreshed pair to
+             Drive (DOE Applications/{folder}/), overwriting older-dated copies.
+             No LLM calls — body is extracted from the existing DOCX.
+    """
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     _run("prune_stale_jobs.py", "--yes", stage_label="prune_stale_jobs")
     volume.commit()
+    today = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y-%m-%d")
+    _run(
+        "update_cover_letter_dates.py",
+        "--letter-date", today,
+        "--min-score", "7",
+        stage_label="update_cover_letter_dates",
+    )
+    volume.commit()
+    _mirror_tmp()
 
 
 @app.function(
@@ -356,10 +461,11 @@ def pipeline_weekly_digest() -> None:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     _run("weekly_digest.py", stage_label="weekly_digest")
     volume.commit()
+    _mirror_tmp()
 
 
 @app.function(
-    schedule=modal.Cron("0 */2 * * *"),    # Every 2 hours
+    schedule=modal.Cron("0 */6 * * *"),    # Every 6 hours (manual-override fallback)
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=3600,
@@ -367,9 +473,15 @@ def pipeline_weekly_digest() -> None:
     max_containers=1,
 )
 def pipeline_generate_applications() -> None:
-    """Stage 4 + 4.5 + 5: cover letter + CV + contact discovery for Ready_to_Apply rows.
+    """Manual-override fallback: regenerate CL/CV for rows the user flips to Ready_to_Apply.
 
-    Polls the Sheet every 2 hours. Skips rows already in APPLYING/Applied.
+    Demoted from primary path (pipeline_full now generates everything end-to-end
+    on Tue/Thu). This function only matters when the user manually flips a row
+    to Ready_to_Apply between scheduled runs — typically to re-generate after
+    editing scored_jobs.json or fixing a bad cover letter. Cheap when no rows
+    match (most runs do nothing).
+
+    Polls the Sheet every 6 hours. Skips rows already in APPLYING/Applied.
     Generated PDFs/DOCXs are uploaded to Google Drive (DOE Applications/).
     Sends an email notification when new applications are ready.
     CV photo is bundled in the image at /root/workspace/cv_photo.jpg.
@@ -396,7 +508,7 @@ def pipeline_generate_applications() -> None:
     _run("discover_contacts.py", "--sheet-triggered", stage_label="discover_contacts")
     volume.commit()
     _notify_applications_ready()
-    volume.commit()
+    _mirror_tmp()
 
 
 # ---------------------------------------------------------------------------
@@ -427,3 +539,4 @@ def preflight() -> None:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     _run("preflight.py", "--cloud", stage_label="preflight")
     volume.commit()
+    _mirror_tmp()

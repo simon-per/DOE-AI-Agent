@@ -25,8 +25,8 @@ autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
 
 | Where | Stages | Trigger |
 |---|---|---|
-| **Modal (cloud)** | 1+2+3 (scrape → evaluate → sheet) | Tue+Thu 17:00 CEST cron |
-| **Modal (cloud)** | **4 + 4.5 + 5 (CL + contacts + CV)** | **Every 2h cron** — picks up rows with `Status=Ready_to_Apply` |
+| **Modal (cloud)** | **1–5 + 4.5 (full pipeline, scrape → CV)** | **Tue+Thu 18:00 CEST cron** — `pipeline_full`, `--min-score 7`, no manual gate |
+| **Modal (cloud)** | 4 + 4.5 + 5 (CL + contacts + CV) — fallback | Every 6h cron — `pipeline_generate_applications`, only fires for rows manually flipped to `Ready_to_Apply` |
 | **Modal (cloud)** | 6 (send follow-ups, multi-touch) | Mon-Fri 08:00 CEST cron |
 | **Modal (cloud)** | Maintenance: prune_stale_jobs | Daily 05:45 CEST cron |
 | **Modal (cloud)** | Weekly digest | Sun 18:00 CEST cron |
@@ -34,9 +34,12 @@ autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
 
 **Modal app:** `execution/modal_pipeline.py`
 **Deploy:** `modal deploy execution/modal_pipeline.py`
-**Manual trigger (cloud):** `modal run execution/modal_pipeline.py::pipeline_generate_applications`
+**Manual trigger (cloud, full pipeline):** `modal run execution/modal_pipeline.py::pipeline_full`
+**Manual trigger (cloud, regenerate-from-sheet fallback):** `modal run execution/modal_pipeline.py::pipeline_generate_applications`
 **Connectivity check (cloud):** `modal run execution/modal_pipeline.py::preflight`
 **Connectivity check (local):** `python execution/preflight.py`
+
+**LinkedIn (jobspy):** disabled by default — set `DOE_ENABLE_LINKEDIN=1` to enable on local runs (LinkedIn 429-walls cloud egress, so it stays off on Modal).
 
 **One-time Modal setup:**
 1. `pip install modal && modal token new`
@@ -49,9 +52,12 @@ autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
 
 ## Reliability Hardening (Stages 4+5)
 
-The cloud function `pipeline_generate_applications()` invokes the same Python
-scripts as local, so quality gates and idempotency are identical by construction.
-On top of that, it adds:
+The cloud function `pipeline_full()` is the primary cloud entrypoint and invokes
+the same Python scripts as local in the same order, so quality gates and
+idempotency are identical by construction. (`pipeline_generate_applications()`
+is the every-6h fallback for rows the user manually flips to `Ready_to_Apply`
+between scheduled runs — same script chain, just gated by sheet status.)
+On top of the local behavior, the cloud functions add:
 
 **Preflight (`execution/preflight.py`)** — runs as the FIRST step of every
 cloud invocation. 11 checks:
@@ -103,12 +109,13 @@ python execution/preflight.py
 # 2. Cloud preflight — confirms secrets + image + volume
 modal run execution/modal_pipeline.py::preflight
 
-# 3. End-to-end: pick one row in the Sheet, set Status=Ready_to_Apply
-modal run execution/modal_pipeline.py::pipeline_generate_applications
+# 3. End-to-end: full pipeline (scrape → score → CL → CV → contacts).
+#    Generates everything for fresh jobs scoring >= 6 — no sheet gate needed.
+modal run execution/modal_pipeline.py::pipeline_full
 
 # 4. Idempotency check: trigger again immediately. Expect zero LLM calls,
 #    zero new Drive uploads, no sheet diff. Folder dedup should fire.
-modal run execution/modal_pipeline.py::pipeline_generate_applications
+modal run execution/modal_pipeline.py::pipeline_full
 ```
 
 ---
@@ -367,7 +374,7 @@ vs salutation) actually moved your reply rate. Phase 3 tuning is informed by thi
 - `directives/setup_google_auth.md` — Google OAuth setup for Sheets + Gmail
 
 ## Learnings (auto-updated)
-- Stages 4+5 run on Modal every 2 hours and use four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup). The same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap.
+- Stages 4+5 run on Modal as part of the unified `pipeline_full` (Tue/Thu 18:00 CEST) for any new job scoring >= 7, with a 6h `pipeline_generate_applications` fallback for rows manually flipped to `Ready_to_Apply`. Both paths use four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup). The same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap.
 - A preflight check runs before any cloud LLM stage. Failures are emailed to `simonobemair@gmail.com` and the run aborts before burning tokens.
 - `_write_oauth_files()` validates secret presence + base64 decode up front; missing/rotated secrets produce clear `Modal secret missing: <NAME>` errors instead of `binascii.Error`.
 - `volume.commit()` runs after every stage so partial progress (e.g. CL done, CV crashes) survives a mid-run failure.
