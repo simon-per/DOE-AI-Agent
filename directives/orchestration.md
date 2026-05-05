@@ -41,6 +41,8 @@ autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
 
 **LinkedIn (jobspy):** disabled by default — set `DOE_ENABLE_LINKEDIN=1` to enable on local runs (LinkedIn 429-walls cloud egress, so it stays off on Modal).
 
+**Search-term policy:** terms in `ABOUTME.md` are intentionally broad to surface the AI/automation framing across CRM, RevOps, Sales Ops, Marketing Ops, and BI. Quality is enforced at the **title-filter** layer in `scrape_jobs.py` (junior/clerical/operative + French/Italian) and the **scoring** layer (min 7), not by aggressive term pruning. Cut a term only when it returns verified-zero results over multiple runs.
+
 **One-time Modal setup:**
 1. `pip install modal && modal token new`
 2. In Modal dashboard → Secrets → create `doe-google-oauth` with:

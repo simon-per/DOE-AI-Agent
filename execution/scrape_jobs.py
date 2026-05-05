@@ -98,9 +98,64 @@ BLOCKED_DOMAINS = frozenset({
     "cosmoquick.com",           # user-excluded
 })
 
+# Junior / clerical / operative / call-center / retail-sales roles — out of scope.
+# We target specialist/manager+ in CRM, RevOps, Sales Ops, Marketing Ops, BI.
+JUNIOR_TOKENS = re.compile(
+    r"\b("
+    r"sachbearbeiter(?:in)?|junior|"
+    r"trainee|volont(?:är|aer)(?:in)?|volontariat|"
+    r"praktikant(?:in)?|praktikum|werkstudent(?:in)?|"
+    r"lehrling|lehrstelle|"
+    r"ausbildung|auszubildende(?:r)?|azubi|"
+    r"hilfskraft|aushilfe|"
+    r"inside sales(?: representative| rep)?|"
+    r"sales development(?: representative| rep)?|sdr|"
+    r"business development(?: representative| rep)?|bdr|"
+    r"telesales|telefonist(?:in)?|"
+    r"call ?cent(?:re|er)(?:[ -]agent)?|"
+    r"verk(?:ä|ae)ufer(?:in)?|verkaufsberater(?:in)?|"
+    r"au(?:ß|ss)endienst(?:mitarbeiter(?:in)?)?|"
+    r"disponent(?:in)?|"
+    r"assistent(?:in)?(?!\s+(?:der|des|cfo|ceo|cto|gl|gesch(?:ä|ae)ftsf(?:ü|ue)hr|vorstand))"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# French / Italian title tokens — high-precision; words almost never appearing in DE/EN titles.
+FR_IT_TOKENS = re.compile(
+    r"\b("
+    r"spécialiste|responsable|chargé(?:e)?|développeur(?:euse)?|opérateur(?:trice)?|"
+    r"directeur|gestionnaire|"
+    r"specialista|responsabile|sviluppatore|operatore|addetto(?:a)?|"
+    r"impiegato(?:a)?|coordinatore"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Drop counters (logged at end of run).
+_filter_stats_lock = threading.Lock()
+_filter_stats: dict[str, int] = {"junior": 0, "fr_it": 0}
+
+
+def _drop_by_title(title: str) -> str | None:
+    """Return drop reason ('junior'|'fr_it') if title should be filtered, else None."""
+    if not title:
+        return None
+    if JUNIOR_TOKENS.search(title):
+        return "junior"
+    if FR_IT_TOKENS.search(title):
+        return "fr_it"
+    return None
+
+
+def _bump_filter(reason: str) -> None:
+    with _filter_stats_lock:
+        _filter_stats[reason] = _filter_stats.get(reason, 0) + 1
+
+
 # --- SERP API configuration ---
 SERPAPI_URL = "https://serpapi.com/search"
-DEFAULT_SERP_PAGES = 3  # up to 30 results per term (10/page)
+DEFAULT_SERP_PAGES = 2  # 20 results per term (10/page) — fresh > volume; page 3 was mostly stale tail
 
 # Round-robin key rotation for 2× budget (500 calls/month)
 _serpapi_keys: list[str] = []
@@ -184,6 +239,7 @@ def scrape_jobspy(search_term: str, hours_old: int = DEFAULT_HOURS_OLD) -> list[
                 date_posted=str(row.get("date_posted", "")) if row.get("date_posted") else None,
                 salary=_extract_salary(row),
                 employment_type=str(row.get("job_type", "")) if row.get("job_type") else None,
+                search_term=search_term,
             )
             if job:
                 jobs.append(job)
@@ -261,7 +317,7 @@ def scrape_jobroom_term(search_term: str, online_since_days: int, page_size: int
         if not isinstance(items, list) or not items:
             break
         for item in items:
-            job = _parse_jobroom_item(item)
+            job = _parse_jobroom_item(item, search_term=search_term)
             if job:
                 jobs.append(job)
         if len(items) < page_size:
@@ -281,7 +337,7 @@ def scrape_jobroom_all(search_terms: list[str], hours_old: int = DEFAULT_HOURS_O
     return all_jobs
 
 
-def _parse_jobroom_item(item: dict) -> dict | None:
+def _parse_jobroom_item(item: dict, search_term: str | None = None) -> dict | None:
     """Parse a job-room.ch search result item.
 
     Schema (POST .../jobAdvertisements/_search):
@@ -347,6 +403,7 @@ def _parse_jobroom_item(item: dict) -> dict | None:
             date_posted=date_posted,
             salary=None,
             employment_type=employment_type,
+            search_term=search_term,
         )
     except Exception as e:
         log.warning(f"[jobroom] Failed to parse item: {e}")
@@ -438,7 +495,7 @@ def scrape_jobs4sales(search_term: str, max_pages: int = 3) -> list[dict]:
                 break
 
             for item in page_jobs:
-                norm = _parse_jobs4sales_item(item)
+                norm = _parse_jobs4sales_item(item, search_term=search_term)
                 if norm:
                     jobs.append(norm)
 
@@ -455,7 +512,7 @@ def scrape_jobs4sales(search_term: str, max_pages: int = 3) -> list[dict]:
     return jobs
 
 
-def _parse_jobs4sales_item(item: dict) -> dict | None:
+def _parse_jobs4sales_item(item: dict, search_term: str | None = None) -> dict | None:
     """Normalize a single jobs4sales listing from the Next.js payload."""
     import html as _html
     try:
@@ -483,6 +540,7 @@ def _parse_jobs4sales_item(item: dict) -> dict | None:
             date_posted=date_posted,
             salary=None,
             employment_type=str(workload) if workload else None,
+            search_term=search_term,
         )
     except Exception as e:
         log.warning(f"[jobs4sales] Failed to parse item: {e}")
@@ -545,7 +603,7 @@ def scrape_ictjobs(search_term: str) -> list[dict]:
             )
 
         for card in cards:
-            norm = _parse_ictjobs_card(card)
+            norm = _parse_ictjobs_card(card, search_term=search_term)
             if norm:
                 jobs.append(norm)
     except requests.RequestException as e:
@@ -556,7 +614,7 @@ def scrape_ictjobs(search_term: str) -> list[dict]:
     return jobs
 
 
-def _parse_ictjobs_card(card_html: str) -> dict | None:
+def _parse_ictjobs_card(card_html: str, search_term: str | None = None) -> dict | None:
     """Normalize a single <div class='offer publish'> card."""
     import html as _html
     try:
@@ -588,6 +646,7 @@ def _parse_ictjobs_card(card_html: str) -> dict | None:
             date_posted=date_posted,
             salary=None,
             employment_type=None,
+            search_term=search_term,
         )
     except Exception as e:
         log.warning(f"[ictjobs] Failed to parse card: {e}")
@@ -638,7 +697,7 @@ def scrape_jobsch_term(search_term: str, max_age_days: int, max_pages: int = 5) 
             age = doc.get("age")
             if isinstance(age, (int, float)) and age <= max_age_days:
                 all_too_old = False
-                job = _parse_jobsch_doc(doc)
+                job = _parse_jobsch_doc(doc, search_term=search_term)
                 if job:
                     jobs.append(job)
 
@@ -651,7 +710,7 @@ def scrape_jobsch_term(search_term: str, max_age_days: int, max_pages: int = 5) 
     return jobs
 
 
-def _parse_jobsch_doc(doc: dict) -> dict | None:
+def _parse_jobsch_doc(doc: dict, search_term: str | None = None) -> dict | None:
     try:
         title = doc.get("title", "") or ""
         company = doc.get("company_name", "") or ""
@@ -688,6 +747,7 @@ def _parse_jobsch_doc(doc: dict) -> dict | None:
             date_posted=date_posted,
             salary=None,
             employment_type=employment_type,
+            search_term=search_term,
         )
     except Exception as e:
         log.warning(f"[jobsch] failed to parse doc: {e}")
@@ -987,6 +1047,7 @@ def normalize_job(
     date_posted: str | None,
     salary: str | None,
     employment_type: str | None,
+    search_term: str | None = None,
 ) -> dict | None:
     """Normalize a job listing to the standard schema.
 
@@ -996,6 +1057,10 @@ def normalize_job(
     - URL: tracking params stripped, must be http(s)
     - Source: mapped to controlled vocabulary
     - Description: max 5000 chars, not just title repeated
+
+    Title-level filters (drops row, returns None):
+    - Junior/clerical/operative/call-center/retail-sales (JUNIOR_TOKENS)
+    - French/Italian (FR_IT_TOKENS)
     """
     # [M1] Collapse internal whitespace (newlines, tabs) to single spaces
     title = re.sub(r'\s+', ' ', (title or "")).strip()
@@ -1004,6 +1069,13 @@ def normalize_job(
     # Title max 200 chars
     if len(title) > 200:
         title = title[:200].rsplit(" ", 1)[0]
+
+    # Title-level junk filter (junior/clerical, FR/IT). Cheap, runs before any I/O.
+    drop_reason = _drop_by_title(title)
+    if drop_reason:
+        _bump_filter(drop_reason)
+        log.debug(f"  Dropped ({drop_reason}): {title}")
+        return None
 
     company = re.sub(r'\s+', ' ', (company or "")).strip()
     if company == "nan":
@@ -1068,6 +1140,7 @@ def normalize_job(
         "date_posted": (date_posted or "").strip() if date_posted and str(date_posted) != "nan" else None,
         "salary": salary,
         "employment_type": (employment_type or "").strip() if employment_type and str(employment_type) != "nan" else None,
+        "search_term": search_term,
     }
 
 
@@ -1129,7 +1202,7 @@ def scrape_serpapi(search_term: str, seen: dict[str, str], max_pages: int = DEFA
 
             page_jobs = []
             for item in results:
-                job = _parse_serpapi_item(item)
+                job = _parse_serpapi_item(item, search_term=search_term)
                 if job:
                     page_jobs.append(job)
 
@@ -1207,7 +1280,7 @@ def _parse_relative_date(text: str | None) -> str | None:
     return None  # Unparseable date — return None instead of raw text
 
 
-def _parse_serpapi_item(item: dict) -> dict | None:
+def _parse_serpapi_item(item: dict, search_term: str | None = None) -> dict | None:
     """Parse a SERP API Google Jobs result into normalized format."""
     title = item.get("title", "")
     company = item.get("company_name", "")
@@ -1243,6 +1316,7 @@ def _parse_serpapi_item(item: dict) -> dict | None:
         date_posted=date_posted,
         salary=salary,
         employment_type=schedule,
+        search_term=search_term,
     )
 
 
@@ -1865,6 +1939,13 @@ def main():
     # Log SERP API budget usage
     if _serpapi_call_count > 0:
         log.info(f"SERP API calls this run: {_serpapi_call_count} (budget: 500/month across 2 keys)")
+
+    # Title-filter drop totals (junior/clerical, FR/IT)
+    if _filter_stats.get("junior") or _filter_stats.get("fr_it"):
+        log.info(
+            f"[filter] dropped {_filter_stats.get('junior', 0)} junior/clerical, "
+            f"{_filter_stats.get('fr_it', 0)} FR/IT titles"
+        )
 
     # Niche-board health check: relevant terms ran but 0 jobs returned → probably
     # a site-side markup change. Escalate to error so the user notices quickly.
