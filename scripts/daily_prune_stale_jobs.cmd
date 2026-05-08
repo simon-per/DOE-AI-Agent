@@ -1,6 +1,7 @@
 @echo off
 REM Daily wrapper for prune_stale_jobs.py.
-REM Runs at 05:45 local (Task: DOE_PruneStaleJobs).
+REM Manual fallback — DOE_PruneStaleJobs Task Scheduler entry was retired 2026-05-06.
+REM Modal `pipeline_daily_maintenance` (06:00 CEST cron) handles this in the cloud now.
 REM Deletes rows where Status in (New, Irrelevant, Rejected) AND newest of
 REM Date Scraped/Date Posted is older than 30 days, OR Score <= 4.
 REM Logs to scripts\logs\prune_stale_jobs_YYYYMMDD.log.

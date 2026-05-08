@@ -49,7 +49,7 @@ TOKEN_FILE = PROJECT_ROOT / "token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 DEFAULT_SHEET_NAME = "Swiss Job Search Pipeline"

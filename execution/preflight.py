@@ -2,9 +2,8 @@
 
 Verifies every external API surface the pipeline depends on, end-to-end.
 
-Run before any production deploy. The Modal cron functions (`pipeline_full`
-on Tue/Thu and `pipeline_generate_applications` on the 6h fallback schedule)
-also run this as their first step on every invocation, so a missing scope
+Run before any production deploy. The Modal cron `pipeline_full` (Tue/Thu)
+also runs this as its first step on every invocation, so a missing scope
 or rotated token surfaces in the alert email *before* the LLM stage burns
 tokens or generates partially-broken artifacts.
 
@@ -135,7 +134,12 @@ def check_sheets_write() -> None:
 
 
 def check_drive_list() -> None:
-    """Confirm Drive auth works and the DOE Applications root folder exists."""
+    """Confirm Drive auth works.
+
+    Under drive.file scope the script can only see files it created, so the
+    DOE Applications folder may not exist yet on a first run. We verify auth
+    by issuing any successful files().list — content is irrelevant.
+    """
     from googleapiclient.discovery import build
 
     from execution.drive_upload import _MIME_FOLDER, _get_credentials
@@ -150,19 +154,16 @@ def check_drive_list() -> None:
         ),
         spaces="drive",
         fields="files(id, name)",
+        pageSize=1,
     ).execute()
     files = results.get("files", [])
-    if not files:
-        raise RuntimeError(
-            f"Drive folder '{DRIVE_ROOT_FOLDER}' not found. "
-            f"Create it manually or run write_jobs_to_sheet.py once."
+    if files:
+        log.info(f"  Drive auth OK; '{DRIVE_ROOT_FOLDER}' folder visible (id={files[0]['id']})")
+    else:
+        log.info(
+            f"  Drive auth OK; '{DRIVE_ROOT_FOLDER}' not yet visible under drive.file scope "
+            "(will be created on first upload)."
         )
-    root_id = files[0]["id"]
-    contents = service.files().list(
-        q=f"'{root_id}' in parents and trashed = false",
-        fields="files(id)",
-    ).execute()
-    log.info(f"  Drive root '{DRIVE_ROOT_FOLDER}' has {len(contents.get('files', []))} item(s)")
 
 
 def check_drive_write_cycle() -> None:

@@ -108,9 +108,7 @@ JUNIOR_TOKENS = re.compile(
     r"lehrling|lehrstelle|"
     r"ausbildung|auszubildende(?:r)?|azubi|"
     r"hilfskraft|aushilfe|"
-    r"inside sales(?: representative| rep)?|"
-    r"sales development(?: representative| rep)?|sdr|"
-    r"business development(?: representative| rep)?|bdr|"
+    r"sdr|bdr|"
     r"telesales|telefonist(?:in)?|"
     r"call ?cent(?:re|er)(?:[ -]agent)?|"
     r"verk(?:ä|ae)ufer(?:in)?|verkaufsberater(?:in)?|"
@@ -155,7 +153,7 @@ def _bump_filter(reason: str) -> None:
 
 # --- SERP API configuration ---
 SERPAPI_URL = "https://serpapi.com/search"
-DEFAULT_SERP_PAGES = 2  # 20 results per term (10/page) — fresh > volume; page 3 was mostly stale tail
+DEFAULT_SERP_PAGES = 3  # 30 results per term (10/page) — restored for coverage on narrow Swiss market
 
 # Round-robin key rotation for 2× budget (500 calls/month)
 _serpapi_keys: list[str] = []

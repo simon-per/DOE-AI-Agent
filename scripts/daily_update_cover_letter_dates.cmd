@@ -1,6 +1,10 @@
 @echo off
 REM Daily wrapper for update_cover_letter_dates.py.
-REM Runs at 05:45 local (Task: DOE_UpdateCoverLetterDates).
+REM Runs at 05:45 local (Task: DOE_UpdateCoverLetterDates) — re-registered 2026-05-06.
+REM Local-only refresh of legacy `.tmp/applications/` files for ad-hoc apply runs.
+REM `--skip-drive` keeps Drive untouched; Modal `pipeline_daily_maintenance` (03:00 CEST)
+REM owns the canonical Drive copies. This task can be retired once Stage 7 fully
+REM pulls from Drive and the local `.tmp/applications/` is no longer needed.
 REM Re-stamps every cover letter folder with score >= 6 to TODAY's date,
 REM so when the user applies right after waking up the letter date is current.
 REM Logs to scripts\logs\update_dates_YYYYMMDD.log.
@@ -42,8 +46,8 @@ if not "!RC!"=="0" (
     goto fail
 )
 
->>"!LOG!" echo [%TIME%] --- update_cover_letter_dates START ---
-"!PY!" -m execution.update_cover_letter_dates --letter-date !LETTER_DATE! --min-score 7 >>"!LOG!" 2>&1
+>>"!LOG!" echo [%TIME%] --- update_cover_letter_dates START (render-only, Drive synced at 06:30) ---
+"!PY!" -m execution.update_cover_letter_dates --letter-date !LETTER_DATE! --min-score 6 --skip-drive >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- update_cover_letter_dates END rc=!RC! ---
 

@@ -52,7 +52,8 @@ TOKEN_FILE = PROJECT_ROOT / "token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    # drive.file = per-file scope (non-sensitive, no 7-day token expiry)
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 HEADERS = [
@@ -207,17 +208,29 @@ def job_to_row(job: dict) -> list:
     ]
 
 
-def _sheets_api_call(func, *args, retries=3, **kwargs):
-    """Wrapper for Google Sheets API calls with retry on quota errors."""
-    for attempt in range(retries):
+_SHEETS_RETRYABLE = {429, 500, 502, 503}
+
+
+def _sheets_api_call(func, *args, max_tries: int = 5, retries: int | None = None, **kwargs):
+    """Wrapper for Google Sheets API calls with exponential backoff on transient errors.
+
+    Retries on 429 (quota), 500/502 (gateway), 503 (unavailable). Sleeps 1s, 2s, 4s, 8s.
+    `retries=` accepted for backwards compatibility; if both are passed, max_tries wins.
+    """
+    if retries is not None:
+        max_tries = retries
+    for attempt in range(max_tries):
         try:
             return func(*args, **kwargs)
         except gspread.exceptions.APIError as e:
-            if e.response.status_code == 429 and attempt < retries - 1:
-                log.warning(f"Sheets API quota hit. Waiting 60s before retry {attempt + 2}/{retries}...")
-                time.sleep(60)
-                continue
-            raise
+            status = getattr(e.response, "status_code", None)
+            if status not in _SHEETS_RETRYABLE or attempt == max_tries - 1:
+                raise
+            sleep = 2 ** attempt  # 1, 2, 4, 8 — total worst-case wait 15s
+            log.warning(
+                f"[sheets] HTTP {status} — retry {attempt + 1}/{max_tries - 1} in {sleep}s"
+            )
+            time.sleep(sleep)
 
 
 def update_job_columns(sheet_name: str, job_url: str, updates: dict[str, str]):

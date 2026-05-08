@@ -1,5 +1,6 @@
 @echo off
-REM Full job-app pipeline. Runs Tue + Thu 17:00 (Task: DOE_PipelineFull).
+REM Manual fallback — DOE_PipelineFull Task Scheduler entry was retired 2026-05-06.
+REM Modal `pipeline_full` (Tue/Thu 18:00 CEST cron) is the canonical run; this stays for ad-hoc local use.
 REM Canonical order from directives/orchestration.md, plus prune+update bookends:
 REM   prune -> scrape -> evaluate -> write -> cover -> cv -> update_dates
 REM
@@ -103,7 +104,7 @@ REM ----- stage 4: generate_cover_letter -----
 >>"!LOG!" echo.
 >>"!LOG!" echo [%TIME%] --- generate_cover_letter START ---
 >"!STAGE_FILE!" echo generate_cover_letter
-"!PY!" -m execution.generate_cover_letter --min-score 7 >>"!LOG!" 2>&1
+"!PY!" -m execution.generate_cover_letter --min-score 6 >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- generate_cover_letter END rc=!RC! ---
 if not "!RC!"=="0" (
@@ -115,7 +116,7 @@ REM ----- stage 5: generate_cv -----
 >>"!LOG!" echo.
 >>"!LOG!" echo [%TIME%] --- generate_cv START ---
 >"!STAGE_FILE!" echo generate_cv
-"!PY!" -m execution.generate_cv --min-score 7 >>"!LOG!" 2>&1
+"!PY!" -m execution.generate_cv --min-score 6 >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- generate_cv END rc=!RC! ---
 if not "!RC!"=="0" (
@@ -127,7 +128,7 @@ REM ----- stage 6: update_cover_letter_dates (re-stamp to today) -----
 >>"!LOG!" echo.
 >>"!LOG!" echo [%TIME%] --- update_cover_letter_dates START (date=!TODAY!) ---
 >"!STAGE_FILE!" echo update_cover_letter_dates
-"!PY!" -m execution.update_cover_letter_dates --letter-date !TODAY! --min-score 7 >>"!LOG!" 2>&1
+"!PY!" -m execution.update_cover_letter_dates --letter-date !TODAY! --min-score 6 >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- update_cover_letter_dates END rc=!RC! ---
 if not "!RC!"=="0" (

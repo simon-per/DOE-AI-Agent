@@ -46,6 +46,18 @@ MODEL_COVER_LETTER = os.getenv("MODEL_COVER_LETTER", "google/gemini-3-flash-prev
 MODEL_CHEAP        = os.getenv("MODEL_CHEAP",        "deepseek/deepseek-v4-flash")
 MODEL_FALLBACK     = os.getenv("MODEL_FALLBACK",     "qwen/qwen3-235b-a22b-2507")
 
+# Per-stage fallback chains. cover_letter has THREE models because the
+# 2026-05-07 incident proved a 2-model chain isn't enough: gemini-3-flash AND
+# qwen3 were both unreachable simultaneously while deepseek stayed up, leaving
+# the CL stage to silent-fail every job. DeepSeek's German is weaker than
+# Gemini's but a working CL beats a missing one. Built lazily inside call_llm
+# so env-var overrides take effect.
+def _model_chain(stage: str) -> list[str]:
+    if stage == "cover_letter":
+        return [MODEL_COVER_LETTER, MODEL_FALLBACK, MODEL_CHEAP]
+    return [MODEL_CHEAP, MODEL_FALLBACK]
+
+
 # Back-compat alias — evaluate_jobs.py logs this in its startup banner. New
 # code should import the named constants above instead.
 OPENROUTER_MODEL = MODEL_CHEAP
@@ -145,24 +157,26 @@ def call_llm(
             "path was removed in the 2026-05-03 routing refactor."
         )
 
-    primary = MODEL_COVER_LETTER if stage == "cover_letter" else MODEL_CHEAP
+    chain = _model_chain(stage)
+    last_exc: Exception | None = None
+    for i, model in enumerate(chain):
+        try:
+            result = call_openrouter(
+                openrouter_key, prompt, temperature, max_tokens, json_mode, model=model,
+            )
+            return result, model
+        except Exception as exc:
+            last_exc = exc
+            if i < len(chain) - 1:
+                log.warning(
+                    f"[openrouter:{model}] failed ({type(exc).__name__}: {exc}). "
+                    f"Trying next: {chain[i + 1]}"
+                )
 
-    try:
-        result = call_openrouter(
-            openrouter_key, prompt, temperature, max_tokens, json_mode, model=primary,
-        )
-        return result, primary
-    except Exception as exc:
-        if primary == MODEL_FALLBACK:
-            # Already on the fallback — nothing left to try
-            raise
-        log.warning(f"[openrouter:{primary}] failed ({type(exc).__name__}: {exc}). "
-                    f"Retrying with fallback {MODEL_FALLBACK}...")
-
-    result = call_openrouter(
-        openrouter_key, prompt, temperature, max_tokens, json_mode, model=MODEL_FALLBACK,
-    )
-    return result, MODEL_FALLBACK
+    # All models in the chain exhausted — surface the last exception unchanged
+    # so per-job try/except in callers can log type(e).__name__ meaningfully.
+    assert last_exc is not None  # chain is never empty
+    raise last_exc
 
 
 def parse_json_response(text: str) -> dict:

@@ -98,6 +98,38 @@ def main() -> int:
     ap.add_argument("--sheet-name", default=DEFAULT_SHEET_NAME)
     ap.add_argument("--dry-run", action="store_true", help="Log candidates, do not delete")
     ap.add_argument("--yes", action="store_true", help="Skip interactive confirmation")
+    ap.add_argument(
+        "--archive-drive", action="store_true",
+        help="After deletion, move pruned rows' Drive folders to _Archive/ and "
+             "permanently delete folders that have been in _Archive/ longer than "
+             "--archive-purge-days. Cloud-only; safe to omit on local runs.",
+    )
+    ap.add_argument(
+        "--archive-purge-days", type=int, default=14,
+        help="Days a folder lingers in _Archive/ before permanent deletion (default: 14).",
+    )
+    ap.add_argument(
+        "--reconcile-orphans", action="store_true",
+        help="After deletion+archive, also archive any active Drive J-* folder whose "
+             "job_id is no longer in the Sheet. Cloud-only — relies on --archive-drive's "
+             "purge step to clean up the orphan archives after 14 days.",
+    )
+    ap.add_argument(
+        "--orphan-max-pct", type=float, default=0.10,
+        help="Refuse orphan-archive if the orphan share exceeds this fraction "
+             "(default 0.10 = 10%%). Catches Sheet read errors that would mass-archive "
+             "everything. Override with --force-reconcile.",
+    )
+    ap.add_argument(
+        "--orphan-grace-hours", type=int, default=12,
+        help="Skip orphan-archive on folders modified within last N hours (default 12). "
+             "Avoids racing in-flight CL uploads from pipeline_full / manual runs.",
+    )
+    ap.add_argument(
+        "--force-reconcile", action="store_true",
+        help="Bypass --orphan-max-pct safeguard. Use only when a large legitimate "
+             "cleanup is expected (e.g., after manually deleting many Sheet rows).",
+    )
     args = ap.parse_args()
 
     stale_statuses = {s.strip().lower() for s in args.statuses.split(",") if s.strip()}
@@ -225,6 +257,68 @@ def main() -> int:
 
     _sheets_api_call(spreadsheet.batch_update, {"requests": requests})
     log.info(f"Deleted {len(delete_indices)} row(s).")
+
+    # Drive lifecycle (cloud-only): archive the deleted rows' Drive folders,
+    # then purge anything in _Archive/ older than --archive-purge-days.
+    # Failures are logged but never raise — Drive hygiene must not block the
+    # primary prune. Local runs typically skip this flag (--skip-drive parity).
+    if args.archive_drive:
+        try:
+            from execution.drive_upload import (
+                archive_folders_by_job_id,
+                purge_archive_older_than,
+            )
+            archived = archive_folders_by_job_id([j for j in deleted_job_ids if j])
+            log.info(f"Drive: archived {archived} folder(s)")
+            purged, kept = purge_archive_older_than(days=args.archive_purge_days)
+            log.info(
+                f"Drive: purged {purged} folder(s) older than "
+                f"{args.archive_purge_days}d from _Archive ({kept} kept)"
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.warning(f"Drive archive/purge failed (non-fatal): {exc}")
+
+    # Drive→Sheet reconciliation (Round 4): archive any active J-* folder whose
+    # job_id is no longer in the Sheet (manually deleted rows, legacy state).
+    # Uses sheet_job_ids derived from `rows` already loaded above — no extra API call.
+    # Just-deleted rows' folders are already in _Archive/ (above), so they don't appear here.
+    if args.reconcile_orphans:
+        try:
+            from execution.drive_upload import archive_orphan_drive_folders
+            sheet_job_ids: set[str] = set()
+            if job_id_idx is not None:
+                for row in rows[1:]:
+                    if job_id_idx < len(row):
+                        jid = row[job_id_idx].strip()
+                        if jid:
+                            sheet_job_ids.add(jid)
+            result = archive_orphan_drive_folders(
+                sheet_job_ids,
+                max_orphan_pct=args.orphan_max_pct,
+                grace_hours=args.orphan_grace_hours,
+                force=args.force_reconcile,
+            )
+            log.info(
+                f"Drive reconcile: active={result['active']} "
+                f"orphans={result['orphan_candidates']} "
+                f"in_grace={result['in_grace']} "
+                f"archived={result['archived']} "
+                f"failed={result['failed']} "
+                f"aborted={result['aborted']}"
+            )
+            # If a safeguard tripped, surface it so cron output capture flags it.
+            # Use a stable token the modal_pipeline summary regex can match.
+            if result["aborted"]:
+                log.warning(
+                    f"[reconcile] aborted={result['aborted']} "
+                    f"pct={result['threshold_pct']:.1%} — "
+                    f"orphan archive skipped, see safeguard threshold or "
+                    f"empty-sheet guard. Re-run with --force-reconcile if "
+                    f"the situation is known-good."
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.warning(f"Drive reconcile failed (non-fatal): {exc}")
+
     return 0
 
 

@@ -1515,6 +1515,24 @@ def generate_cover_letter_for_job(
     docx_path = generate_docx(text, job, lang_code, docx_output, contact_name=contact_name, subtitle=subtitle, letter_date=letter_date, gender_hint=gender_hint)
     log.info(f"  DOCX saved: {docx_path}")
 
+    # Sidecar: persist body + metadata so update_cover_letter_dates can re-render
+    # the PDF without regex-extracting the body back out of the DOCX.
+    meta_path = Path(docx_path).parent / "letter_meta.json"
+    meta_payload = json.dumps(
+        {
+            "body": text,
+            "contact_name": contact_name,
+            "subtitle": subtitle,
+            "language": lang_code,
+            "first_letter_date": letter_date,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    meta_tmp = meta_path.with_suffix(meta_path.suffix + ".part")
+    meta_tmp.write_text(meta_payload, encoding="utf-8")
+    meta_tmp.replace(meta_path)
+
     return {
         "title": title,
         "company": company,
@@ -1813,16 +1831,18 @@ def main():
             log.error(f"  Failed (hallucination reject {count}/{MAX_HALLUCINATION_REJECTS_ACROSS_RUNS}): {e}")
             _save_checkpoint(checkpoint)
             results.append({
+                "job_id": job_id,
                 "title": job.get("title", "?"),
                 "company": job.get("company", "?"),
                 "error": f"hallucination_reject (attempt {count})",
             })
         except Exception as e:
-            log.error(f"  Failed: {e}")
+            log.error(f"  Failed: {type(e).__name__}: {e}")
             results.append({
+                "job_id": _get_job_id(job),
                 "title": job.get("title", "?"),
                 "company": job.get("company", "?"),
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
             })
 
         # Rate limit between calls
@@ -1906,6 +1926,47 @@ def main():
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(quality_report, f, ensure_ascii=False, indent=2)
         log.info(f"  Quality report saved: {report_path}")
+
+    # Always persist a run summary (even when 0/N succeeded) so post-mortem
+    # debugging doesn't depend on Modal's ephemeral live-only stdout. The
+    # 2026-05-08 incident — 49 silent per-job failures, no quality_report.json
+    # written — burned ~30 min of Volume archaeology. This file makes the
+    # answer a single `modal volume get` away.
+    summary_path = TMP_DIR / "cl_run_summary.json"
+    summary_payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "eligible_count": len(eligible_jobs),
+        "pending_count": len(pending_jobs),
+        "skipped_checkpoint_or_folder": skipped,
+        "skipped_hallucination_giveup": skipped_halluc_giveup,
+        "generated": len(successful),
+        "failed": len(failed),
+        "errors": [
+            {
+                "job_id": r.get("job_id", ""),
+                "title": r.get("title", ""),
+                "company": r.get("company", ""),
+                "error": r.get("error", ""),
+            }
+            for r in failed
+        ],
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+    log.info(f"Run summary saved: {summary_path} ({len(successful)} ok / {len(failed)} failed)")
+
+    # Loud-fail: a 0-success day on a non-trivial batch is a systemic problem
+    # (LLM outage, prompt rejected by every model, profile load broken, etc.),
+    # not a content problem. Force non-zero exit so _run() in modal_pipeline.py
+    # captures the tail of stdout and emails ALERT_EMAIL. Threshold ≥3 protects
+    # against tiny days where a single hallucination giveup would alert.
+    if len(successful) == 0 and len(pending_jobs) >= 3:
+        log.error(
+            f"SYSTEMIC FAILURE: 0/{len(pending_jobs)} cover letters generated. "
+            f"See {summary_path.name} on the Modal volume for per-job error list. "
+            f"Exiting non-zero so the pipeline alerts."
+        )
+        sys.exit(1)
 
     return results
 

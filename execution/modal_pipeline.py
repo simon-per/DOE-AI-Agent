@@ -4,17 +4,18 @@ Cloud-scheduled pipeline runner on Modal (serverless).
 Runs all automatable stages 24/7 without the local PC needing to be on:
   - Tue + Thu 18:00 CEST: pipeline_full — end-to-end parity with the local
                           scripts/pipeline_full.cmd (prune → scrape → evaluate
-                          → write_sheet → cover_letter --min-score 7 → cv
-                          --min-score 7 → update_dates → discover_contacts).
+                          → write_sheet → cover_letter --min-score 6 → cv
+                          --min-score 6 → discover_contacts).
                           No manual sheet gate; selection is by score threshold.
-  - Every 6 hours:        pipeline_generate_applications — fallback that polls
-                          the Sheet for any rows the user manually flips to
-                          Ready_to_Apply (e.g. for re-generation).
+                          Date freshness on subsequent days is handled by
+                          pipeline_daily_maintenance (no re-stamp inside this run).
   - Mon-Fri 06:00 UTC:    send_followups --send
-  - Daily 04:00 UTC:      pipeline_daily_maintenance — prune stale rows AND
-                          re-stamp every score>=7 cover letter to TODAY,
+  - Daily 01:00 UTC:      pipeline_daily_maintenance — prune stale rows AND
+                          re-stamp every score>=6 cover letter to TODAY,
                           pushing refreshed PDF/DOCX to Drive so the user
-                          always opens an up-to-date letter.
+                          always opens an up-to-date letter. Fires at 03:00
+                          CEST (summer) / 02:00 CET (winter) so it finishes
+                          well before the 05:45 local apply window.
   - Sun 16:00 UTC:        weekly digest email
 
 Stage 7 (run_swarm / apply) stays local — requires Chrome + human review.
@@ -27,15 +28,14 @@ swarm, which then progresses APPLYING → Applied.
 Reliability hardening (see .claude/plans/hi-how-are-you-enchanted-tulip.md):
   - Defensive secret validation (clear errors instead of binascii cracks)
   - Per-stage volume.commit() so partial progress survives a mid-run crash
-  - Email alert on any stage failure (Gmail via token_gmail.json)
+  - Email alert on any stage failure (Gmail via SMTP + GMAIL_APP_PASSWORD)
   - max_containers=1 prevents cron + manual triggers overlapping
   - Preflight step verifies all API surfaces before LLM calls
 
 Secrets required (set once in Modal dashboard):
-  doe-google-oauth  →  TOKEN_JSON (base64 of token.json, Sheets+Drive scope)
-                        TOKEN_GMAIL_JSON (base64 of token_gmail.json, +Gmail.send)
-                        CREDENTIALS_JSON (base64 of credentials.json)
-  doe-api-keys      →  OPEN_ROUTER_API_KEY, GOOGLE_AI_STUDIO_API_KEY,
+  doe-google-oauth  →  TOKEN_JSON (base64 of token.json, Sheets+drive.file scope)
+                        CREDENTIALS_JSON (base64 of credentials.json — OAuth client id/secret)
+  doe-api-keys      →  OPEN_ROUTER_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD,
                         SERPAPI_API_KEY, SERPAPI_API_KEY2
 
 Volume:
@@ -44,7 +44,7 @@ Volume:
 Images:
   image                — lightweight: followups / prune / weekly digest
   image_with_playwright — adds Playwright Chromium for CV PDF rendering;
-                          used by pipeline_full + pipeline_generate_applications
+                          used by pipeline_full + pipeline_daily_maintenance
 
 Deploy:   modal deploy execution/modal_pipeline.py
 Dry-run:  modal run execution/modal_pipeline.py::preflight
@@ -55,10 +55,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import json as _json_mod
 import os
+import re
 import subprocess
 import sys
-from datetime import datetime
+import threading
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -85,7 +89,7 @@ _base = (
 # Lightweight image — used by scrape/evaluate/sheet/followups/prune
 image = _base
 
-# Playwright image — used by pipeline_generate_applications (Stage 4+5).
+# Playwright image — used by pipeline_full + pipeline_daily_maintenance (PDF rendering).
 # Adds Chromium system deps + browser binary for CV HTML→PDF rendering.
 # run_commands must come before add_local_* (Modal requirement).
 image_with_playwright = (
@@ -96,6 +100,11 @@ image_with_playwright = (
         "libnss3", "libatk1.0-0", "libatk-bridge2.0-0",
         "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1",
         "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2",
+        # TTF fonts for fpdf2 cover-letter rendering. Without this, _setup_fonts()
+        # in CoverLetterPDF can't find LiberationSans-*.ttf, fpdf2 falls back to
+        # the helvetica core font (latin-1), and rendering raises
+        # FPDFUnicodeEncodingException on the "•" in subtitles.
+        "fonts-liberation",
     )
     .pip_install_from_requirements("requirements.txt")
     .run_commands("python -m playwright install chromium")
@@ -134,9 +143,10 @@ app = modal.App("doe-pipeline", image=image)
 # ---------------------------------------------------------------------------
 
 # Required Modal secret env vars; mapped to the file each must be decoded into.
+# Gmail send is via SMTP+app-password (env vars GMAIL_ADDRESS, GMAIL_APP_PASSWORD
+# in the doe-api-keys secret); no Gmail OAuth token is required anymore.
 _REQUIRED_OAUTH_SECRETS: dict[str, Path] = {
     "TOKEN_JSON":       WORKSPACE / "token.json",
-    "TOKEN_GMAIL_JSON": WORKSPACE / "token_gmail.json",
     "CREDENTIALS_JSON": WORKSPACE / "credentials.json",
 }
 _REQUIRED_API_KEYS = ("OPEN_ROUTER_API_KEY",)
@@ -191,6 +201,101 @@ def _send_email(subject: str, body: str, to: str = ALERT_EMAIL) -> bool:
     return _send(subject, body, to)
 
 
+OAUTH_SENTINEL = TMP_DIR / "oauth_sentinel.json"
+OAUTH_REAUTH_HOWTO = (
+    "Re-auth steps:\n"
+    "  1. python execution/write_jobs_to_sheet.py    # opens browser, refreshes token.json\n"
+    "  2. PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes('token.json'))\n"
+    "  3. Modal dashboard -> Secrets -> doe-google-oauth -> set TOKEN_JSON to the base64 value\n"
+    "  4. modal deploy execution/modal_pipeline.py\n"
+)
+
+
+def _check_oauth_health() -> tuple[bool, str | None]:
+    """Active health check on the Sheets OAuth chain.
+
+    Returns:
+        (True, None)            — token healthy, no action needed.
+        (True, "<warning msg>") — soft warning, day-5 or day-6 since last rotation.
+        (False, "<error msg>")  — Sheets read failed; caller should raise to fail loudly.
+
+    Side effect: refreshes the on-Volume sentinel that tracks last rotation date.
+    Sticky: warns at most once on day 5 and once on day 6, never spams.
+
+    The "rotation" date is detected by hashing the decoded token.json — when the
+    Modal secret is updated and re-deployed, the hash changes and the sentinel
+    resets. This gives an accurate proxy for the refresh_token age that
+    Google's 7-day rule revokes against (sensitive scopes, unverified app).
+    """
+    token_path = WORKSPACE / "token.json"
+    h = hashlib.sha256(token_path.read_bytes()).hexdigest()[:16]
+    today_iso = date.today().isoformat()
+
+    rec = {"hash": h, "rotated_at": today_iso, "last_warn_day": -1}
+    if OAUTH_SENTINEL.exists():
+        try:
+            prev = _json_mod.loads(OAUTH_SENTINEL.read_text())
+            if prev.get("hash") == h:
+                rec["rotated_at"] = prev.get("rotated_at", today_iso)
+                rec["last_warn_day"] = prev.get("last_warn_day", -1)
+            # else: secret rotated → fresh sentinel, last_warn_day reset to -1
+        except Exception:
+            pass
+
+    days_old = (date.today() - date.fromisoformat(rec["rotated_at"])).days
+
+    # Active end-to-end check: refresh + Sheet header read.
+    try:
+        sys.path.insert(0, str(WORKSPACE))
+        from execution.write_jobs_to_sheet import authenticate, _sheets_api_call
+        client = authenticate()
+        ws = _sheets_api_call(client.open, "Swiss Job Search Pipeline").sheet1
+        _sheets_api_call(ws.row_values, 1)
+    except Exception as exc:
+        OAUTH_SENTINEL.write_text(_json_mod.dumps(rec))
+        return (False, f"OAuth/Sheets read failed (token age {days_old}d): {exc}")
+
+    # Sticky warning at days 5 and 6 only — never spam.
+    if days_old in (5, 6) and rec["last_warn_day"] != days_old:
+        rec["last_warn_day"] = days_old
+        OAUTH_SENTINEL.write_text(_json_mod.dumps(rec))
+        return (True, f"OAuth token age {days_old}d — re-auth recommended within {7 - days_old}d")
+
+    OAUTH_SENTINEL.write_text(_json_mod.dumps(rec))
+    return (True, None)
+
+
+def _send_oauth_alert(message: str, healthy: bool) -> None:
+    """Email the user about OAuth health. Best-effort — never raises."""
+    if healthy:
+        subject = f"[DOE pipeline OAUTH WARN] {message}"
+    else:
+        subject = "[DOE pipeline OAUTH FAIL] re-auth required"
+    body = f"{message}\n\n{OAUTH_REAUTH_HOWTO}"
+    try:
+        _send_email(subject=subject, body=body)
+    except Exception as exc:
+        print(f"[oauth] alert email failed: {exc}", file=sys.stderr)
+
+
+def _pipeline_startup(stage_name: str) -> None:
+    """Standard prelude for every cloud cron.
+
+    1. Decode OAuth + API-key secrets from Modal env vars.
+    2. Ensure tmp dir exists.
+    3. Run OAuth health check — fail loudly if Sheets auth is broken,
+       email a soft warning on day-5/6 token age.
+    """
+    _write_oauth_files()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    healthy, msg = _check_oauth_health()
+    if not healthy:
+        _send_oauth_alert(msg or "Sheets read failed", healthy=False)
+        raise RuntimeError(f"[{stage_name}] OAuth health check failed: {msg}")
+    if msg:
+        _send_oauth_alert(msg, healthy=True)
+
+
 def _mirror_tmp() -> None:
     """Mirror top-level .tmp/ files → Drive (DOE Data/) for local visibility.
 
@@ -211,13 +316,31 @@ def _mirror_tmp() -> None:
         print(f"[tmp-mirror] import/call failed: {exc}", file=sys.stderr)
 
 
-def _run(script: str, *args: str, stage_label: str | None = None) -> None:
+def _run(
+    script: str,
+    *args: str,
+    stage_label: str | None = None,
+    check: bool = True,
+    timeout: int = 3600,
+    capture: list[str] | None = None,
+) -> None:
     """Run an execution script as a subprocess, streaming output live.
 
-    On non-zero exit:
-      1. capture the last 40 output lines for context
-      2. send a failure email to ALERT_EMAIL
-      3. raise RuntimeError so Modal marks the run as failed
+    Args:
+        check:   If False, a non-zero exit logs and emails but does NOT raise —
+                 the pipeline continues. Use for best-effort stages (e.g. hydrate)
+                 whose failure should not block downstream work.
+        timeout: Seconds before a watchdog kills the subprocess. Defaults to 3600
+                 (60 min). A `threading.Timer` is used because the streaming-stdout
+                 read loop blocks while the pipe is open — `proc.wait(timeout=)` on
+                 its own can't unwind a hung child.
+        capture: If provided, every output line is appended to this list in
+                 addition to being printed. Used to extract per-stage stats for
+                 the daily success summary email.
+
+    On non-zero exit (and check=True): capture last 40 output lines, email
+    ALERT_EMAIL, raise RuntimeError. On timeout: kill, email TIMEOUT subject,
+    raise unconditionally (a hung stage is always a real failure).
     """
     label = stage_label or script
     cmd = [sys.executable, f"execution/{script}", *args]
@@ -230,16 +353,49 @@ def _run(script: str, *args: str, stage_label: str | None = None) -> None:
         text=True,
         bufsize=1,
     )
+
+    timed_out = False
+
+    def _kill_on_timeout() -> None:
+        nonlocal timed_out
+        timed_out = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(timeout, _kill_on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+
     output_lines: list[str] = []
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
             output_lines.append(line)
+            if capture is not None:
+                capture.append(line)
         proc.wait()
     except BaseException:
         proc.kill()
         raise
+    finally:
+        watchdog.cancel()
+
+    if timed_out:
+        tail = "".join(output_lines[-40:]) or "(no output captured)"
+        body = (
+            f"Stage:        {label}\n"
+            f"Script:       execution/{script} {' '.join(args)}\n"
+            f"Exit code:    TIMEOUT (killed after {timeout}s)\n"
+            f"Workspace:    {WORKSPACE}\n\n"
+            f"Last 40 output lines:\n"
+            f"{'-' * 60}\n"
+            f"{tail}\n"
+        )
+        _send_email(subject=f"[DOE pipeline TIMEOUT] {label}", body=body)
+        raise RuntimeError(f"{script} timed out after {timeout}s")
 
     if proc.returncode != 0:
         tail = "".join(output_lines[-40:]) or "(no output captured)"
@@ -256,7 +412,54 @@ def _run(script: str, *args: str, stage_label: str | None = None) -> None:
             subject=f"[DOE pipeline FAIL] {label}",
             body=body,
         )
-        raise RuntimeError(f"{script} exited with code {proc.returncode}")
+        if check:
+            raise RuntimeError(f"{script} exited with code {proc.returncode}")
+        else:
+            print(
+                f"[pipeline] {label} non-zero exit ({proc.returncode}) — "
+                f"continuing (check=False)",
+                flush=True,
+            )
+
+
+def _send_maintenance_summary(stage_outputs: dict[str, list[str]]) -> None:
+    """Send a positive-confirmation email after pipeline_daily_maintenance succeeds.
+
+    Parses the captured output from each stage to extract counts. The whole point
+    is to make silent failure impossible: if this email doesn't arrive at the
+    expected time, something is wrong (cron not firing, secrets rotated,
+    pipeline dead). Best-effort — never raises.
+    """
+    def _last_match(stage: str, pattern: str) -> str:
+        for line in reversed(stage_outputs.get(stage, [])):
+            m = re.search(pattern, line)
+            if m:
+                return m.group(1)
+        return "?"
+
+    fetched          = _last_match("hydrate_volume_from_drive", r"fetched=(\d+)")
+    hydrate_failed   = _last_match("hydrate_volume_from_drive", r"failed=(\d+)")
+    hydrate_total    = _last_match("hydrate_volume_from_drive", r"candidates=(\d+)")
+    updated          = _last_match("update_cover_letter_dates", r"updated=(\d+)")
+    errored          = _last_match("update_cover_letter_dates", r"errored=(\d+)")
+    coverage_match   = _last_match("update_cover_letter_dates", r"Coverage: ([\d.]+%)")
+    # Drive reconcile counts (Round 4) — parsed from the prune_stale_jobs stage.
+    rec_active   = _last_match("prune_stale_jobs", r"Drive reconcile: active=(\d+)")
+    rec_orphans  = _last_match("prune_stale_jobs", r"orphans=(\d+)")
+    rec_archived = _last_match("prune_stale_jobs", r"archived=(\d+)")
+    rec_aborted  = _last_match("prune_stale_jobs", r"aborted=(\S+)")
+
+    body = (
+        f"Daily maintenance ran successfully.\n\n"
+        f"  Hydrate:   fetched={fetched}, failed={hydrate_failed}, candidates={hydrate_total}\n"
+        f"  Re-stamp:  updated={updated}, errored={errored}, coverage={coverage_match}\n"
+        f"  Reconcile: active={rec_active}, orphans={rec_orphans}, archived={rec_archived}, aborted={rec_aborted}\n\n"
+        f"Workspace: {WORKSPACE}\n"
+    )
+    try:
+        _send_email(subject="[DOE pipeline OK] daily maintenance", body=body)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        print(f"[summary] email failed: {exc}", file=sys.stderr)
 
 
 def _notify_applications_ready() -> None:
@@ -265,7 +468,7 @@ def _notify_applications_ready() -> None:
     Reads the current APPLYING rows from the Sheet to build the email body.
     Best-effort — never raises.
     """
-    if not (WORKSPACE / "token_gmail.json").exists():
+    if not os.environ.get("GMAIL_APP_PASSWORD"):
         return
 
     try:
@@ -327,52 +530,46 @@ def _notify_applications_ready() -> None:
 def pipeline_full() -> None:
     """End-to-end Modal pipeline matching scripts/pipeline_full.cmd.
 
-    Runs every stage in the local pipeline back-to-back, no manual sheet gate:
+    Runs every stage back-to-back, no manual sheet gate:
       preflight → prune → scrape (full description fetch) → evaluate
-      → write_sheet → generate_cover_letter --min-score 7
-      → generate_cv --min-score 7 → update_cover_letter_dates
+      → write_sheet → generate_cover_letter --min-score 6
+      → generate_cv --min-score 6
       → discover_contacts (cloud-only extra) → notify → mirror
 
-    Selection is by score threshold (--min-score 7) reading scored_jobs.json
-    from the volume — matches local behavior. Status stays at 'New' after
-    generation (CL/CV columns flip to 'Yes'); the user gates Ready_to_Apply
-    manually before running the local swarm.
+    Selection is by score threshold (--min-score 6) reading scored_jobs.json
+    from the volume. Status stays at 'New' after generation (CL/CV columns
+    flip to 'Yes'); the user gates Ready_to_Apply manually before running
+    the local swarm.
+
+    Cover letters are stamped with today's date during generation, so no
+    re-stamp step is needed here — pipeline_daily_maintenance keeps them
+    fresh on subsequent days.
 
     Per-stage volume.commit() preserves partial progress on mid-run failure.
     On any stage's non-zero exit _run() emails the alert mailbox and raises.
     """
     os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
-    _write_oauth_files()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    _pipeline_startup("pipeline_full")
 
-    # Letter date in Swiss time (cron fires at 16:00 UTC = 18:00 CEST, so
-    # UTC and CEST share the same calendar date — but use the explicit zone
-    # so this stays correct if the schedule ever moves near midnight UTC).
-    today = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y-%m-%d")
-
-    _run("preflight.py", "--cloud", stage_label="preflight")
-    _run("prune_stale_jobs.py", "--yes", stage_label="prune_stale_jobs")
+    _run("preflight.py", "--cloud", stage_label="preflight", timeout=300)
+    _run("prune_stale_jobs.py", "--yes", "--archive-drive", "--reconcile-orphans",
+         stage_label="prune_stale_jobs", timeout=1200)
     volume.commit()
-    _run("scrape_jobs.py", stage_label="scrape_jobs")
+    _run("scrape_jobs.py", stage_label="scrape_jobs", timeout=3600)
     volume.commit()
-    _run("evaluate_jobs.py", stage_label="evaluate_jobs")
+    _run("evaluate_jobs.py", stage_label="evaluate_jobs", timeout=3600)
     volume.commit()
-    _run("write_jobs_to_sheet.py", stage_label="write_jobs_to_sheet")
+    _run("write_jobs_to_sheet.py", stage_label="write_jobs_to_sheet", timeout=900)
     volume.commit()
-    _run("generate_cover_letter.py", "--min-score", "7", stage_label="generate_cover_letter")
+    _run("generate_cover_letter.py", "--min-score", "6",
+         stage_label="generate_cover_letter", timeout=3600)
     volume.commit()
-    _run("generate_cv.py", "--min-score", "7", stage_label="generate_cv")
-    volume.commit()
-    _run(
-        "update_cover_letter_dates.py",
-        "--letter-date", today,
-        "--min-score", "7",
-        stage_label="update_cover_letter_dates",
-    )
+    _run("generate_cv.py", "--min-score", "6", stage_label="generate_cv", timeout=3600)
     volume.commit()
     # Stage 4.5: free contact-email discovery (fail-soft, always exits 0).
     # Local pipeline skips this; Modal keeps it as a free quality-of-life extra.
-    _run("discover_contacts.py", stage_label="discover_contacts")
+    _run("discover_contacts.py", stage_label="discover_contacts",
+         check=False, timeout=1800)
     volume.commit()
 
     _notify_applications_ready()
@@ -399,49 +596,81 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     sheet write. Useful for verifying OAuth + per-stage routing without firing
     real outbound mail.
     """
-    _write_oauth_files()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    _pipeline_startup("pipeline_send_followups")
     args = [] if dry_run else ["--send"]
-    _run("send_followups.py", *args, stage_label="send_followups")
+    _run("send_followups.py", *args, stage_label="send_followups", timeout=540)
     volume.commit()
     _mirror_tmp()
 
 
 @app.function(
-    # Daily 04:00 UTC = 06:00 CEST (summer) / 05:00 CET (winter).
-    # One combined maintenance pass before the user wakes up:
+    # Daily 01:00 UTC = 03:00 CEST (summer) / 02:00 CET (winter).
+    # User starts applying ~05:45 local — this finishes well before then,
+    # leaving a safe 2h+ buffer even if the run takes the full timeout.
+    # One combined maintenance pass:
     #   1. prune stale Sheet rows
-    #   2. re-stamp every score>=7 cover letter to today's date and push the
+    #   2. hydrate the Volume from Drive (download any J-* folder Drive has but
+    #      the Volume doesn't — bridges legacy local-generated folders)
+    #   3. re-stamp every score>=6 cover letter to today's date and push the
     #      refreshed PDF/DOCX to Drive
     # Combined to stay under Modal's 5-cron cap on the current plan.
-    schedule=modal.Cron("0 4 * * *"),
+    schedule=modal.Cron("0 1 * * *"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=1800,
+    timeout=7200,
     image=image_with_playwright,           # PDF render needs Chromium
     max_containers=1,
 )
 def pipeline_daily_maintenance() -> None:
-    """Daily prune + cover-letter date re-stamp.
+    """Daily prune + Drive→Volume hydrate + cover-letter date re-stamp.
 
     Stage 1: prune_stale_jobs.py --yes — drop expired rows from the Sheet.
-    Stage 2: update_cover_letter_dates.py --letter-date TODAY --min-score 7 —
+    Stage 2: hydrate_volume_from_drive.py --since-days 365 — download any
+             DOE Applications/J-* folder Drive has but the Volume is missing.
+             Without this, update_cover_letter_dates only sees Modal-generated
+             folders and silently skips the legacy local-generated ones.
+    Stage 3: update_cover_letter_dates.py --letter-date TODAY --min-score 6 —
              re-render PDF + DOCX with today's date and push refreshed pair to
              Drive (DOE Applications/{folder}/), overwriting older-dated copies.
              No LLM calls — body is extracted from the existing DOCX.
     """
-    _write_oauth_files()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("prune_stale_jobs.py", "--yes", stage_label="prune_stale_jobs")
+    _pipeline_startup("pipeline_daily_maintenance")
+
+    # Capture each stage's output so the success summary email can extract counts.
+    outputs: dict[str, list[str]] = {
+        "prune_stale_jobs": [],
+        "hydrate_volume_from_drive": [],
+        "update_cover_letter_dates": [],
+    }
+
+    _run(
+        "prune_stale_jobs.py", "--yes", "--archive-drive", "--reconcile-orphans",
+        stage_label="prune_stale_jobs",
+        timeout=1200,                   # 20 min — Sheet ops + Drive archive/purge + orphan reconcile
+        capture=outputs["prune_stale_jobs"],
+    )
+    volume.commit()
+    _run(
+        "hydrate_volume_from_drive.py",
+        "--since-days", "365",
+        stage_label="hydrate_volume_from_drive",
+        check=False,                    # best-effort — never blocks re-stamp
+        timeout=2400,                   # 40 min ceiling
+        capture=outputs["hydrate_volume_from_drive"],
+    )
     volume.commit()
     today = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y-%m-%d")
     _run(
         "update_cover_letter_dates.py",
         "--letter-date", today,
-        "--min-score", "7",
+        "--min-score", "6",
         stage_label="update_cover_letter_dates",
+        timeout=3600,                   # 60 min ceiling
+        capture=outputs["update_cover_letter_dates"],
     )
     volume.commit()
+
+    _send_maintenance_summary(outputs)
     _mirror_tmp()
 
 
@@ -457,57 +686,9 @@ def pipeline_daily_maintenance() -> None:
 )
 def pipeline_weekly_digest() -> None:
     """Email a weekly pipeline digest (read-only on the sheet)."""
-    _write_oauth_files()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("weekly_digest.py", stage_label="weekly_digest")
+    _pipeline_startup("pipeline_weekly_digest")
+    _run("weekly_digest.py", stage_label="weekly_digest", timeout=270)
     volume.commit()
-    _mirror_tmp()
-
-
-@app.function(
-    schedule=modal.Cron("0 */6 * * *"),    # Every 6 hours (manual-override fallback)
-    volumes={str(TMP_DIR): volume},
-    secrets=secrets,
-    timeout=3600,
-    image=image_with_playwright,
-    max_containers=1,
-)
-def pipeline_generate_applications() -> None:
-    """Manual-override fallback: regenerate CL/CV for rows the user flips to Ready_to_Apply.
-
-    Demoted from primary path (pipeline_full now generates everything end-to-end
-    on Tue/Thu). This function only matters when the user manually flips a row
-    to Ready_to_Apply between scheduled runs — typically to re-generate after
-    editing scored_jobs.json or fixing a bad cover letter. Cheap when no rows
-    match (most runs do nothing).
-
-    Polls the Sheet every 6 hours. Skips rows already in APPLYING/Applied.
-    Generated PDFs/DOCXs are uploaded to Google Drive (DOE Applications/).
-    Sends an email notification when new applications are ready.
-    CV photo is bundled in the image at /root/workspace/cv_photo.jpg.
-
-    Order of operations:
-      1. write OAuth files from secrets (fail fast on missing secret)
-      2. preflight: verify every API surface BEFORE any LLM call
-      3. cover-letter stage → commit (CL checkpoint persists even if CV fails)
-      4. CV stage → commit
-      5. contact-discovery stage 4.5 → commit (free email lookup, fail-soft)
-      6. notify success → commit
-    """
-    os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
-    _write_oauth_files()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("preflight.py", "--cloud", stage_label="preflight")
-    _run("generate_cover_letter.py", "--sheet-triggered", stage_label="generate_cover_letter")
-    volume.commit()
-    _run("generate_cv.py", "--sheet-triggered", stage_label="generate_cv")
-    volume.commit()
-    # Stage 4.5: free contact-email discovery for the rows we just generated docs for.
-    # discover_contacts.py is fail-soft (always exits 0), so a slow site can't abort the
-    # pipeline — at worst, those rows ship with empty Contact_Email and the next run retries.
-    _run("discover_contacts.py", "--sheet-triggered", stage_label="discover_contacts")
-    volume.commit()
-    _notify_applications_ready()
     _mirror_tmp()
 
 
@@ -537,6 +718,6 @@ def preflight() -> None:
     os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    _run("preflight.py", "--cloud", stage_label="preflight")
+    _run("preflight.py", "--cloud", stage_label="preflight", timeout=270)
     volume.commit()
     _mirror_tmp()

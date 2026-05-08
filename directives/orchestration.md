@@ -20,22 +20,23 @@ Stage 7:   Swarm      → Browser-based auto-apply (HITL)
 ## Execution Model: Cloud vs Local
 
 The full preparation pipeline (Stages 1–6 + Stage 4.5 + weekly digest) runs
-autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
-(apply) stays local because you submit applications manually.
+autonomously on Modal. Drive is the canonical fresh source for cover letters.
+The laptop runs Stage 7 (apply) plus one transitional cron that re-stamps the
+legacy local `.tmp/applications/` files for ad-hoc apply runs — both will
+retire once Stage 7 fully reads from Drive.
 
 | Where | Stages | Trigger |
 |---|---|---|
-| **Modal (cloud)** | **1–5 + 4.5 (full pipeline, scrape → CV)** | **Tue+Thu 18:00 CEST cron** — `pipeline_full`, `--min-score 7`, no manual gate |
-| **Modal (cloud)** | 4 + 4.5 + 5 (CL + contacts + CV) — fallback | Every 6h cron — `pipeline_generate_applications`, only fires for rows manually flipped to `Ready_to_Apply` |
+| **Modal (cloud)** | **1–5 + 4.5 (full pipeline, scrape → CV)** | **Tue+Thu 18:00 CEST cron** — `pipeline_full`, `--min-score 6`, no manual gate. CLs stamped with that day's date during generation; uploaded to Drive automatically. |
 | **Modal (cloud)** | 6 (send follow-ups, multi-touch) | Mon-Fri 08:00 CEST cron |
-| **Modal (cloud)** | Maintenance: prune_stale_jobs | Daily 05:45 CEST cron |
+| **Modal (cloud)** | Maintenance: prune stale rows + archive Drive folders + reconcile orphans + hydrate Volume from Drive + re-stamp every score≥6 CL date → Drive | Daily 03:00 CEST / 02:00 CET — `pipeline_daily_maintenance`, `--min-score 6`, timeout 2h. Stages: `prune_stale_jobs --archive-drive --reconcile-orphans` (deletes pruned Sheet rows, moves their Drive folders to `DOE Applications/_Archive/` with an `archived_at` stamp, then reconciles: any **active** J-* folder whose `job_id` is no longer in the Sheet — manual deletes, legacy state — is also archived with `archive_reason: orphan`. Layered safeguards: empty-sheet guard, 10% threshold guard, 12h grace period for in-flight uploads, override via `--force-reconcile`. Permanently deletes folders that have been in `_Archive/` for 14+ days) → `hydrate_volume_from_drive --since-days 365` (downloads any active DOE Applications/J-* folder Drive has but the Volume is missing — best-effort, never blocks the next stage) → `update_cover_letter_dates` (mutates the right-aligned date paragraph in the DOCX in place; re-renders the PDF via fpdf2 from the body cached in `letter_meta.json` — no LLM, no template re-build). On every cron firing the OAuth health check (`_check_oauth_health`) runs first; failure emails `[DOE pipeline OAUTH FAIL]` and stops the run, day-5/6 age sends a `[OAUTH WARN]`. Coverage gap >5% triggers an alert email. Success summary email closes each run with hydrate / re-stamp / reconcile counts. Finishes before the 05:45 local apply window. |
 | **Modal (cloud)** | Weekly digest | Sun 18:00 CEST cron |
+| **Local (Windows Task Scheduler)** | Re-stamp legacy local `.tmp/applications/` CL dates (transitional) | Daily 05:45 local — `DOE_UpdateCoverLetterDates`, `--skip-drive --min-score 6`. Drive untouched (Modal owns it). Retire when Stage 7 pulls from Drive. |
 | **Local (HITL)** | 7 (apply) | Run manually — Simon submits each application |
 
 **Modal app:** `execution/modal_pipeline.py`
 **Deploy:** `modal deploy execution/modal_pipeline.py`
 **Manual trigger (cloud, full pipeline):** `modal run execution/modal_pipeline.py::pipeline_full`
-**Manual trigger (cloud, regenerate-from-sheet fallback):** `modal run execution/modal_pipeline.py::pipeline_generate_applications`
 **Connectivity check (cloud):** `modal run execution/modal_pipeline.py::preflight`
 **Connectivity check (local):** `python execution/preflight.py`
 
@@ -46,20 +47,28 @@ autonomously on Modal. Local execution is the rare-debug fallback only. Stage 7
 **One-time Modal setup:**
 1. `pip install modal && modal token new`
 2. In Modal dashboard → Secrets → create `doe-google-oauth` with:
-   - `TOKEN_JSON` = `base64 < token.json` (Sheets+Drive scope)
-   - `TOKEN_GMAIL_JSON` = `base64 < token_gmail.json` (Sheets+Drive+Gmail.send)
+   - `TOKEN_JSON` = `base64 < token.json` (Sheets + drive.file scope, non-sensitive)
    - `CREDENTIALS_JSON` = `base64 < credentials.json`
-3. Create `doe-api-keys` secret with all env vars from `.env`
+3. Create `doe-api-keys` secret with `OPEN_ROUTER_API_KEY`, `SERPAPI_API_KEY`, `SERPAPI_API_KEY2`, plus mail vars:
+   - `GMAIL_ADDRESS` = your Google account email
+   - `GMAIL_APP_PASSWORD` = 16-char app password from <https://myaccount.google.com/apppasswords>
 4. `modal deploy execution/modal_pipeline.py`
+
+**Why no Gmail OAuth token?** Gmail send is via SMTP + app password (`execution/gmail_send.py`). App passwords don't expire, sidestepping Google's 7-day refresh-token rule for unverified sensitive scopes. `auth/drive.file` is similarly non-sensitive — same reason — so neither Drive nor Gmail trigger the recurring re-auth pain. Only the Sheets `auth/spreadsheets` scope still requires periodic re-auth until Google verifies the app.
+
+**Re-auth procedure (when Sheets token expires).** The cloud `_check_oauth_health` function emails a `[DOE pipeline OAUTH WARN]` notice on day-5 / day-6 of token age and a `[DOE pipeline OAUTH FAIL] re-auth required` on day-7 hard expiry. To recover:
+1. `python execution/write_jobs_to_sheet.py` — opens browser, refreshes `token.json`.
+2. PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes('token.json'))` → copy output.
+3. Modal dashboard → Secrets → `doe-google-oauth` → set `TOKEN_JSON` to the base64 value.
+4. `modal deploy execution/modal_pipeline.py` — next cron firing picks up the new secret.
+
+The on-Volume sentinel (`oauth_sentinel.json`) detects the rotation via SHA256 hash and resets the warning timer automatically.
 
 ## Reliability Hardening (Stages 4+5)
 
 The cloud function `pipeline_full()` is the primary cloud entrypoint and invokes
 the same Python scripts as local in the same order, so quality gates and
-idempotency are identical by construction. (`pipeline_generate_applications()`
-is the every-6h fallback for rows the user manually flips to `Ready_to_Apply`
-between scheduled runs — same script chain, just gated by sheet status.)
-On top of the local behavior, the cloud functions add:
+idempotency are identical by construction. On top of the local behavior, the cloud functions add:
 
 **Preflight (`execution/preflight.py`)** — runs as the FIRST step of every
 cloud invocation. 11 checks:
@@ -376,7 +385,7 @@ vs salutation) actually moved your reply rate. Phase 3 tuning is informed by thi
 - `directives/setup_google_auth.md` — Google OAuth setup for Sheets + Gmail
 
 ## Learnings (auto-updated)
-- Stages 4+5 run on Modal as part of the unified `pipeline_full` (Tue/Thu 18:00 CEST) for any new job scoring >= 7, with a 6h `pipeline_generate_applications` fallback for rows manually flipped to `Ready_to_Apply`. Both paths use four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup). The same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap.
+- Stages 4+5 run on Modal as part of the unified `pipeline_full` (Tue/Thu 18:00 CEST) for any new job scoring >= 6. Four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup) — the same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap. Date freshness on subsequent days is handled by `pipeline_daily_maintenance` (06:00 CEST) which re-stamps every score≥6 cover letter to today and pushes the refresh to Drive without re-running the LLM.
 - A preflight check runs before any cloud LLM stage. Failures are emailed to `simonobemair@gmail.com` and the run aborts before burning tokens.
 - `_write_oauth_files()` validates secret presence + base64 decode up front; missing/rotated secrets produce clear `Modal secret missing: <NAME>` errors instead of `binascii.Error`.
 - `volume.commit()` runs after every stage so partial progress (e.g. CL done, CV crashes) survives a mid-run failure.
@@ -388,3 +397,8 @@ vs salutation) actually moved your reply rate. Phase 3 tuning is informed by thi
 - **Title cleaning** (Stage 4): Raw job titles from scrapers may include URLs, percentages, and location suffixes. `_clean_title_for_subject()` strips these for the "Bewerbung als ..." subject line in PDFs/DOCXs.
 - **Word count calibration:** Qwen3 undershoots by ~20 words in German. Prompt target is set higher (220-260) to achieve actual 200-250. Some descriptions with minimal context still produce short letters — this is an LLM limitation, not a bug.
 - **Self-annealing verified:** 3 fixes (title cleaning, CV agency detection, confidence assignment) were implemented and re-tested. Run 3 results: 3/4 PASS, 1/4 WARNING (burstiness variance). WOLFFKRAN improved from WARNING 193w to PASS 202w. e-nov8 improved from WARNING 183w to PASS 202w.
+- **Silent-success in `pipeline_daily_maintenance` (fixed 2026-05-07):** the Modal `doe-tmp` Volume only contains folders Modal generated — legacy local-generated `J-*` folders lived on Drive but not on the Volume. `update_cover_letter_dates.py` walked the Volume, silently skipped the missing folders as `missing_folder`, and exited 0 because the 5%-error-rate gate only counts true render errors. Fix: a new `hydrate_volume_from_drive.py` stage runs before the re-stamp and incrementally pulls Drive→Volume (idempotent, size-match skip). The script's main loop also now logs a coverage % and emails an alert when `(missing_folder + missing_docx) / eligible > 5%`. Sheet-load filter requires `CL_Generated=Yes` so freshly-scraped score≥6 rows don't trigger false alerts.
+- **In-place DOCX date edit + JSON-backed PDF render (2026-05-07):** the daily re-stamp no longer re-renders the DOCX from scratch. `generate_cover_letter.py` now writes a `letter_meta.json` sidecar (body, contact_name, subtitle, language, first_letter_date) into each `.tmp/applications/{folder}/` at generation time. `update_cover_letter_dates.py:_restamp_atomically` reads that JSON, mutates the right-aligned `DD.MM.JJJJ` paragraph in the DOCX in place (no body extraction, no template re-build), and re-renders the PDF via fpdf2. Legacy folders without the sidecar fall back to the regex body extraction once and write the sidecar so the second daily run is on the fast path. Removes the regex fragility that could cause empty-body errors and saves the `generate_docx` template re-build on every folder.
+- **Round 2 reliability hardening (2026-05-07):** Drive API + Sheets API calls now retry on `{429, 500, 502, 503}` with exponential backoff (1/2/4/8 s, 5 tries). Hydrate runs 8 parallel downloads (`ThreadPoolExecutor`) and is now best-effort — its failure is decoupled from the re-stamp via `_run(..., check=False, timeout=2400)`. Subprocess hangs are killed by a `threading.Timer` watchdog on every cloud cron stage (timeouts 270 s–3600 s per stage). A daily `[DOE pipeline OK] daily maintenance` email confirms the cron actually ran — silence is now the failure signal. Stale `.part` files older than 24 h are swept on every hydrate startup. `_sheets_api_call` is now used uniformly across `send_followups.py` and `update_cover_letter_dates.py` — no more raw gspread calls bypassing retry.
+- **Round 3 lifecycle + OAuth (2026-05-07):** every cloud cron now runs `_check_oauth_health` at startup — actively reads the Sheet header, hashes `token.json` to detect rotation via `oauth_sentinel.json` on Volume, sends `[OAUTH WARN]` once on day-5 and once on day-6, hard-fails with `[OAUTH FAIL]` from day-7. Drive folders for pruned rows now move to `DOE Applications/_Archive/` (stamped with `appProperties.archived_at`); folders older than 14 days are permanently deleted on the next prune run. `prune_stale_jobs.py --archive-drive` is the cloud-only opt-in (local runs continue to use `--skip-drive` parity). Schema-drift errors in `update_cover_letter_dates.py` now print all available headers + a 30-second remediation hint instead of a one-line opaque RuntimeError.
+- **Round 4 orphan reconcile (2026-05-07):** `prune_stale_jobs.py --reconcile-orphans` adds a Drive→Sheet sweep that archives any **active** `J-*` folder whose `job_id` is no longer present in the Sheet (covers manual row deletions and pre-`--archive-drive` legacy state). Layered safeguards prevent accidental mass-archives: (1) abort with `aborted=empty_sheet` if the Sheet read returns zero job_ids — assumes a Sheet API failure; (2) abort with `aborted=threshold` if more than `--orphan-max-pct` (default 10%) of active folders would be archived — assumes a Sheet read corruption; (3) `--orphan-grace-hours` (default 12) skips folders modified recently to avoid clobbering in-flight CL uploads from `pipeline_full`. Override (1)+(2) via `--force-reconcile` when a large legitimate cleanup is expected. Orphan archives use `appProperties.archive_reason="orphan"` (vs default `"pruned"` for explicit deletions) and follow the same 14-day permanent-delete window. The daily success summary email now includes `Reconcile: active=N orphans=N archived=N aborted=...` so safeguard trips are immediately visible.

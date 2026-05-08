@@ -62,24 +62,21 @@ TMP_DIR = PROJECT_ROOT / ".tmp"
 COMPANY_CACHE_FILE = TMP_DIR / "company_cache.json"
 FOLLOWUP_CHECKPOINT_FILE = TMP_DIR / "followup_checkpoint.json"  # [H4] Crash-safe checkpoint
 CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
-# Two separate tokens — Google's reauth flow only consents to the scopes baked
-# into each token at issue time, so we keep them split:
-#   token.json       → Sheets + Drive (issued by write_jobs_to_sheet.py)
-#   token_gmail.json → Gmail send only (issued by reauth_gmail.py)
+# Sheets uses OAuth (token.json, issued by write_jobs_to_sheet.py).
+# Gmail send is now via SMTP+app-password (gmail_send.py); no Gmail token.
 SHEETS_TOKEN_FILE = PROJECT_ROOT / "token.json"
-GMAIL_TOKEN_FILE  = PROJECT_ROOT / "token_gmail.json"
-TOKEN_FILE = GMAIL_TOKEN_FILE  # back-compat alias for any legacy reference
+TOKEN_FILE = SHEETS_TOKEN_FILE  # back-compat alias for any legacy reference
 
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    # drive.file = per-file scope (non-sensitive, no 7-day token expiry)
+    "https://www.googleapis.com/auth/drive.file",
 ]
-GMAIL_SCOPES = [
-    "https://mail.google.com/",
-    "https://www.googleapis.com/auth/gmail.send",
-]
-# back-compat — some external callers may import SCOPES
-SCOPES = SHEETS_SCOPES + GMAIL_SCOPES
+# Gmail send is now via SMTP + app password (see execution/gmail_send.py).
+# OAuth-based Gmail is retired. GMAIL_SCOPES kept empty for back-compat
+# with any external import.
+GMAIL_SCOPES: list[str] = []
+SCOPES = SHEETS_SCOPES
 
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared
@@ -126,6 +123,7 @@ _EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
 
 # [H2] Legal suffix stripping — imported from shared utils
 from execution.utils import strip_legal_suffixes, normalize_company_key
+from execution.write_jobs_to_sheet import _sheets_api_call
 
 
 def _build_column_map(header_row: list[str]) -> dict[str, int]:
@@ -383,7 +381,7 @@ def _load_or_refresh(token_path: Path, scopes: list[str], label: str) -> Credent
     if not token_path.exists():
         log.error(f"{label} token missing at {token_path}")
         if label == "Gmail":
-            log.error("Run: python execution/reauth_gmail.py")
+            log.error("Run: python execution/write_jobs_to_sheet.py")
         else:
             log.error("Run: python execution/write_jobs_to_sheet.py (will trigger OAuth)")
         sys.exit(1)
@@ -400,7 +398,7 @@ def _load_or_refresh(token_path: Path, scopes: list[str], label: str) -> Credent
         log.error(f"{label} token at {token_path} is missing scopes: {missing}")
         log.error(f"Granted: {sorted(granted)}")
         if label == "Gmail":
-            log.error("Re-issue with full scopes: python execution/reauth_gmail.py")
+            log.error("Re-issue with full scopes: python execution/write_jobs_to_sheet.py")
         else:
             log.error("Re-issue: python execution/write_jobs_to_sheet.py (delete token.json first)")
         sys.exit(1)
@@ -408,22 +406,15 @@ def _load_or_refresh(token_path: Path, scopes: list[str], label: str) -> Credent
 
 
 def authenticate():
-    """Authenticate with Google Sheets + Gmail using two separate OAuth tokens.
+    """Authenticate with Google Sheets via OAuth. Gmail is sent via SMTP
+    (see execution/gmail_send.py); no Gmail OAuth token required.
 
-    Sheets/Drive lives in token.json, Gmail send lives in token_gmail.json.
-    Both must already exist — interactive consent is handled by the dedicated
-    helpers (write_jobs_to_sheet.py for Sheets, reauth_gmail.py for Gmail).
-
-    Returns (sheets_client, gmail_service, gmail_creds). The third element is
-    the Gmail credentials object — kept for back-compat with the previous
-    single-cred return signature; some downstream code uses it for refresh checks.
+    Returns (sheets_client, None, None). The two None slots preserve the legacy
+    triple-tuple signature used by callers that still unpack three values.
     """
     sheets_creds = _load_or_refresh(SHEETS_TOKEN_FILE, SHEETS_SCOPES, "Sheets")
-    gmail_creds  = _load_or_refresh(GMAIL_TOKEN_FILE,  GMAIL_SCOPES,  "Gmail")
-
     sheets_client = gspread.authorize(sheets_creds)
-    gmail_service = build("gmail", "v1", credentials=gmail_creds)
-    return sheets_client, gmail_service, gmail_creds
+    return sheets_client, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -487,17 +478,16 @@ def _get_company_context(company_name: str, company_cache: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def send_gmail(gmail_service, to_email: str, subject: str, body: str):
-    """Send an email via Gmail API."""
-    message = MIMEText(body, "plain", "utf-8")
-    message["to"] = to_email
-    message["from"] = f"{SENDER_NAME} <{SENDER_EMAIL}>"
-    message["subject"] = subject
+    """Send an email via SMTP (gmail_service arg kept for back-compat; ignored).
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-    gmail_service.users().messages().send(
-        userId="me",
-        body={"raw": raw},
-    ).execute()
+    Raises RuntimeError on failure so the caller's try/except (which advances
+    Status to FAILED) still kicks in.
+    """
+    from execution.gmail_send import send_email
+    if not send_email(subject, body, to=to_email):
+        raise RuntimeError(
+            f"SMTP send_email returned False (check GMAIL_ADDRESS/GMAIL_APP_PASSWORD)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +507,7 @@ def find_eligible_jobs(worksheet, max_days: int = 30) -> list[dict]:
     plenty of slack for weekends/holidays.
     """
     global _col_indices
-    all_data = worksheet.get_all_values()
+    all_data = _sheets_api_call(worksheet.get_all_values)
     if len(all_data) <= 1:
         return []
 
@@ -776,7 +766,7 @@ def main():
 
     # Open sheet
     try:
-        spreadsheet = sheets_client.open(args.sheet_name)
+        spreadsheet = _sheets_api_call(sheets_client.open, args.sheet_name)
     except gspread.SpreadsheetNotFound:
         log.error(f"Spreadsheet '{args.sheet_name}' not found")
         sys.exit(1)
@@ -843,7 +833,7 @@ def main():
                 # STATUS RE-CHECK: Re-read the row right before sending to confirm
                 # status is still "Applied". If user changed it during the wait window
                 # (e.g. to "Interviewing", "Rejected", "Expired", "Duplicate"), do NOT send the follow-up.
-                current_row = worksheet.row_values(job["row_idx"])
+                current_row = _sheets_api_call(worksheet.row_values, job["row_idx"])
                 current_status = current_row[_col("Status")].strip() if _col("Status") < len(current_row) else ""
                 if current_status.lower() != "applied":
                     log.info(f"  Status changed to '{current_status}' — skipping follow-up")
@@ -853,14 +843,14 @@ def main():
                 # If sheet update fails, we skip sending (better than duplicate emails).
                 today = datetime.now().strftime("%d.%m.%Y")
                 # Column indices are 1-based in gspread update
-                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Sent") + 1, "Yes")
+                _sheets_api_call(worksheet.update_cell, job["row_idx"], _col("Follow_Up_Sent") + 1, "Yes")
                 # Phase 2: track the touch number and date of *this* touch separately.
                 # Follow_Up_Date stays at the FIRST touch date for backwards compat
                 # (existing dashboards / prune_stale_jobs read it).
                 if touch_index == 1:
-                    worksheet.update_cell(job["row_idx"], _col("Follow_Up_Date") + 1, today)
-                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Count") + 1, str(touch_index))
-                worksheet.update_cell(job["row_idx"], _col("Follow_Up_Last_Date") + 1, today)
+                    _sheets_api_call(worksheet.update_cell, job["row_idx"], _col("Follow_Up_Date") + 1, today)
+                _sheets_api_call(worksheet.update_cell, job["row_idx"], _col("Follow_Up_Count") + 1, str(touch_index))
+                _sheets_api_call(worksheet.update_cell, job["row_idx"], _col("Follow_Up_Last_Date") + 1, today)
                 log.info(
                     f"  Sheet marked: Follow_Up_Count={touch_index}, "
                     f"Follow_Up_Last_Date={today}"
