@@ -512,6 +512,43 @@ def archive_orphan_drive_folders(
     return result
 
 
+def delete_drive_folders(folders: Iterable[dict]) -> dict:
+    """Permanently delete explicit Drive folders by ID.
+
+    This intentionally accepts concrete folder dicts from `list_application_folders`
+    or a caller-side safety filter, not broad query parameters. The caller owns
+    source-of-truth checks, thresholds, and grace periods before invoking this.
+    Per-folder failures are logged and counted; later folders still run.
+    """
+    folder_list = [f for f in folders if f.get("id")]
+    result = {
+        "requested": len(folder_list),
+        "deleted": 0,
+        "failed": 0,
+        "failed_items": [],
+    }
+    if not folder_list:
+        return result
+
+    creds = _get_credentials()
+    service = _build_drive_service(creds)
+
+    for f in folder_list:
+        folder_id = f["id"]
+        name = f.get("name", folder_id)
+        try:
+            _gapi_retry(service.files().delete(fileId=folder_id).execute)
+            result["deleted"] += 1
+            log.info(f"[drive-delete] deleted {name}")
+        except Exception as exc:  # noqa: BLE001 - keep deleting independent folders
+            result["failed"] += 1
+            msg = f"{type(exc).__name__}: {exc}"
+            result["failed_items"].append({"id": folder_id, "name": name, "error": msg})
+            log.warning(f"[drive-delete] failed for {name}: {msg}")
+
+    return result
+
+
 def purge_archive_older_than(days: int = 14) -> tuple[int, int]:
     """Permanently delete folders in DOE Applications/_Archive/ whose
     `appProperties.archived_at` is older than `days` (UTC).

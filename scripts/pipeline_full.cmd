@@ -3,6 +3,7 @@ REM Manual fallback — DOE_PipelineFull Task Scheduler entry was retired 2026-0
 REM Modal `pipeline_full` (Tue/Thu 18:00 CEST cron) is the canonical run; this stays for ad-hoc local use.
 REM Canonical order from directives/orchestration.md, plus prune+update bookends:
 REM   prune -> scrape -> evaluate -> write -> cover -> cv -> update_dates
+REM Keep prune window aligned with Modal PRUNE_WINDOW_DAYS.
 REM
 REM Hardening (added 2026-04-28 after silent failure on 18:19 catch-up run):
 REM   - Spawns keepawake.ps1 to block sleep while pipeline runs.
@@ -22,6 +23,7 @@ if not exist "scripts\logs" mkdir "scripts\logs" >nul 2>&1
 if not exist ".tmp" mkdir ".tmp" >nul 2>&1
 set "LOG=scripts\logs\pipeline_!STAMP!.log"
 set "PY=.venv\Scripts\python.exe"
+set "PRUNE_WINDOW_DAYS=14"
 set "SENTINEL_OK=.tmp\pipeline_last_success.txt"
 set "SENTINEL_FAIL=.tmp\pipeline_last_failure.txt"
 set "STAGE_FILE=.tmp\pipeline_last_stage.txt"
@@ -54,9 +56,9 @@ if not "!RC!"=="0" (
 
 REM ----- stage 0: prune_stale_jobs -----
 >>"!LOG!" echo.
->>"!LOG!" echo [%TIME%] --- prune_stale_jobs START ---
+>>"!LOG!" echo [%TIME%] --- prune_stale_jobs START (--days !PRUNE_WINDOW_DAYS!) ---
 >"!STAGE_FILE!" echo prune_stale_jobs
-"!PY!" -m execution.prune_stale_jobs --yes >>"!LOG!" 2>&1
+"!PY!" -m execution.prune_stale_jobs --yes --days !PRUNE_WINDOW_DAYS! >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- prune_stale_jobs END rc=!RC! ---
 if not "!RC!"=="0" (

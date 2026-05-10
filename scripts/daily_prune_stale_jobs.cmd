@@ -3,7 +3,7 @@ REM Daily wrapper for prune_stale_jobs.py.
 REM Manual fallback — DOE_PruneStaleJobs Task Scheduler entry was retired 2026-05-06.
 REM Modal `pipeline_daily_maintenance` (06:00 CEST cron) handles this in the cloud now.
 REM Deletes rows where Status in (New, Irrelevant, Rejected) AND newest of
-REM Date Scraped/Date Posted is older than 30 days, OR Score <= 4.
+REM Date Scraped/Date Posted is older than 14 days, OR Score <= 4.
 REM Logs to scripts\logs\prune_stale_jobs_YYYYMMDD.log.
 REM
 REM Hardening (2026-04-28): keepawake, sentinel, fix parens %RC% bug.
@@ -18,6 +18,7 @@ if not exist "scripts\logs" mkdir "scripts\logs" >nul 2>&1
 if not exist ".tmp" mkdir ".tmp" >nul 2>&1
 set "LOG=scripts\logs\prune_stale_jobs_!STAMP!.log"
 set "PY=.venv\Scripts\python.exe"
+set "PRUNE_WINDOW_DAYS=14"
 set "SENTINEL_OK=.tmp\prune_last_success.txt"
 set "SENTINEL_FAIL=.tmp\prune_last_failure.txt"
 set "FRC=0"
@@ -41,8 +42,8 @@ if not "!RC!"=="0" (
     goto fail
 )
 
->>"!LOG!" echo [%TIME%] --- prune_stale_jobs START ---
-"!PY!" -m execution.prune_stale_jobs --yes >>"!LOG!" 2>&1
+>>"!LOG!" echo [%TIME%] --- prune_stale_jobs START (--days !PRUNE_WINDOW_DAYS!) ---
+"!PY!" -m execution.prune_stale_jobs --yes --days !PRUNE_WINDOW_DAYS! >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo [%TIME%] --- prune_stale_jobs END rc=!RC! ---
 

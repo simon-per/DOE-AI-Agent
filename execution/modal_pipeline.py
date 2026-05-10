@@ -10,8 +10,8 @@ Runs all automatable stages 24/7 without the local PC needing to be on:
                           Date freshness on subsequent days is handled by
                           pipeline_daily_maintenance (no re-stamp inside this run).
   - Mon-Fri 06:00 UTC:    send_followups --send
-  - Daily 01:00 UTC:      pipeline_daily_maintenance — prune stale rows AND
-                          re-stamp every score>=6 cover letter to TODAY,
+  - Daily 01:00 UTC:      pipeline_daily_maintenance — prune stale rows, clean
+                          orphan folders, and re-stamp every score>=6 cover letter to TODAY,
                           pushing refreshed PDF/DOCX to Drive so the user
                           always opens an up-to-date letter. Fires at 03:00
                           CEST (summer) / 02:00 CET (winter) so it finishes
@@ -30,7 +30,8 @@ Reliability hardening (see .claude/plans/hi-how-are-you-enchanted-tulip.md):
   - Per-stage volume.commit() so partial progress survives a mid-run crash
   - Email alert on any stage failure (Gmail via SMTP + GMAIL_APP_PASSWORD)
   - max_containers=1 prevents cron + manual triggers overlapping
-  - Preflight step verifies all API surfaces before LLM calls
+  - On-demand preflight verifies API surfaces when explicitly requested; scheduled
+    runs rely on per-stage checks to avoid noisy Gmail/LLM probes
 
 Secrets required (set once in Modal dashboard):
   doe-google-oauth  →  TOKEN_JSON (base64 of token.json, Sheets+drive.file scope)
@@ -125,6 +126,7 @@ volume = modal.Volume.from_name("doe-tmp", create_if_missing=True)
 
 WORKSPACE = Path("/root/workspace")
 TMP_DIR = WORKSPACE / ".tmp"
+STAGE_LOG_DIR = TMP_DIR / "stage_logs"
 ALERT_EMAIL = "simonobemair@gmail.com"
 
 # Age cutoff for prune_stale_jobs (passed via --days). Aggressive vs the
@@ -323,6 +325,14 @@ def _mirror_tmp() -> None:
         print(f"[tmp-mirror] import/call failed: {exc}", file=sys.stderr)
 
 
+def _commit_volume_best_effort(context: str) -> None:
+    """Persist diagnostic files before raising from a failed stage."""
+    try:
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001 — diagnostics-only, non-fatal
+        print(f"[volume] commit failed after {context}: {exc}", file=sys.stderr)
+
+
 def _run(
     script: str,
     *args: str,
@@ -351,6 +361,13 @@ def _run(
     """
     label = stage_label or script
     cmd = [sys.executable, f"execution/{script}", *args]
+    STAGE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "stage"
+    stamp = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y%m%d_%H%M%S")
+    stage_log_path = STAGE_LOG_DIR / f"{stamp}_{safe_label}.log"
+    stage_log = stage_log_path.open("w", encoding="utf-8", errors="replace")
+    stage_log.write(f"$ {' '.join(cmd)}\n")
+    stage_log.flush()
 
     proc = subprocess.Popen(
         cmd,
@@ -380,6 +397,8 @@ def _run(
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
+            stage_log.write(line)
+            stage_log.flush()
             output_lines.append(line)
             if capture is not None:
                 capture.append(line)
@@ -389,6 +408,8 @@ def _run(
         raise
     finally:
         watchdog.cancel()
+        stage_log.write(f"\n[modal_pipeline] exit_code={proc.returncode} timed_out={timed_out}\n")
+        stage_log.close()
 
     if timed_out:
         tail = "".join(output_lines[-40:]) or "(no output captured)"
@@ -396,12 +417,14 @@ def _run(
             f"Stage:        {label}\n"
             f"Script:       execution/{script} {' '.join(args)}\n"
             f"Exit code:    TIMEOUT (killed after {timeout}s)\n"
-            f"Workspace:    {WORKSPACE}\n\n"
+            f"Workspace:    {WORKSPACE}\n"
+            f"Stage log:    {stage_log_path}\n\n"
             f"Last 40 output lines:\n"
             f"{'-' * 60}\n"
             f"{tail}\n"
         )
         _send_email(subject=f"[DOE pipeline TIMEOUT] {label}", body=body)
+        _commit_volume_best_effort(f"timeout in {label}")
         raise RuntimeError(f"{script} timed out after {timeout}s")
 
     if proc.returncode != 0:
@@ -410,7 +433,8 @@ def _run(
             f"Stage:        {label}\n"
             f"Script:       execution/{script} {' '.join(args)}\n"
             f"Exit code:    {proc.returncode}\n"
-            f"Workspace:    {WORKSPACE}\n\n"
+            f"Workspace:    {WORKSPACE}\n"
+            f"Stage log:    {stage_log_path}\n\n"
             f"Last 40 output lines:\n"
             f"{'-' * 60}\n"
             f"{tail}\n"
@@ -419,6 +443,7 @@ def _run(
             subject=f"[DOE pipeline FAIL] {label}",
             body=body,
         )
+        _commit_volume_best_effort(f"non-zero exit in {label}")
         if check:
             raise RuntimeError(f"{script} exited with code {proc.returncode}")
         else:
@@ -447,6 +472,10 @@ def _send_maintenance_summary(stage_outputs: dict[str, list[str]]) -> None:
     fetched          = _last_match("hydrate_volume_from_drive", r"fetched=(\d+)")
     hydrate_failed   = _last_match("hydrate_volume_from_drive", r"failed=(\d+)")
     hydrate_total    = _last_match("hydrate_volume_from_drive", r"candidates=(\d+)")
+    cleanup_local    = _last_match("cleanup_orphan_application_folders", r"local_deleted=(\d+)")
+    cleanup_drive    = _last_match("cleanup_orphan_application_folders", r"drive_deleted=(\d+)")
+    cleanup_failed   = _last_match("cleanup_orphan_application_folders", r"failed=(\d+)")
+    cleanup_aborts   = _last_match("cleanup_orphan_application_folders", r"safety_aborts=(\d+)")
     updated          = _last_match("update_cover_letter_dates", r"updated=(\d+)")
     errored          = _last_match("update_cover_letter_dates", r"errored=(\d+)")
     drive_failed     = _last_match("update_cover_letter_dates", r"drive_failed=(\d+)")
@@ -459,6 +488,7 @@ def _send_maintenance_summary(stage_outputs: dict[str, list[str]]) -> None:
 
     body = (
         f"Daily maintenance ran successfully.\n\n"
+        f"  Cleanup:   local_deleted={cleanup_local}, drive_deleted={cleanup_drive}, failed={cleanup_failed}, safety_aborts={cleanup_aborts}\n"
         f"  Hydrate:   fetched={fetched}, failed={hydrate_failed}, candidates={hydrate_total}\n"
         f"  Re-stamp:  updated={updated}, errored={errored}, drive_failed={drive_failed}, coverage={coverage_match}\n"
         f"  Reconcile: active={rec_active}, orphans={rec_orphans}, archived={rec_archived}, aborted={rec_aborted}\n\n"
@@ -531,7 +561,7 @@ def _notify_applications_ready() -> None:
     schedule=modal.Cron("0 16 * * 2,4"),   # Tue + Thu 18:00 CEST
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=19800,                         # 5.5 h — sum of per-stage budgets (18 600 s = 300+1200+3600+3600+900+3600+3600+1800) + 1 200 s margin
+    timeout=19800,                         # 5.5 h: stage budgets total 18 300 s after removing scheduled preflight, with 1 500 s margin
     image=image_with_playwright,           # CV stage needs Chromium
     max_containers=1,
 )
@@ -539,7 +569,7 @@ def pipeline_full() -> None:
     """End-to-end Modal pipeline matching scripts/pipeline_full.cmd.
 
     Runs every stage back-to-back, no manual sheet gate:
-      preflight → prune → scrape (full description fetch) → evaluate
+      prune → scrape (full description fetch) → evaluate
       → write_sheet → generate_cover_letter --min-score 6
       → generate_cv --min-score 6
       → discover_contacts (cloud-only extra) → notify → mirror
@@ -559,7 +589,6 @@ def pipeline_full() -> None:
     os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
     _pipeline_startup("pipeline_full")
 
-    _run("preflight.py", "--cloud", stage_label="preflight", timeout=300)
     _run("prune_stale_jobs.py", "--yes", "--days", PRUNE_WINDOW_DAYS,
          "--archive-drive", "--reconcile-orphans",
          stage_label="prune_stale_jobs", timeout=1200)
@@ -618,27 +647,31 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     # leaving a safe 2h+ buffer even if the run takes the full timeout.
     # One combined maintenance pass:
     #   1. prune stale Sheet rows
-    #   2. hydrate the Volume from Drive (download any J-* folder Drive has but
+    #   2. cleanup orphan application folders absent from the Sheet
+    #   3. hydrate the Volume from Drive (download any J-* folder Drive has but
     #      the Volume doesn't — bridges legacy local-generated folders)
-    #   3. re-stamp every score>=6 cover letter to today's date and push the
+    #   4. re-stamp every score>=6 cover letter to today's date and push the
     #      refreshed PDF/DOCX to Drive
     # Combined to stay under Modal's 5-cron cap on the current plan.
     schedule=modal.Cron("0 1 * * *"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=8400,                          # sum of per-stage budgets (7 200 s = 1200+2400+3600) + 1 200 s margin
+    timeout=9600,                          # 2 h 40 m: stage budgets total 8 400 s with 1 200 s margin
     image=image_with_playwright,           # PDF render needs Chromium
     max_containers=1,
 )
 def pipeline_daily_maintenance() -> None:
-    """Daily prune + Drive→Volume hydrate + cover-letter date re-stamp.
+    """Daily prune + orphan cleanup + Drive→Volume hydrate + CL date re-stamp.
 
     Stage 1: prune_stale_jobs.py --yes — drop expired rows from the Sheet.
-    Stage 2: hydrate_volume_from_drive.py --since-days 365 — download any
+    Stage 2: cleanup_orphan_application_folders.py --apply --yes — delete local
+             and active Drive application folders no longer present in the
+             Sheet. Runs fail-soft: safety trips alert but do not block re-stamp.
+    Stage 3: hydrate_volume_from_drive.py --since-days 365 — download any
              DOE Applications/J-* folder Drive has but the Volume is missing.
              Without this, update_cover_letter_dates only sees Modal-generated
              folders and silently skips the legacy local-generated ones.
-    Stage 3: update_cover_letter_dates.py --letter-date TODAY --min-score 6 —
+    Stage 4: update_cover_letter_dates.py --letter-date TODAY --min-score 6 —
              re-render PDF + DOCX with today's date and push refreshed pair to
              Drive (DOE Applications/{folder}/), overwriting older-dated copies.
              No LLM calls — body is extracted from the existing DOCX.
@@ -648,6 +681,7 @@ def pipeline_daily_maintenance() -> None:
     # Capture each stage's output so the success summary email can extract counts.
     outputs: dict[str, list[str]] = {
         "prune_stale_jobs": [],
+        "cleanup_orphan_application_folders": [],
         "hydrate_volume_from_drive": [],
         "update_cover_letter_dates": [],
     }
@@ -658,6 +692,19 @@ def pipeline_daily_maintenance() -> None:
         stage_label="prune_stale_jobs",
         timeout=1200,                   # 20 min — Sheet ops + Drive archive/purge + orphan reconcile
         capture=outputs["prune_stale_jobs"],
+    )
+    volume.commit()
+    _run(
+        "cleanup_orphan_application_folders.py",
+        "--targets", "both",
+        "--apply", "--yes",
+        "--grace-hours", "24",
+        "--max-delete-pct", "0.25",
+        "--max-delete-count", "500",
+        stage_label="cleanup_orphan_application_folders",
+        check=False,                    # safety trips should alert, not block re-stamp
+        timeout=1200,                   # 20 min — expected near-zero after initial cleanup
+        capture=outputs["cleanup_orphan_application_folders"],
     )
     volume.commit()
     _run(
@@ -699,6 +746,56 @@ def pipeline_weekly_digest() -> None:
     """Email a weekly pipeline digest (read-only on the sheet)."""
     _pipeline_startup("pipeline_weekly_digest")
     _run("weekly_digest.py", stage_label="weekly_digest", timeout=270)
+    volume.commit()
+    _mirror_tmp()
+
+
+# ---------------------------------------------------------------------------
+# On-demand folder hygiene (no schedule)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    volumes={str(TMP_DIR): volume},
+    secrets=secrets,
+    timeout=3600,
+    max_containers=1,
+)
+def cleanup_orphan_application_folders(
+    targets: str = "both",
+    apply: bool = False,
+    force: bool = False,
+    grace_hours: int = 24,
+    max_delete_pct: float = 0.25,
+    max_delete_count: int = 500,
+) -> None:
+    """Clean Modal Volume / Drive application folders absent from the Sheet.
+
+    Dry-run by default. Pass `apply=True` to delete candidates. Large cleanups
+    still trip the tool's count/percentage guards unless `force=True` is set.
+
+    Invoke:
+      modal run execution/modal_pipeline.py::cleanup_orphan_application_folders
+      modal run execution/modal_pipeline.py::cleanup_orphan_application_folders --apply --force
+    """
+    if targets not in {"local", "drive", "both"}:
+        raise ValueError("targets must be one of: local, drive, both")
+    _pipeline_startup("cleanup_orphan_application_folders")
+    args = [
+        "--targets", targets,
+        "--grace-hours", str(grace_hours),
+        "--max-delete-pct", str(max_delete_pct),
+        "--max-delete-count", str(max_delete_count),
+    ]
+    if apply:
+        args.extend(["--apply", "--yes"])
+    if force:
+        args.append("--force")
+    _run(
+        "cleanup_orphan_application_folders.py",
+        *args,
+        stage_label="cleanup_orphan_application_folders",
+        timeout=3300,
+    )
     volume.commit()
     _mirror_tmp()
 
