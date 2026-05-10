@@ -80,6 +80,7 @@ SCOPES = SHEETS_SCOPES
 
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared
+from execution._stage_helpers import require_nonzero_success, write_run_summary
 from execution.language_detect import detect_language as _detect_language_full
 
 # Column names used in Google Sheet — mapped to indices at runtime
@@ -800,6 +801,7 @@ def main():
     # Process each eligible job
     sent_count = 0
     skipped_checkpoint = 0
+    errors: list[dict] = []
     for i, job in enumerate(eligible):
         # [H1] Use job_id (stable) as checkpoint key — not row_idx (shifts on row insert/delete).
         # Include touch_index so a row can be deduplicated *per touch*: re-running the script
@@ -819,7 +821,14 @@ def main():
         try:
             email = generate_followup_email(job, openrouter_key, gemini_key, company_cache, researched_companies)
         except Exception as e:
-            log.error(f"  Failed to generate email: {e}")
+            log.error(f"  Failed to generate email: {type(e).__name__}: {e}")
+            errors.append({
+                "job_id": job_id,
+                "title": job.get("title", "?"),
+                "company": job.get("company", "?"),
+                "stage": "generate_email",
+                "error": f"{type(e).__name__}: {e}",
+            })
             continue
 
         # [L4] Enhanced logging with word count
@@ -877,7 +886,14 @@ def main():
                         log.warning(f"  MANUAL ACTION NEEDED: '{job['title']}' at {job['company']} marked as sent but email failed. Check and resend manually.")
 
             except Exception as e:
-                log.error(f"  Failed (sheet update or status re-check): {e}")
+                log.error(f"  Failed (sheet update or status re-check): {type(e).__name__}: {e}")
+                errors.append({
+                    "job_id": job_id,
+                    "title": job.get("title", "?"),
+                    "company": job.get("company", "?"),
+                    "stage": "sheet_update_or_recheck",
+                    "error": f"{type(e).__name__}: {e}",
+                })
                 # Email was NOT sent (failure occurred before send_gmail call)
         else:
             log.info("  [DRY RUN] Email NOT sent")
@@ -895,6 +911,32 @@ def main():
     else:
         log.info(f"DRY RUN complete: {len(eligible) - skipped_checkpoint} emails would be sent")
         log.info("Run with --send to actually send emails")
+
+    # Always-write run summary so post-mortem doesn't depend on Modal stdout.
+    pending = max(len(eligible) - skipped_checkpoint, 0)
+    summary_path = TMP_DIR / "followup_run_summary.json"
+    write_run_summary(
+        summary_path,
+        stage="send_followups",
+        successful=sent_count,
+        failed=len(errors),
+        errors=errors,
+        eligible_count=len(eligible),
+        pending_count=pending,
+        skipped_checkpoint=skipped_checkpoint,
+        dry_run=not args.send,
+    )
+
+    # Loud-fail only when actually sending — dry runs legitimately have
+    # sent_count==0. Threshold ≥3 mirrors the CL stage; follow-up batches are
+    # typically small (5-15) so this still gives a real signal.
+    if args.send:
+        require_nonzero_success(
+            successful=sent_count,
+            pending=pending,
+            stage="send_followups",
+            summary_path=summary_path,
+        )
 
 
 if __name__ == "__main__":

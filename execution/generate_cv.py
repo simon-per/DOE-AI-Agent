@@ -64,6 +64,7 @@ DEFAULT_MIN_SCORE = 6
 
 # Shared modules
 from execution.llm_client import call_llm as _call_llm_shared, parse_json_response as _parse_json_response
+from execution._stage_helpers import require_nonzero_success, write_run_summary
 from execution.language_detect import detect_language
 from execution.utils import (
     sanitize_filename,
@@ -1350,11 +1351,12 @@ def main():
             except Exception as e:
                 log.debug(f"  Drive upload skipped: {e}")
         except Exception as e:
-            log.error(f"  Failed: {e}")
+            log.error(f"  Failed: {type(e).__name__}: {e}")
             results.append({
+                "job_id": _get_job_id(job),
                 "title": job.get("title", "?"),
                 "company": job.get("company", "?"),
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
             })
 
         if i < len(pending_jobs) - 1:
@@ -1373,6 +1375,32 @@ def main():
     log.info(f"  Output directory: {OUTPUT_DIR}")
     for r in successful:
         log.info(f"  - {r['company']}: {r['title']} ({r['language']}) [{r['subtitle']}]")
+
+    summary_path = TMP_DIR / "cv_run_summary.json"
+    write_run_summary(
+        summary_path,
+        stage="generate_cv",
+        successful=len(successful),
+        failed=len(failed),
+        errors=[
+            {
+                "job_id": r.get("job_id", ""),
+                "title": r.get("title", ""),
+                "company": r.get("company", ""),
+                "error": r.get("error", ""),
+            }
+            for r in failed
+        ],
+        eligible_count=len(pending_jobs) + skipped,
+        pending_count=len(pending_jobs),
+        skipped_checkpoint_or_folder=skipped,
+    )
+    require_nonzero_success(
+        successful=len(successful),
+        pending=len(pending_jobs),
+        stage="generate_cv",
+        summary_path=summary_path,
+    )
 
     return results
 

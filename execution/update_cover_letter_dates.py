@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from execution.generate_cover_letter import generate_docx, generate_pdf  # noqa: E402
 from execution.utils import enforce_revops_subtitle, generate_job_id  # noqa: E402
+from execution._stage_helpers import write_run_summary  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -134,6 +135,25 @@ def _detect_language_from_greeting(greeting: str) -> str:
     return "de"
 
 
+# Statuses whose cover letter is a frozen historical artifact — re-stamping them
+# with today's date would silently rewrite the document we already submitted (or
+# explicitly archived). The active set the daily restamp legitimately serves is
+# {New, Ready_to_Apply}; everything else is excluded.
+FROZEN_STATUSES = {
+    "applying",
+    "applied",
+    "follow-up_sent",
+    "interviewing",
+    "rejected",
+    "offer",
+    "no_response",
+    "expired",
+    "duplicate",
+    "paused",
+    "failed",
+}
+
+
 def _normalize_header(header: str) -> str:
     return header.strip().lower().replace(" ", "_")
 
@@ -203,9 +223,18 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
         )
 
     has_cl_flag = "cl_generated" in col_map
+    has_status_col = "status" in col_map
+    if not has_status_col:
+        log.warning(
+            f"Sheet '{sheet_name}' has no Status column - frozen-status filter "
+            f"DISABLED. All score>=min_score rows will be re-stamped, including "
+            f"already-applied/rejected/interviewing letters. Restore the Status "
+            f"header (or update _normalize_header logic) to re-enable the filter."
+        )
 
     jobs = []
     skipped_no_cl = 0
+    skipped_frozen = 0
     for row_idx, row in enumerate(rows[1:], start=2):
         score = _parse_score(_safe_cell(row, col_map, "score"))
         if score < min_score:
@@ -219,6 +248,16 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
             cl_done = _safe_cell(row, col_map, "cl_generated").strip().lower()
             if cl_done != "yes":
                 skipped_no_cl += 1
+                continue
+
+        # Frozen-status filter: applied / interviewing / rejected / etc. letters
+        # are historical submissions and must not be re-dated. Without this the
+        # daily restamp keeps the entire backlog in its working set forever and
+        # rewrites letters we've already sent.
+        if has_status_col:
+            status = _safe_cell(row, col_map, "status").strip().lower()
+            if status in FROZEN_STATUSES:
+                skipped_frozen += 1
                 continue
 
         job_id = _safe_cell(row, col_map, "job_id")
@@ -237,9 +276,14 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
             "description": _safe_cell(row, col_map, "description"),
         })
 
+    extras = []
+    if has_cl_flag:
+        extras.append(f"skipped {skipped_no_cl} not-yet-generated")
+    if has_status_col:
+        extras.append(f"skipped {skipped_frozen} frozen-status")
     log.info(
         f"Sheet rows with score >= {min_score} and CL_Generated=Yes: {len(jobs)}"
-        + (f" (skipped {skipped_no_cl} not-yet-generated)" if has_cl_flag else "")
+        + (f" ({'; '.join(extras)})" if extras else "")
     )
     return jobs
 
@@ -387,6 +431,35 @@ def _render_atomically(
 
 DATE_RX = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 LETTER_META = "letter_meta.json"
+
+
+def _read_current_letter_date(docx_path: Path) -> str | None:
+    """Return the right-aligned date paragraph as 'dd.mm.yyyy', or None if absent.
+
+    Cheap idempotency probe — lets the per-job loop skip folders whose DOCX
+    already shows the target date. Same right-aligned-paragraph invariant as
+    _mutate_docx_date_to_tmp; reading-only, never mutates the file.
+    """
+    doc = Document(str(docx_path))
+    for p in doc.paragraphs:
+        if p.alignment != WD_ALIGN_PARAGRAPH.RIGHT:
+            continue
+        text = p.text.strip()
+        if DATE_RX.match(text):
+            return text
+    return None
+
+
+def _drive_pushed_marker(folder: Path, date_iso: str) -> Path:
+    """Path of the per-day "Drive upload succeeded" sentinel for `folder`.
+
+    Existence == today's restamped pair was successfully pushed to Drive on
+    `date_iso`. Lets the next-day skip-if-today guard distinguish "DOCX is
+    today's date AND Drive is in sync" from "DOCX got rewritten yesterday but
+    the upload silently failed (logged as warning)" — without the marker, the
+    probe would skip such folders forever and leave Drive permanently stale.
+    """
+    return folder / f".drive_pushed_{date_iso}"
 
 
 def _load_letter_meta(folder: Path) -> dict | None:
@@ -621,7 +694,10 @@ def main():
     elif args.skip_drive:
         log.info("Drive upload skipped (--skip-drive)")
 
+    target_de = datetime.strptime(args.letter_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+
     updated = 0
+    skipped_already_today = 0
     errored = []
     for job in candidates:
         jid = job["job_id"]
@@ -629,6 +705,28 @@ def main():
         fld = all_folders[jid]
         docx_path = fld / COVER_LETTER_DOCX
         pdf_path = fld / COVER_LETTER_PDF
+
+        # Idempotency: skip if the DOCX is already stamped with the target date
+        # AND we have a marker proving the Drive push succeeded on the same day.
+        # Without the marker, a silent Drive-upload failure (logged as warning,
+        # not raised) would leave the local DOCX dated today while Drive still
+        # holds yesterday's PDF — and tomorrow's probe would skip the folder
+        # forever, freezing the divergence. Cheap: one Document() open + one
+        # stat, no PDF render, no Drive call.
+        if not args.dry_run:
+            try:
+                current_de = _read_current_letter_date(docx_path)
+            except Exception as probe_err:
+                log.warning(f"[probe] {jid}: date probe failed - {probe_err}")
+                current_de = None
+            drive_synced = (
+                _drive_pushed_marker(fld, args.letter_date).exists()
+                or upload_application_folder is None  # --skip-drive: marker not required
+            )
+            if current_de == target_de and drive_synced:
+                skipped_already_today += 1
+                log.info(f"[skip] {jid} | already stamped {target_de}")
+                continue
 
         if args.dry_run:
             meta = _load_letter_meta(fld)
@@ -672,16 +770,51 @@ def main():
             log.info(f"[OK  ] {jid} | score={job.get('score')} | {fld.name[:80]}")
 
             if upload_application_folder is not None:
+                # Re-stamping only touches the cover letter + sidecar; the CV
+                # and ATS PDFs in the folder are unchanged. Restrict the push
+                # to the modified files so we don't burn ~6 s/job on Drive
+                # update calls for bytes that didn't change.
+                upload_succeeded = False
                 try:
-                    upload_application_folder(fld)
+                    upload_application_folder(
+                        fld,
+                        only_files={COVER_LETTER_DOCX, COVER_LETTER_PDF, LETTER_META},
+                    )
+                    upload_succeeded = True
                 except Exception as drive_err:
                     log.warning(f"[drive] {jid}: re-upload failed - {drive_err}")
+
+                if upload_succeeded:
+                    # Drop a per-day sentinel so tomorrow's probe knows this
+                    # folder's Drive copy is in sync. Sweep older sentinels
+                    # to keep folder noise bounded. Marker-write failure is
+                    # its own category — log loud (so the operator notices
+                    # tomorrow's spurious re-render) but don't roll back the
+                    # successful render+upload.
+                    try:
+                        for stale in fld.glob(".drive_pushed_*"):
+                            try:
+                                stale.unlink()
+                            except OSError:
+                                pass
+                        _drive_pushed_marker(fld, args.letter_date).touch()
+                    except OSError as marker_err:
+                        log.error(
+                            f"[marker] {jid}: failed to write "
+                            f".drive_pushed_{args.letter_date} after successful "
+                            f"Drive upload - {marker_err}. Tomorrow's run will "
+                            f"re-render this folder unnecessarily but won't "
+                            f"lose data."
+                        )
         except Exception as e:
-            log.error(f"[ERR ] {jid}: render failed - {e}")
-            errored.append((jid, str(e)))
+            log.error(f"[ERR ] {jid}: render failed - {type(e).__name__}: {e}")
+            errored.append((jid, f"{type(e).__name__}: {e}"))
 
     log.info("")
-    log.info(f"Done. updated={updated}, errored={len(errored)}")
+    log.info(
+        f"Done. updated={updated}, skipped_already_today={skipped_already_today}, "
+        f"errored={len(errored)}"
+    )
 
     eligible = len(high)
     log.info(
@@ -703,13 +836,39 @@ def main():
             updated=updated,
         )
 
+    # Always write a per-job summary so post-mortem on a future failure has
+    # type-prefixed error strings to grep, not just the existing one-line
+    # success/failure sentinel files. Mirrors cl_run_summary.json.
+    summary_path = ROOT / ".tmp" / "update_cl_dates_summary.json"
+    write_run_summary(
+        summary_path,
+        stage="update_cover_letter_dates",
+        successful=updated,
+        failed=len(errored),
+        errors=[{"job_id": jid, "error": msg} for jid, msg in errored],
+        eligible_count=eligible,
+        matched_count=matched_count,
+        missing_folder=missing_folder,
+        missing_docx=missing_docx,
+        skipped_already_today=skipped_already_today,
+        letter_date=args.letter_date,
+        dry_run=args.dry_run,
+    )
+
     if errored:
         log.info("Errors:")
         for jid, msg in errored:
             log.info(f"  {jid}: {msg}")
         # Only treat as failure if error rate exceeds 5% — isolated bad DOCX files
         # should not mark the whole run as failed in Task Scheduler.
-        error_rate = len(errored) / max(updated + len(errored), 1)
+        # Coverage-aware denominator: skipped folders count as healthy work
+        # (already-stamped, idempotent skip), so excluding them would inflate
+        # the rate on quiet days where most rows are correctly skipped.
+        # Note: missing_folder/missing_docx are intentionally NOT in the
+        # denominator — they have their own coverage alert via _send_coverage_alert
+        # above, conflating them with render failures here would double-count.
+        attempted = updated + len(errored) + skipped_already_today
+        error_rate = len(errored) / max(attempted, 1)
         if error_rate > 0.05:
             sys.exit(1)
 

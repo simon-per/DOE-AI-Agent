@@ -17,11 +17,14 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -56,6 +59,16 @@ _DOWNLOAD_EXTENSIONS = {".docx", ".pdf", ".json"}
 
 _RETRYABLE = {429, 500, 502, 503}
 
+# Per-socket-op ceiling for the Drive client. httplib2 wires this into
+# socket.settimeout(), so it caps each individual recv/send — NOT the wall-clock
+# duration of a request. The realistic failure mode it rescues is a fully
+# stalled socket (network blip, transient Google-side hang where the connection
+# stays open but no bytes flow). A slow-but-progressing upload of a 200 KB PDF
+# can still legally exceed 60 s without tripping this; for a true wall-cap on
+# a request we'd need to wrap the call in a futures timeout, which we don't
+# do today (stalled-socket is the case we've actually observed in production).
+_DRIVE_HTTP_TIMEOUT_S = 60
+
 
 def _gapi_retry(fn, *args, max_tries: int = 4, **kwargs):
     """Call a Google API callable with exponential backoff on transient errors (429/5xx)."""
@@ -71,6 +84,20 @@ def _gapi_retry(fn, *args, max_tries: int = 4, **kwargs):
                 exc.resp.status, attempt + 1, max_tries - 1, sleep,
             )
             time.sleep(sleep)
+
+
+def _build_drive_service(creds: Credentials):
+    """Build the Drive client with a per-socket-op timeout.
+
+    Default httplib2 socket timeout is unbounded — a single fully-stalled
+    socket can pin a Modal stage to its outer wall (the subprocess watchdog
+    can't kill a child stuck inside a blocking httplib2 read). Routing through
+    AuthorizedHttp with an explicit timeout caps each recv/send at
+    _DRIVE_HTTP_TIMEOUT_S. See the constant's comment for the caveat that
+    this is per-syscall, not per-request.
+    """
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=_DRIVE_HTTP_TIMEOUT_S))
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 
 def _get_credentials() -> Credentials:
@@ -117,23 +144,39 @@ def _get_or_create_folder(service, name: str, parent_id: str | None = None) -> s
     return folder["id"]
 
 
-def upload_application_folder(local_folder: Path) -> str:
-    """Upload all files in `local_folder` to Drive under DOE Applications/.
+def upload_application_folder(
+    local_folder: Path,
+    only_files: Iterable[str] | None = None,
+) -> str:
+    """Upload files in `local_folder` to Drive under DOE Applications/.
 
     Creates DOE Applications/{local_folder.name}/ if it doesn't exist.
-    Skips files that already exist in the Drive subfolder (idempotent).
+    By default uploads every file in the folder. Pass `only_files` (a set/list
+    of basenames) to push just a subset — used by update_cover_letter_dates.py
+    so it doesn't re-upload unchanged CV/ATS PDFs alongside the re-stamped CL.
     Returns the Drive web URL of the uploaded subfolder.
     """
     if not local_folder.exists():
         raise FileNotFoundError(f"Application folder not found: {local_folder}")
 
-    files_to_upload = [f for f in local_folder.iterdir() if f.is_file()]
+    # Skip dot-prefixed files in the default path. Application folders carry
+    # internal sentinels like .drive_pushed_{date} (written by
+    # update_cover_letter_dates.py) plus the occasional .DS_Store / .part
+    # rollback temp; none of those belong in Drive. The only_files allowlist
+    # path stays explicit and unaffected.
+    files_to_upload = [
+        f for f in local_folder.iterdir()
+        if f.is_file() and not f.name.startswith(".")
+    ]
+    if only_files is not None:
+        allow = set(only_files)
+        files_to_upload = [f for f in files_to_upload if f.name in allow]
     if not files_to_upload:
         log.warning(f"[drive] No files to upload in {local_folder}")
         return ""
 
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
 
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     sub_id  = _get_or_create_folder(service, local_folder.name, parent_id=root_id)
@@ -179,7 +222,7 @@ def list_application_folders() -> list[dict]:
     under the drive.file scope, which matches what we want (we only manage our own).
     """
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
 
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     folders: list[dict] = []
@@ -214,7 +257,7 @@ def download_application_folder(folder_name: str, local_root: Path) -> Path | No
     Only fetches .docx / .pdf / .json (skips Google-native docs and other types).
     """
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
 
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     resp = _gapi_retry(service.files().list(
@@ -296,7 +339,7 @@ def archive_folders_by_job_id(job_ids: list[str]) -> int:
         return 0
 
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
 
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     archive_id = _get_or_create_folder(service, ARCHIVE_FOLDER, parent_id=root_id)
@@ -435,7 +478,7 @@ def archive_orphan_drive_folders(
 
     # All safeguards passed (or forced) — archive the orphan set.
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     archive_id = _get_or_create_folder(service, ARCHIVE_FOLDER, parent_id=root_id)
 
@@ -478,7 +521,7 @@ def purge_archive_older_than(days: int = 14) -> tuple[int, int]:
     Per-folder delete failures are logged and counted as kept.
     """
     creds = _get_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _build_drive_service(creds)
 
     root_id = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     archive_id = _get_or_create_folder(service, ARCHIVE_FOLDER, parent_id=root_id)

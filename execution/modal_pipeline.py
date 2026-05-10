@@ -523,7 +523,7 @@ def _notify_applications_ready() -> None:
     schedule=modal.Cron("0 16 * * 2,4"),   # Tue + Thu 18:00 CEST
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=14400,                         # 4 h — full scrape+score+gen budget
+    timeout=19800,                         # 5.5 h — sum of per-stage budgets (18 600 s = 300+1200+3600+3600+900+3600+3600+1800) + 1 200 s margin
     image=image_with_playwright,           # CV stage needs Chromium
     max_containers=1,
 )
@@ -617,7 +617,7 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     schedule=modal.Cron("0 1 * * *"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=7200,
+    timeout=8400,                          # sum of per-stage budgets (7 200 s = 1200+2400+3600) + 1 200 s margin
     image=image_with_playwright,           # PDF render needs Chromium
     max_containers=1,
 )
