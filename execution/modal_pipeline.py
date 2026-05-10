@@ -127,6 +127,13 @@ WORKSPACE = Path("/root/workspace")
 TMP_DIR = WORKSPACE / ".tmp"
 ALERT_EMAIL = "simonobemair@gmail.com"
 
+# Age cutoff for prune_stale_jobs (passed via --days). Aggressive vs the
+# script default of 30d because Swiss listings typically die within 1-2
+# weeks; keeping the cutoff tight shrinks the daily restamp working set
+# at the source. Both pipeline_full and pipeline_daily_maintenance share
+# this constant so the window can't drift between cron functions.
+PRUNE_WINDOW_DAYS = "14"
+
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
@@ -442,6 +449,7 @@ def _send_maintenance_summary(stage_outputs: dict[str, list[str]]) -> None:
     hydrate_total    = _last_match("hydrate_volume_from_drive", r"candidates=(\d+)")
     updated          = _last_match("update_cover_letter_dates", r"updated=(\d+)")
     errored          = _last_match("update_cover_letter_dates", r"errored=(\d+)")
+    drive_failed     = _last_match("update_cover_letter_dates", r"drive_failed=(\d+)")
     coverage_match   = _last_match("update_cover_letter_dates", r"Coverage: ([\d.]+%)")
     # Drive reconcile counts (Round 4) — parsed from the prune_stale_jobs stage.
     rec_active   = _last_match("prune_stale_jobs", r"Drive reconcile: active=(\d+)")
@@ -452,7 +460,7 @@ def _send_maintenance_summary(stage_outputs: dict[str, list[str]]) -> None:
     body = (
         f"Daily maintenance ran successfully.\n\n"
         f"  Hydrate:   fetched={fetched}, failed={hydrate_failed}, candidates={hydrate_total}\n"
-        f"  Re-stamp:  updated={updated}, errored={errored}, coverage={coverage_match}\n"
+        f"  Re-stamp:  updated={updated}, errored={errored}, drive_failed={drive_failed}, coverage={coverage_match}\n"
         f"  Reconcile: active={rec_active}, orphans={rec_orphans}, archived={rec_archived}, aborted={rec_aborted}\n\n"
         f"Workspace: {WORKSPACE}\n"
     )
@@ -552,7 +560,8 @@ def pipeline_full() -> None:
     _pipeline_startup("pipeline_full")
 
     _run("preflight.py", "--cloud", stage_label="preflight", timeout=300)
-    _run("prune_stale_jobs.py", "--yes", "--archive-drive", "--reconcile-orphans",
+    _run("prune_stale_jobs.py", "--yes", "--days", PRUNE_WINDOW_DAYS,
+         "--archive-drive", "--reconcile-orphans",
          stage_label="prune_stale_jobs", timeout=1200)
     volume.commit()
     _run("scrape_jobs.py", stage_label="scrape_jobs", timeout=3600)
@@ -644,7 +653,8 @@ def pipeline_daily_maintenance() -> None:
     }
 
     _run(
-        "prune_stale_jobs.py", "--yes", "--archive-drive", "--reconcile-orphans",
+        "prune_stale_jobs.py", "--yes", "--days", PRUNE_WINDOW_DAYS,
+        "--archive-drive", "--reconcile-orphans",
         stage_label="prune_stale_jobs",
         timeout=1200,                   # 20 min — Sheet ops + Drive archive/purge + orphan reconcile
         capture=outputs["prune_stale_jobs"],
@@ -664,6 +674,7 @@ def pipeline_daily_maintenance() -> None:
         "update_cover_letter_dates.py",
         "--letter-date", today,
         "--min-score", "6",
+        "--statuses", "New",            # cloud cron: only restamp the apply backlog, not Applied/etc.
         stage_label="update_cover_letter_dates",
         timeout=3600,                   # 60 min ceiling
         capture=outputs["update_cover_letter_dates"],

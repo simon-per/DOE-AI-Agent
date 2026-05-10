@@ -138,7 +138,9 @@ def _detect_language_from_greeting(greeting: str) -> str:
 # Statuses whose cover letter is a frozen historical artifact — re-stamping them
 # with today's date would silently rewrite the document we already submitted (or
 # explicitly archived). The active set the daily restamp legitimately serves is
-# {New, Ready_to_Apply}; everything else is excluded.
+# {New, Ready_to_Apply}; everything else is excluded. Defense-in-depth: the
+# Modal cron also passes a positive --statuses allowlist, but this stays as a
+# second gate so a CLI run without the flag still avoids rewriting frozen rows.
 FROZEN_STATUSES = {
     "applying",
     "applied",
@@ -152,6 +154,19 @@ FROZEN_STATUSES = {
     "paused",
     "failed",
 }
+
+# Status normalization: collapse whitespace + hyphens + underscores into a single
+# underscore so 'Follow-Up_Sent' / 'follow up sent' / 'Follow_Up Sent' all match.
+# A hand-typed Sheet entry with a space ('Follow-up Sent') previously bypassed
+# the FROZEN check silently — this closes that gap.
+_STATUS_NORM_RX = re.compile(r"[\s_-]+")
+
+
+def _normalize_status(value: str) -> str:
+    return _STATUS_NORM_RX.sub("_", value.strip().lower())
+
+
+_FROZEN_NORMALIZED = frozenset(_normalize_status(s) for s in FROZEN_STATUSES)
 
 
 def _normalize_header(header: str) -> str:
@@ -191,7 +206,11 @@ def _load_jobs_from_local(min_score: int) -> list[dict]:
     return jobs
 
 
-def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
+def _load_jobs_from_sheet(
+    sheet_name: str,
+    min_score: int,
+    statuses_allow: frozenset[str] | None = None,
+) -> list[dict]:
     """Read eligible jobs from the Google Sheet, the application source of truth."""
     from execution.write_jobs_to_sheet import authenticate, _sheets_api_call  # Lazy import keeps local mode offline.
 
@@ -235,6 +254,7 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
     jobs = []
     skipped_no_cl = 0
     skipped_frozen = 0
+    skipped_not_in_allowlist = 0
     for row_idx, row in enumerate(rows[1:], start=2):
         score = _parse_score(_safe_cell(row, col_map, "score"))
         if score < min_score:
@@ -250,14 +270,20 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
                 skipped_no_cl += 1
                 continue
 
-        # Frozen-status filter: applied / interviewing / rejected / etc. letters
-        # are historical submissions and must not be re-dated. Without this the
-        # daily restamp keeps the entire backlog in its working set forever and
-        # rewrites letters we've already sent.
+        # Two-stage status filter (defense in depth):
+        #  - FROZEN_NORMALIZED excludes Applied / Rejected / Interviewing / etc.
+        #    Always applied; protects historical submissions from being rewritten.
+        #  - statuses_allow (when set, e.g. {"new"}) is a positive allowlist
+        #    passed by the Modal cron so the daily restamp only touches the
+        #    apply backlog and not Ready_to_Apply etc. Frozen check stays first
+        #    so an over-broad allowlist can't accidentally re-stamp Applied.
         if has_status_col:
-            status = _safe_cell(row, col_map, "status").strip().lower()
-            if status in FROZEN_STATUSES:
+            status_norm = _normalize_status(_safe_cell(row, col_map, "status"))
+            if status_norm in _FROZEN_NORMALIZED:
                 skipped_frozen += 1
+                continue
+            if statuses_allow is not None and status_norm not in statuses_allow:
+                skipped_not_in_allowlist += 1
                 continue
 
         job_id = _safe_cell(row, col_map, "job_id")
@@ -281,6 +307,8 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
         extras.append(f"skipped {skipped_no_cl} not-yet-generated")
     if has_status_col:
         extras.append(f"skipped {skipped_frozen} frozen-status")
+        if statuses_allow is not None:
+            extras.append(f"skipped {skipped_not_in_allowlist} not-in-allowlist")
     log.info(
         f"Sheet rows with score >= {min_score} and CL_Generated=Yes: {len(jobs)}"
         + (f" ({'; '.join(extras)})" if extras else "")
@@ -288,10 +316,20 @@ def _load_jobs_from_sheet(sheet_name: str, min_score: int) -> list[dict]:
     return jobs
 
 
-def _load_jobs(source: str, sheet_name: str, min_score: int) -> list[dict]:
+def _load_jobs(
+    source: str,
+    sheet_name: str,
+    min_score: int,
+    statuses_allow: frozenset[str] | None = None,
+) -> list[dict]:
     if source == "sheet":
-        return _load_jobs_from_sheet(sheet_name, min_score)
+        return _load_jobs_from_sheet(sheet_name, min_score, statuses_allow=statuses_allow)
     if source == "local":
+        if statuses_allow is not None:
+            log.warning(
+                "--statuses ignored in --source local mode "
+                "(scored_jobs.json carries no Status column)"
+            )
         return _load_jobs_from_local(min_score)
     raise ValueError(f"Unsupported source: {source}")
 
@@ -626,7 +664,22 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Only parse/extract, do not rewrite files")
     ap.add_argument("--limit", type=int, default=None, help="Process only first N jobs (for testing)")
     ap.add_argument("--skip-drive", action="store_true", help="Skip Drive re-upload after rendering (fast mode)")
+    ap.add_argument(
+        "--statuses",
+        default=None,
+        help="Comma-separated positive allowlist of statuses to restamp. "
+             "Case + hyphen + space + underscore insensitive (so 'New' matches "
+             "'new'/'NEW'; 'Follow-Up_Sent' matches 'follow up sent'). "
+             "When omitted, only the FROZEN_STATUSES exclusion is applied.",
+    )
     args = ap.parse_args()
+
+    statuses_allow: frozenset[str] | None = None
+    if args.statuses:
+        statuses_allow = frozenset(
+            _normalize_status(s) for s in args.statuses.split(",") if s.strip()
+        )
+        log.info(f"--statuses allowlist (normalized): {sorted(statuses_allow)}")
 
     parsed = _validate_letter_date(args.letter_date)
     log.info(f"Target letter date: {parsed.strftime('%d.%m.%Y')}")
@@ -637,7 +690,7 @@ def main():
         log.info(f"Only processing folders modified on or after: {since_date}")
 
     try:
-        high = _load_jobs(args.source, args.sheet_name, args.min_score)
+        high = _load_jobs(args.source, args.sheet_name, args.min_score, statuses_allow=statuses_allow)
     except Exception as e:
         log.error(e)
         sys.exit(1)
@@ -684,13 +737,22 @@ def main():
 
     # Lazy import — keeps --source local fully offline. Imported once outside the
     # loop so a missing googleapiclient surfaces immediately, not per-row.
+    # Distinguishes explicit user opt-out (--skip-drive) from broken Drive import:
+    # in Modal, an import failure must fail loud so pipeline_daily_maintenance
+    # alerts; previously this silently treated "Drive missing" as "Drive not
+    # required" and the skip-if-today guard would then mark every folder as
+    # already-synced forever.
     upload_application_folder = None
+    drive_available = False
     if not args.dry_run and not args.skip_drive:
         try:
             from execution.drive_upload import upload_application_folder as _uaf
             upload_application_folder = _uaf
+            drive_available = True
         except Exception as e:
-            log.warning(f"Drive upload disabled (import failed): {e}")
+            log.error(f"Drive upload import failed - {e}")
+            log.error("Pass --skip-drive to opt out explicitly, or fix the import.")
+            sys.exit(1)
     elif args.skip_drive:
         log.info("Drive upload skipped (--skip-drive)")
 
@@ -699,6 +761,7 @@ def main():
     updated = 0
     skipped_already_today = 0
     errored = []
+    drive_failed: list[tuple[str, str]] = []
     for job in candidates:
         jid = job["job_id"]
         ck = checkpoint.get(jid, {})
@@ -721,7 +784,7 @@ def main():
                 current_de = None
             drive_synced = (
                 _drive_pushed_marker(fld, args.letter_date).exists()
-                or upload_application_folder is None  # --skip-drive: marker not required
+                or args.skip_drive  # explicit opt-out: marker not required
             )
             if current_de == target_de and drive_synced:
                 skipped_already_today += 1
@@ -769,7 +832,7 @@ def main():
             updated += 1
             log.info(f"[OK  ] {jid} | score={job.get('score')} | {fld.name[:80]}")
 
-            if upload_application_folder is not None:
+            if drive_available:
                 # Re-stamping only touches the cover letter + sidecar; the CV
                 # and ATS PDFs in the folder are unchanged. Restrict the push
                 # to the modified files so we don't burn ~6 s/job on Drive
@@ -783,6 +846,7 @@ def main():
                     upload_succeeded = True
                 except Exception as drive_err:
                     log.warning(f"[drive] {jid}: re-upload failed - {drive_err}")
+                    drive_failed.append((jid, f"{type(drive_err).__name__}: {drive_err}"))
 
                 if upload_succeeded:
                     # Drop a per-day sentinel so tomorrow's probe knows this
@@ -813,7 +877,7 @@ def main():
     log.info("")
     log.info(
         f"Done. updated={updated}, skipped_already_today={skipped_already_today}, "
-        f"errored={len(errored)}"
+        f"errored={len(errored)}, drive_failed={len(drive_failed)}"
     )
 
     eligible = len(high)
@@ -851,6 +915,9 @@ def main():
         missing_folder=missing_folder,
         missing_docx=missing_docx,
         skipped_already_today=skipped_already_today,
+        drive_failed_count=len(drive_failed),
+        drive_failed_first5=[{"job_id": j, "error": e} for j, e in drive_failed[:5]],
+        statuses_allow=sorted(statuses_allow) if statuses_allow else None,
         letter_date=args.letter_date,
         dry_run=args.dry_run,
     )
@@ -870,6 +937,28 @@ def main():
         attempted = updated + len(errored) + skipped_already_today
         error_rate = len(errored) / max(attempted, 1)
         if error_rate > 0.05:
+            sys.exit(1)
+
+    # Drive failures get their own threshold + alert. Independent of the render
+    # error rate so a transient Drive flap (rate-limit cascade, brief network
+    # blip) doesn't mask a real render issue, and a single bad render doesn't
+    # spuriously alert about Drive. 25% is intentionally permissive — Drive
+    # failures retry next run because the marker file isn't written.
+    # Denominator excludes errored — those rows never reached the Drive step,
+    # so including them would dilute the rate and hide a real Drive incident
+    # on a day where renders also struggle.
+    attempted_for_drive = updated + skipped_already_today
+    if drive_failed:
+        drive_failure_rate = len(drive_failed) / max(attempted_for_drive, 1)
+        log.info(
+            f"Drive failure rate: {drive_failure_rate:.1%} "
+            f"({len(drive_failed)}/{attempted_for_drive})"
+        )
+        if drive_failure_rate > 0.25:
+            log.error(
+                f"[ALERT] Drive failure rate {drive_failure_rate:.1%} exceeds 25% threshold. "
+                f"First 5 failures: {drive_failed[:5]}"
+            )
             sys.exit(1)
 
 
