@@ -29,7 +29,11 @@ Reliability hardening (see .claude/plans/hi-how-are-you-enchanted-tulip.md):
   - Defensive secret validation (clear errors instead of binascii cracks)
   - Per-stage volume.commit() so partial progress survives a mid-run crash
   - Email alert on any stage failure (Gmail via SMTP + GMAIL_APP_PASSWORD)
-  - max_containers=1 prevents cron + manual triggers overlapping
+  - Volume-resident single-flight lock for pipeline_full prevents concurrent
+    invocations (cron + manual `modal run` + dashboard re-fire).
+    max_containers=1 alone proved insufficient on 2026-05-11 when a phantom
+    Run 2 evicted Run 1 mid-CV. Stale locks (>8h) auto-clear; manual
+    override: `modal volume rm doe-tmp .pipeline_lock.json`.
   - On-demand preflight verifies API surfaces when explicitly requested; scheduled
     runs rely on per-stage checks to avoid noisy Gmail/LLM probes
 
@@ -62,8 +66,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -287,13 +292,123 @@ def _send_oauth_alert(message: str, healthy: bool) -> None:
         print(f"[oauth] alert email failed: {exc}", file=sys.stderr)
 
 
-def _pipeline_startup(stage_name: str) -> None:
+# Single-flight lock for pipeline_full. Application-layer guard against
+# concurrent invocations from cron + manual `modal run` + dashboard re-fire.
+# Stored on the persistent volume so sibling containers can see it.
+PIPELINE_LOCK_FILE = TMP_DIR / ".pipeline_lock.json"
+PIPELINE_LOCK_STALE_HOURS = 8  # matches pipeline_full's 28800s function timeout
+
+
+def _acquire_pipeline_lock(stage_name: str) -> None:
+    """Acquire the single-flight lock for pipeline-style cron functions.
+
+    Best-effort guard against concurrent invocations spaced > a few seconds
+    apart. On 2026-05-11 Modal Run 1 (cron 17:00 CEST) was evicted mid-CV
+    when a phantom Run 2 started at 18:19 CEST (1h+ later) despite
+    max_containers=1 — exactly the case this lock catches.
+
+    Known limitations (intentional, not bugs):
+      - TOCTOU window: two containers calling _acquire within the same
+        second can both pass the exists() check before either commits.
+        Modal Volume commits are eventually consistent across containers;
+        there is no compare-and-swap. Rare in practice given Modal's
+        scheduler — the real-world failure mode is the 1h+ spaced
+        re-fire, not simultaneous double-trigger.
+      - SIGKILL / OOM: if Modal kills the container itself, the finally
+        block in pipeline_full never runs and the lock persists. The
+        PIPELINE_LOCK_STALE_HOURS (8h, matches function timeout) auto-clear
+        is the only real backstop in that case. Repeated stale-clear
+        emails are a signal to investigate cumulative kills.
+
+    On conflict (fresh lock held): emails an alert and raises RuntimeError
+    so Modal marks the invocation failed. On stale lock: clears it, emails
+    a notice, proceeds. Caller MUST release via _release_pipeline_lock()
+    in a finally block.
+    """
+    volume.reload()  # see commits from any sibling container
+    if PIPELINE_LOCK_FILE.exists():
+        try:
+            held = _json_mod.loads(PIPELINE_LOCK_FILE.read_text())
+        except Exception:
+            held = {}
+        age_hours: float | None = None
+        started_at_iso = held.get("started_at", "")
+        try:
+            started_at = datetime.fromisoformat(started_at_iso)
+            age_hours = (datetime.now(timezone.utc) - started_at).total_seconds() / 3600
+        except Exception:
+            pass
+
+        if age_hours is None or age_hours < PIPELINE_LOCK_STALE_HOURS:
+            held_pretty = _json_mod.dumps(held, indent=2)
+            subject = f"[DOE pipeline LOCK] {stage_name} aborted — another run in progress"
+            body = (
+                f"{stage_name} invocation refused: lock held since {started_at_iso}.\n\n"
+                f"Lock contents:\n{held_pretty}\n\n"
+                f"If the holding run is stuck, clear the lock manually:\n"
+                f"  modal volume rm doe-tmp .pipeline_lock.json\n\n"
+                f"The lock auto-clears after {PIPELINE_LOCK_STALE_HOURS}h."
+            )
+            try:
+                _send_email(subject=subject, body=body)
+            except Exception as exc:
+                print(f"[lock] alert email failed: {exc}", file=sys.stderr)
+            raise RuntimeError(
+                f"{stage_name} lock held since {started_at_iso}; aborting concurrent invocation"
+            )
+
+        # Stale — clear and proceed
+        print(f"[lock] clearing stale lock (age={age_hours:.1f}h): {held}", file=sys.stderr)
+        try:
+            _send_email(
+                subject=f"[DOE pipeline LOCK] stale lock cleared before {stage_name}",
+                body=f"Found stale lock (age {age_hours:.1f}h):\n{_json_mod.dumps(held, indent=2)}",
+            )
+        except Exception:
+            pass
+
+    lock_payload = {
+        "stage": stage_name,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "container_id": os.environ.get("MODAL_TASK_ID", ""),
+        "function_call_id": os.environ.get("MODAL_FUNCTION_CALL_ID", ""),
+    }
+
+    # Atomic write: tempfile in same dir, then os.replace.
+    PIPELINE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", delete=False,
+        dir=str(PIPELINE_LOCK_FILE.parent), prefix=".pipeline_lock.", suffix=".tmp",
+    ) as tf:
+        _json_mod.dump(lock_payload, tf, indent=2)
+        tmp_path = Path(tf.name)
+    os.replace(tmp_path, PIPELINE_LOCK_FILE)
+    volume.commit()  # publish lock to sibling containers ASAP
+
+
+def _release_pipeline_lock() -> None:
+    """Release the single-flight lock. Best-effort — never raises.
+
+    Called from the consumer's finally block so the lock clears even when
+    a stage failure raises out of pipeline_full.
+    """
+    try:
+        if PIPELINE_LOCK_FILE.exists():
+            PIPELINE_LOCK_FILE.unlink()
+            volume.commit()
+    except Exception as exc:
+        print(f"[lock] release failed (continuing): {exc}", file=sys.stderr)
+
+
+def _pipeline_startup(stage_name: str, *, single_flight: bool = False) -> None:
     """Standard prelude for every cloud cron.
 
     1. Decode OAuth + API-key secrets from Modal env vars.
     2. Ensure tmp dir exists.
     3. Run OAuth health check — fail loudly if Sheets auth is broken,
        email a soft warning on day-5/6 token age.
+    4. If single_flight=True: acquire the pipeline lock. Caller MUST
+       release via _release_pipeline_lock() in a finally block.
     """
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -303,6 +418,8 @@ def _pipeline_startup(stage_name: str) -> None:
         raise RuntimeError(f"[{stage_name}] OAuth health check failed: {msg}")
     if msg:
         _send_oauth_alert(msg, healthy=True)
+    if single_flight:
+        _acquire_pipeline_lock(stage_name)
 
 
 def _mirror_tmp() -> None:
@@ -558,10 +675,10 @@ def _notify_applications_ready() -> None:
 # Using 16:00 UTC — fires at 18:00 during CEST season (Mar–Oct).
 
 @app.function(
-    schedule=modal.Cron("0 16 * * 2,4"),   # Tue + Thu 18:00 CEST
+    schedule=modal.Cron("0 15 * * 1,3"),   # Mon + Wed 15:00 UTC = 17:00 CEST / 16:00 CET — finishes well before Tue/Thu 01:00 UTC maintenance
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=19800,                         # 5.5 h: stage budgets total 18 300 s after removing scheduled preflight, with 1 500 s margin
+    timeout=28800,                         # 8 h: stage budgets total 18 300 s with 10 500 s headroom for slow scrape/LLM stages
     image=image_with_playwright,           # CV stage needs Chromium
     max_containers=1,
 )
@@ -572,7 +689,7 @@ def pipeline_full() -> None:
       prune → scrape (full description fetch) → evaluate
       → write_sheet → generate_cover_letter --min-score 6
       → generate_cv --min-score 6
-      → discover_contacts (cloud-only extra) → notify → mirror
+      → discover_contacts --limit 250 (cloud-only extra) → notify → mirror
 
     Selection is by score threshold (--min-score 6) reading scored_jobs.json
     from the volume. Status stays at 'New' after generation (CL/CV columns
@@ -583,35 +700,49 @@ def pipeline_full() -> None:
     re-stamp step is needed here — pipeline_daily_maintenance keeps them
     fresh on subsequent days.
 
+    Single-flight: acquires .pipeline_lock.json on the volume at start and
+    releases it in finally — concurrent invocations (cron + manual + dash)
+    get a "lock held" email and raise, the holding run continues unaffected.
+    Stale locks (>8h) auto-clear; manual override is a `modal volume rm`.
+
+    discover_contacts is capped at --limit 250 per run with a 3600s budget;
+    the 1k+ row backlog drains across consecutive runs. Stage runs with
+    check=False — its failure must not block notify/mirror at the end.
+
     Per-stage volume.commit() preserves partial progress on mid-run failure.
     On any stage's non-zero exit _run() emails the alert mailbox and raises.
     """
     os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
-    _pipeline_startup("pipeline_full")
+    _pipeline_startup("pipeline_full", single_flight=True)
 
-    _run("prune_stale_jobs.py", "--yes", "--days", PRUNE_WINDOW_DAYS,
-         "--archive-drive", "--reconcile-orphans",
-         stage_label="prune_stale_jobs", timeout=1200)
-    volume.commit()
-    _run("scrape_jobs.py", stage_label="scrape_jobs", timeout=3600)
-    volume.commit()
-    _run("evaluate_jobs.py", stage_label="evaluate_jobs", timeout=3600)
-    volume.commit()
-    _run("write_jobs_to_sheet.py", stage_label="write_jobs_to_sheet", timeout=900)
-    volume.commit()
-    _run("generate_cover_letter.py", "--min-score", "6",
-         stage_label="generate_cover_letter", timeout=3600)
-    volume.commit()
-    _run("generate_cv.py", "--min-score", "6", stage_label="generate_cv", timeout=3600)
-    volume.commit()
-    # Stage 4.5: free contact-email discovery (fail-soft, always exits 0).
-    # Local pipeline skips this; Modal keeps it as a free quality-of-life extra.
-    _run("discover_contacts.py", stage_label="discover_contacts",
-         check=False, timeout=1800)
-    volume.commit()
+    try:
+        _run("prune_stale_jobs.py", "--yes", "--days", PRUNE_WINDOW_DAYS,
+             "--archive-drive", "--reconcile-orphans",
+             stage_label="prune_stale_jobs", timeout=1200)
+        volume.commit()
+        _run("scrape_jobs.py", stage_label="scrape_jobs", timeout=3600)
+        volume.commit()
+        _run("evaluate_jobs.py", stage_label="evaluate_jobs", timeout=3600)
+        volume.commit()
+        _run("write_jobs_to_sheet.py", stage_label="write_jobs_to_sheet", timeout=900)
+        volume.commit()
+        _run("generate_cover_letter.py", "--min-score", "6",
+             stage_label="generate_cover_letter", timeout=3600)
+        volume.commit()
+        _run("generate_cv.py", "--min-score", "6", stage_label="generate_cv", timeout=3600)
+        volume.commit()
+        # Stage 4.5: free contact-email discovery (fail-soft, always exits 0).
+        # --limit 250 caps per-run work — the 1k+ row backlog drains across runs.
+        # timeout=3600 gives 1h headroom for 250 contacts at ~12s each (~3000s + margin).
+        # Pre-2026-05-11 the 1800s budget SIGKILLed after ~80 contacts on a full backlog.
+        _run("discover_contacts.py", "--limit", "250", stage_label="discover_contacts",
+             check=False, timeout=3600)
+        volume.commit()
 
-    _notify_applications_ready()
-    _mirror_tmp()
+        _notify_applications_ready()
+        _mirror_tmp()
+    finally:
+        _release_pipeline_lock()
 
 
 @app.function(
@@ -656,7 +787,7 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     schedule=modal.Cron("0 1 * * *"),
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
-    timeout=9600,                          # 2 h 40 m: stage budgets total 8 400 s with 1 200 s margin
+    timeout=16800,                         # 4 h 40 m: stage budgets total 15 600 s with 1 200 s margin
     image=image_with_playwright,           # PDF render needs Chromium
     max_containers=1,
 )
@@ -723,7 +854,7 @@ def pipeline_daily_maintenance() -> None:
         "--min-score", "6",
         "--statuses", "New",            # cloud cron: only restamp the apply backlog, not Applied/etc.
         stage_label="update_cover_letter_dates",
-        timeout=3600,                   # 60 min ceiling
+        timeout=10800,                  # 3 h ceiling — absorbs Drive throttling / backlog growth
         capture=outputs["update_cover_letter_dates"],
     )
     volume.commit()
@@ -801,10 +932,12 @@ def cleanup_orphan_application_folders(
 
 
 # ---------------------------------------------------------------------------
-# On-demand preflight (no schedule — invoke with `modal run`)
+# Weekly preflight (Sun 12:00 UTC) — early-warning sanity check before the
+# Monday pipeline_full run. Also callable on-demand: `modal run ... ::preflight`.
 # ---------------------------------------------------------------------------
 
 @app.function(
+    schedule=modal.Cron("0 12 * * 0"),     # Sun 12:00 UTC = 14:00 CEST / 13:00 CET — before Mon pipeline_full
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=300,

@@ -471,14 +471,31 @@ def main() -> int:
 
     header = [h.strip() for h in all_rows[0]]
     eligible = _eligible_rows(all_rows[1:], header, args.sheet_triggered, allowed_statuses)
+
+    # Load cache early so we can partition fresh rows ahead of cached-NOT_FOUND
+    # retries. Without this, the first --limit rows are dominated by NOT_FOUND
+    # entries (which never write Contact_Email, so they stay eligible until the
+    # 30-day cache TTL expires) and fresh rows past position --limit never run.
+    cache = _load_cache()
+    if args.limit is not None and not args.reset_cache:
+        from execution.utils import normalize_company_key
+        fresh, retry = [], []
+        for job in eligible:
+            ck = normalize_company_key(job["company"]) if job["company"] else ""
+            cached = _cached_contact(cache, ck) if ck else None
+            if cached and cached.get("contact_source") == "NOT_FOUND":
+                retry.append(job)
+            else:
+                fresh.append(job)
+        eligible = fresh + retry
+        log.info(f"Partitioned eligible rows: {len(fresh)} fresh + {len(retry)} cached-NOT_FOUND retry")
+
     if args.limit is not None:
         eligible = eligible[: args.limit]
 
     log.info(f"Eligible rows: {len(eligible)}")
     if not eligible:
         return 0
-
-    cache = _load_cache()
     summary = {"hits": 0, "misses": 0, "errors": 0, "cached": 0}
 
     # Try to set up a single Playwright browser to reuse across rows
