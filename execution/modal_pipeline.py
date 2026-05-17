@@ -974,12 +974,11 @@ def cleanup_orphan_application_folders(
 
 
 # ---------------------------------------------------------------------------
-# Weekly preflight (Sun 12:00 UTC) — early-warning sanity check before the
-# Monday pipeline_full run. Also callable on-demand: `modal run ... ::preflight`.
+# On-demand preflight. Keep this unscheduled so the app stays within Modal's
+# 5-cron free-plan cap; run manually before production changes when needed.
 # ---------------------------------------------------------------------------
 
 @app.function(
-    schedule=modal.Cron("0 12 * * 0"),     # Sun 12:00 UTC = 14:00 CEST / 13:00 CET — before Mon pipeline_full
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=300,
