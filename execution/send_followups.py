@@ -549,6 +549,17 @@ def find_eligible_jobs(worksheet, max_days: int = 30) -> list[dict]:
             log.warning(f"  Row {row_idx}: Invalid email format '{contact_email}' for '{title}', skipping")
             continue
 
+        # Gate: skip low-confidence contacts (Constructed emails from Source 3
+        # pattern construction). They're written for manual review; auto-sending
+        # to a guessed address risks landing in spam or reaching the wrong person.
+        # High (Discovered/Posting/Listing_Page) and medium (Generic_Inbox) still send.
+        confidence = _safe_cell(row, "Contact_Confidence").lower().strip()
+        if confidence == "low":
+            title = _safe_cell(row, "Title") or "?"
+            company = _safe_cell(row, "Company") or "?"
+            log.info(f"  Skipping '{title}' at {company} — Contact_Confidence=low (manual review required)")
+            continue
+
         # [M7] Must have Date_Applied
         if not date_applied_str or not date_applied_str.strip():
             continue

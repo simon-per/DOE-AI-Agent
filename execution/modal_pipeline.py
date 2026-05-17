@@ -9,7 +9,8 @@ Runs all automatable stages 24/7 without the local PC needing to be on:
                           No manual sheet gate; selection is by score threshold.
                           Date freshness on subsequent days is handled by
                           pipeline_daily_maintenance (no re-stamp inside this run).
-  - Mon-Fri 06:00 UTC:    send_followups --send
+  - send_followups:       on-demand only (auto-schedule disabled 2026-05-15;
+                          run via `modal run execution/modal_pipeline.py::pipeline_send_followups`)
   - Daily 01:00 UTC:      pipeline_daily_maintenance — prune stale rows, clean
                           orphan folders, and re-stamp every score>=6 cover letter to TODAY,
                           pushing refreshed PDF/DOCX to Drive so the user
@@ -705,9 +706,12 @@ def pipeline_full() -> None:
     get a "lock held" email and raise, the holding run continues unaffected.
     Stale locks (>8h) auto-clear; manual override is a `modal volume rm`.
 
-    discover_contacts is capped at --limit 250 per run with a 3600s budget;
-    the 1k+ row backlog drains across consecutive runs. Stage runs with
-    check=False — its failure must not block notify/mirror at the end.
+    Contact discovery is split off into pipeline_discover_contacts (Tue+Thu
+    06:00 UTC) so its slow per-row work cannot timeout-cascade and block
+    notify + Drive mirror at the end of this run.
+
+    Stage budgets total ~16 500 s under the 28 800 s (8 h) function timeout,
+    leaving ~3 h 25 m headroom for slow scrape/LLM stages.
 
     Per-stage volume.commit() preserves partial progress on mid-run failure.
     On any stage's non-zero exit _run() emails the alert mailbox and raises.
@@ -731,14 +735,11 @@ def pipeline_full() -> None:
         volume.commit()
         _run("generate_cv.py", "--min-score", "6", stage_label="generate_cv", timeout=3600)
         volume.commit()
-        # Stage 4.5: free contact-email discovery (fail-soft, always exits 0).
-        # --limit 250 caps per-run work — the 1k+ row backlog drains across runs.
-        # timeout=3600 gives 1h headroom for 250 contacts at ~12s each (~3000s + margin).
-        # Pre-2026-05-11 the 1800s budget SIGKILLed after ~80 contacts on a full backlog.
-        _run("discover_contacts.py", "--limit", "250", stage_label="discover_contacts",
-             check=False, timeout=3600)
-        volume.commit()
 
+        # Contact discovery runs separately as pipeline_discover_contacts —
+        # its 250-row batch routinely exceeds 1h and the _run() watchdog
+        # always raises on timeout (regardless of check=False), which used
+        # to abort the notify + mirror below.
         _notify_applications_ready()
         _mirror_tmp()
     finally:
@@ -746,11 +747,11 @@ def pipeline_full() -> None:
 
 
 @app.function(
-    # Mon-Fri 06:00 UTC = 08:00 CEST (summer) / 07:00 CET (winter).
-    # Multi-touch flow checks each row against 3/6/12-bd thresholds and only sends
-    # what's actually due — running daily means a touch fires on the first business
-    # day after its threshold instead of waiting up to 2 days for the next M/W/F.
-    schedule=modal.Cron("0 6 * * 1-5"),
+    # Auto-schedule DISABLED 2026-05-15 — Contact_Email resolution sometimes
+    # picks the wrong recipient, so follow-ups must be triggered manually after
+    # the user verifies the contact. Re-enable by restoring:
+    #   schedule=modal.Cron("0 6 * * 1-5"),
+    # and re-running `modal deploy execution/modal_pipeline.py`.
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=600,
@@ -770,6 +771,44 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
     _run("send_followups.py", *args, stage_label="send_followups", timeout=540)
     volume.commit()
     _mirror_tmp()
+
+
+@app.function(
+    # Tue + Thu 06:00 UTC = 08:00 CEST / 07:00 CET. Sits past the 05:40 UTC
+    # worst-case tail of pipeline_daily_maintenance (cron 0 1 * * *, timeout
+    # 16800s) so the shared single-flight lock doesn't fire a spurious
+    # "lock held" alert email on overlap days. Well clear of Mon/Wed 15:00
+    # UTC pipeline_full.
+    schedule=modal.Cron("0 6 * * 2,4"),
+    volumes={str(TMP_DIR): volume},
+    secrets=secrets,
+    timeout=7800,                          # 7200 s stage budget + 600 s startup/teardown margin
+    image=image_with_playwright,           # Source 2 (impressum scrape) needs Chromium
+    max_containers=1,
+)
+def pipeline_discover_contacts() -> None:
+    """Stage 4.5 (split off): contact-email discovery for backlog rows.
+
+    Split out of pipeline_full on 2026-05-16 because the 250-row batch
+    routinely exceeded 1 h and the _run() watchdog always raises on timeout
+    (check=False only suppresses non-zero exits, not timeouts), which used
+    to skip notify + Drive mirror at the tail of pipeline_full.
+
+    --limit 250 caps per-run work; the row-level checkpoint at
+    .tmp/discover_contacts_checkpoint.json (24h TTL) lets consecutive runs
+    drain the backlog without re-paying SERP/LLM cost.
+
+    Single-flight: shares the .pipeline_lock.json mechanism with
+    pipeline_full / daily_maintenance so concurrent runs cannot collide.
+    """
+    _pipeline_startup("pipeline_discover_contacts", single_flight=True)
+    try:
+        _run("discover_contacts.py", "--limit", "250",
+             stage_label="discover_contacts", check=False, timeout=7200)
+        volume.commit()
+        _mirror_tmp()
+    finally:
+        _release_pipeline_lock()
 
 
 @app.function(
@@ -830,7 +869,7 @@ def pipeline_daily_maintenance() -> None:
         "--targets", "both",
         "--apply", "--yes",
         "--grace-hours", "24",
-        "--max-delete-pct", "0.25",
+        "--max-delete-pct", "0.40",       # 0.25 was tripping at ~25.6% steady-state backlog; 500-count cap still bounds blast radius
         "--max-delete-count", "500",
         stage_label="cleanup_orphan_application_folders",
         check=False,                    # safety trips should alert, not block re-stamp
@@ -852,7 +891,10 @@ def pipeline_daily_maintenance() -> None:
         "update_cover_letter_dates.py",
         "--letter-date", today,
         "--min-score", "6",
-        "--statuses", "New",            # cloud cron: only restamp the apply backlog, not Applied/etc.
+        # No --statuses filter: re-stamp every score>=6 row on Drive so the local
+        # view stays in sync with the canonical source. Previously --statuses New
+        # left older Applied/Ready_to_Apply rows un-stamped, causing the 06:33
+        # local task to report 35% missing folders.
         stage_label="update_cover_letter_dates",
         timeout=10800,                  # 3 h ceiling — absorbs Drive throttling / backlog growth
         capture=outputs["update_cover_letter_dates"],
@@ -896,7 +938,7 @@ def cleanup_orphan_application_folders(
     apply: bool = False,
     force: bool = False,
     grace_hours: int = 24,
-    max_delete_pct: float = 0.25,
+    max_delete_pct: float = 0.40,
     max_delete_count: int = 500,
 ) -> None:
     """Clean Modal Volume / Drive application folders absent from the Sheet.

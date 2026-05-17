@@ -749,6 +749,11 @@ def research_company(
 # ---------------------------------------------------------------------------
 # Contact discovery — SerpAPI source for discover_contacts.py (Source 3)
 # ---------------------------------------------------------------------------
+# Unused after 2026-05-16 listing-anchored refactor. Source 3 (company-level
+# Google search) was retired because hits were unanchored to the specific
+# listing. Kept for now in case it's needed again — verify no other callers
+# via `grep -r search_company_contacts` before deleting.
+
 
 def search_company_contacts(
     domain: str,

@@ -88,7 +88,7 @@ HEADERS = [
     "CL_Quality_Score",
     "CV_Generated",
     # Auto-populated by Stage 4.5 (discover_contacts.py)
-    "Contact_Source",        # Posting | Impressum | Google | Pattern | NOT_FOUND | Manual
+    "Contact_Source",        # Posting | Listing_Page | Discovered | Generic_Inbox | Constructed | NEEDS_MANUAL | NOT_FOUND | Manual
     "Contact_Confidence",    # high | medium | low
     # Auto-populated by Stage 6 (send_followups.py) — multi-touch tracking
     "Follow_Up_Count",       # 0 / 1 / 2 / 3 (number of touches sent)

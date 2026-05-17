@@ -46,6 +46,10 @@ retire once Stage 7 fully reads from Drive.
 
 **Application folder hygiene:** `execution/cleanup_orphan_application_folders.py` deletes local `.tmp/applications/J-*` folders and active Drive `DOE Applications/J-*` folders whose `Job_ID` is no longer present in the Sheet. Google Sheet is the source of truth. The tool is dry-run by default and requires `--apply --yes` before deletion. Safety gates refuse applies when the Sheet has too few valid IDs, when folders are inside the grace window, or when candidate count/share exceeds the configured threshold; use `--force` only after reviewing the dry-run counts. Modal exposes the same tool as on-demand `cleanup_orphan_application_folders`, and `pipeline_daily_maintenance` runs it fail-soft after pruning with `--apply --yes` but no `--force` so safety trips alert without blocking cover-letter date freshness.
 
+**Applied row age-out:** `execution/prune_stale_jobs.py` also deletes rows stuck at `Status=Applied` when `Date_Applied` is older than `--applied-days` (default 60 calendar days) and no `Response_Date`, `Interview_Date`, or `Response_Received=Yes` marker exists. This keeps ghosted February/March-style applications from living forever while preserving any row with outcome evidence. Deleted rows feed the existing Drive archive and orphan-folder cleanup path.
+
+**Drive retention safeguard:** `prune_stale_jobs --reconcile-orphans` uses the post-delete Sheet state (loaded rows minus just-deleted `Job_ID`s), and it still runs when no Sheet rows were pruned. If rows were deleted and Drive reconcile does not complete cleanly, the script exits non-zero so downstream orphan cleanup does not permanently delete folders before they have had the `_Archive/` retention window.
+
 **One-time Modal setup:**
 1. `pip install modal && modal token new`
 2. In Modal dashboard → Secrets → create `doe-google-oauth` with:
@@ -236,21 +240,26 @@ python execution/run_swarm.py --limit 3
 **Input:** Google Sheet (rows with `Status=APPLYING` and empty `Contact_Email`)
 **Output:** Sheet columns `Contact_Person`, `Contact_Email`, `Contact_Source`, `Contact_Confidence`
 
-**Five free sources, tried in order; first email wins:**
-1. **Posting LLM extract** (`extract_contacts.py:extract_contacts_from_posting`) — strict JSON
-   pull of name + email + title + honorific from the job description.
-2. **Impressum / Kontakt scrape** (`contact_scraper.py:scrape_company_contacts`) — Playwright
-   visits `/impressum`, `/kontakt`, `/team`, etc. (Swiss/DE/AT legal req → highest hit rate
-   for SMEs). LLM second-pass for structured contacts.
-3. **Google search via SerpAPI** (`web_search.py:search_company_contacts`) — `site:linkedin.com/in`
-   queries scoped to recruiters / talent / HR; capped at 2 SERP credits per company.
-4. **Email pattern + SMTP RCPT verify** (`email_verifier.py:verify_pattern`) — generates
-   `firstname.lastname@`, `f.lastname@`, etc., MX-resolves the domain, probes via SMTP
-   `RCPT TO`. Skips accept-all providers (Gmail/Outlook) → returns first pattern as low-conf
-   guess instead of false-positive verify.
-5. **NOT_FOUND** — sheet flagged so user can spot-check the worst 10% manually.
+**Listing-anchored sources, tried in order; first validated email wins:**
+1. **Posting extract** (`extract_contacts.py:extract_contacts_from_posting`) — regex + strict
+   LLM JSON pull of name, email, title, honorific, and grounded `source_quote` from the stored
+   job description.
+2. **Listing-page re-fetch** (`contact_scraper.py:fetch_listing_page_text`) — Playwright
+   re-fetches the listing URL itself and reruns the same extractor so rendered sidebars,
+   widgets, and `mailto:` links are visible.
+3. **Aggregator canonical hop** (`contact_scraper.py:find_canonical_apply_url`) — for known
+   job boards only, Source 2 may follow one high-confidence "apply on company site" link and
+   validate against the canonical host.
+4. **NOT_FOUND** — sheet flagged for manual fill.
 
-**Cache:** results stored in `.tmp/company_cache.json` per-company entry (30-day TTL).
+**Validation:** free-mail domains are always rejected. Direct company listings validate only
+against their listing host. Aggregator/job-board listings do not trust the board host; they
+seed expected domains from JD-body emails while skipping free-mail and aggregator-owned
+domains such as `jobs.ch`, `indeed.com`, or `jobagent.ch`.
+
+**Cache:** per-company results stored in `.tmp/company_cache.json` (30-day TTL). Source 2
+listing-page extraction results are also cached by URL in `.tmp/listing_page_cache.json`
+(30 days for hits, 7 days for misses).
 **Failure mode:** every error path swallowed; the script always exits 0 so a slow
 website / blocked port 25 / DNS hiccup cannot abort the parent pipeline. Worst case:
 column reads `Contact_Source=NOT_FOUND` and the next 2-hour run retries the row.

@@ -56,3 +56,11 @@ model-routing-session.txt
 claude-session-*.md
 claude-wip-*.diff
 *.diff
+
+# Runtime checkpoints + transcripts (never belong in git)
+*_checkpoint.json
+%TEMP%*
+*-this-session-is-being-continued*.txt
+
+# Local Windows scheduled task exports (contain username + Desktop paths)
+scripts/DOE_UpdateCoverLetterDates.xml

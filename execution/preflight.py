@@ -262,23 +262,6 @@ def check_openrouter_fallback() -> None:
     _check_openrouter_model(MODEL_FALLBACK)
 
 
-def check_dns_resolver_import() -> None:
-    """Confirm dnspython is installed.
-
-    `email_verifier._resolve_mx` raises a clear RuntimeError if dnspython is
-    missing, but that only fires the first time a contact-discovery row hits
-    Source 4. Catch it here, before the LLM stage burns tokens.
-    """
-    try:
-        import dns.resolver  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "dnspython is not installed — contact-email verification (Source 4 of "
-            "discover_contacts) will silently produce zero hits. Run: "
-            "pip install -r requirements.txt"
-        ) from exc
-
-
 def check_profile_parse() -> None:
     """Parse ABOUTME.md and confirm essential personal fields are populated."""
     from execution.profile_loader import load_profile
@@ -365,7 +348,6 @@ def main() -> int:
 
     # Order matters: cheap → expensive, so we fail fast on auth issues
     results.append(_run_check("Profile parse (ABOUTME.md)",  check_profile_parse))
-    results.append(_run_check("dnspython import",            check_dns_resolver_import))
     results.append(_run_check("Sheets API: read",            check_sheets_read))
     results.append(_run_check("Sheets API: write",           check_sheets_write))
     results.append(_run_check("Drive API: list",             check_drive_list))
