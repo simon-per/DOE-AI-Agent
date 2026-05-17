@@ -17,7 +17,8 @@ Runs all automatable stages 24/7 without the local PC needing to be on:
                           always opens an up-to-date letter. Fires at 03:00
                           CEST (summer) / 02:00 CET (winter) so it finishes
                           well before the 05:45 local apply window.
-  - Sun 16:00 UTC:        weekly digest email
+  - weekly digest:        on-demand only (kept unscheduled to stay within
+                          Modal's 5-cron free-plan cap)
 
 Stage 7 (run_swarm / apply) stays local — requires Chrome + human review.
 
@@ -760,7 +761,7 @@ def pipeline_full() -> None:
 def pipeline_send_followups(dry_run: bool = False) -> None:
     """Stage 6: send multi-touch follow-up emails (3 / 6 / 12 business days).
 
-    Cron schedule (no args) always sends. Pass `dry_run=True` via
+    On-demand run with no args sends. Pass `dry_run=True` via
     `modal run ... --dry-run` for a side-effect-free smoke test in cloud — runs
     the full eligibility scan + LLM generation but skips the Gmail send and
     sheet write. Useful for verifying OAuth + per-stage routing without firing
@@ -906,10 +907,9 @@ def pipeline_daily_maintenance() -> None:
 
 
 @app.function(
-    # Sun 16:00 UTC = 18:00 CEST (summer) / 17:00 CET (winter).
-    # Sent on Sunday evening so the metrics cover the full Mon–Sun window and the
-    # candidate sees them before Monday's working day starts.
-    schedule=modal.Cron("0 16 * * 0"),
+    # Auto-schedule DISABLED 2026-05-17 to stay within Modal's 5-cron
+    # free-plan cap. Run on demand:
+    #   modal run execution/modal_pipeline.py::pipeline_weekly_digest
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=300,
