@@ -775,12 +775,13 @@ def pipeline_send_followups(dry_run: bool = False) -> None:
 
 
 @app.function(
-    # Tue + Thu 06:00 UTC = 08:00 CEST / 07:00 CET. Sits past the 05:40 UTC
-    # worst-case tail of pipeline_daily_maintenance (cron 0 1 * * *, timeout
-    # 16800s) so the shared single-flight lock doesn't fire a spurious
-    # "lock held" alert email on overlap days. Well clear of Mon/Wed 15:00
-    # UTC pipeline_full.
-    schedule=modal.Cron("0 6 * * 2,4"),
+    # Auto-schedule DISABLED 2026-05-17 to stay under Modal's 5-cron
+    # free-plan cap (Modal allocates 2 slots per scheduled function, so
+    # 3 scheduled functions = 6 > 5). Run on demand:
+    #   modal run execution/modal_pipeline.py::pipeline_discover_contacts
+    # Backlog drains via row-level checkpoint
+    # (.tmp/discover_contacts_checkpoint.json, 24h TTL), so consecutive
+    # manual runs resume cleanly without re-paying SERP/LLM cost.
     volumes={str(TMP_DIR): volume},
     secrets=secrets,
     timeout=7800,                          # 7200 s stage budget + 600 s startup/teardown margin
