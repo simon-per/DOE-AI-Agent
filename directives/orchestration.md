@@ -10,7 +10,7 @@ Stage 1:   Scrape     → raw_jobs.json
 Stage 2:   Evaluate   → scored_jobs.json
 Stage 3:   Sheet      → Google Sheet (deliverable)
 Stage 4:   Cover      → PDF + DOCX cover letters (gender-aware salutation)
-Stage 4.5: Contacts   → Discover Contact_Email + Contact_Person from 5 free sources
+Stage 4.5: Contacts   → Discover Contact_Email + Contact_Person via 3-source listing-anchored waterfall
 Stage 5:   CV         → PDF + DOCX tailored CVs
 Stage 6:   Follow-up  → 3-touch sequence (3 / 6 / 12 business days)
 Stage 7:   Swarm      → Browser-based auto-apply (HITL)
@@ -27,9 +27,10 @@ retire once Stage 7 fully reads from Drive.
 
 | Where | Stages | Trigger |
 |---|---|---|
-| **Modal (cloud)** | **1–5 + 4.5 (full pipeline, scrape → CV)** | **Tue+Thu 18:00 CEST cron** — `pipeline_full`, `--min-score 6`, no manual gate. CLs stamped with that day's date during generation; uploaded to Drive automatically. |
+| **Modal (cloud)** | **1–5 (full pipeline, scrape → CV)** | **Mon+Wed 15:00 UTC cron (17:00 CEST / 16:00 CET)** — `pipeline_full`, `--min-score 6`, no manual gate. CLs stamped with that day's date during generation; uploaded to Drive automatically. Contact discovery (Stage 4.5) is split out — see next row. |
+| **Modal (cloud)** | 4.5 (contact discovery, listing-anchored waterfall) | **On-demand only** — `modal run execution/modal_pipeline.py::pipeline_discover_contacts`. Schedule was removed 2026-05-17 to stay under Modal's 5-cron free-plan cap (Modal allocates 2 slots per scheduled function). Row-level checkpoint (`.tmp/discover_contacts_checkpoint.json`, 24h TTL) lets consecutive manual runs drain the 600-row backlog without re-paying LLM cost. Free-waterfall design — zero SerpAPI calls per run. |
 | **Modal (cloud)** | 6 (send follow-ups, multi-touch) | On-demand only — `modal run execution/modal_pipeline.py::pipeline_send_followups` after verifying contacts |
-| **Modal (cloud)** | Maintenance: prune stale rows + archive Drive folders + reconcile orphans + cleanup orphan folders + hydrate Volume from Drive + re-stamp every score≥6 CL date → Drive | Daily 03:00 CEST / 02:00 CET — `pipeline_daily_maintenance`, `--min-score 6`, timeout 2h40m. Stages: `prune_stale_jobs --days 14 --archive-drive --reconcile-orphans` (deletes pruned Sheet rows, moves their Drive folders to `DOE Applications/_Archive/` with an `archived_at` stamp, then reconciles: any **active** J-* folder whose `job_id` is no longer in the Sheet — manual deletes, legacy state — is also archived with `archive_reason: orphan`. Layered safeguards: empty-sheet guard, 10% threshold guard, 12h grace period for in-flight uploads, override via `--force-reconcile`. Permanently deletes folders that have been in `_Archive/` for 14+ days) → `cleanup_orphan_application_folders --targets both --apply --yes` (fail-soft, no `--force`, deletes local/active-Drive folders absent from the Sheet only when safety gates pass) → `hydrate_volume_from_drive --since-days 365` (downloads any active DOE Applications/J-* folder Drive has but the Volume is missing — best-effort, never blocks the next stage) → `update_cover_letter_dates` (mutates the right-aligned date paragraph in the DOCX in place; re-renders the PDF via fpdf2 from the body cached in `letter_meta.json` — no LLM, no template re-build). On every cron firing the OAuth health check (`_check_oauth_health`) runs first; failure emails `[DOE pipeline OAUTH FAIL]` and stops the run, day-5/6 age sends a `[OAUTH WARN]`. Coverage gap >5% triggers an alert email. Success summary email closes each run with cleanup / hydrate / re-stamp / reconcile counts. Finishes before the 05:45 local apply window. |
+| **Modal (cloud)** | Maintenance: prune stale rows + archive Drive folders + reconcile orphans + cleanup orphan folders + hydrate Volume from Drive + re-stamp every score≥6 CL date → Drive | Daily 01:00 UTC (03:00 CEST / 02:00 CET) — `pipeline_daily_maintenance`, `--min-score 6`, timeout 2h40m. Stages: `prune_stale_jobs --days 14 --archive-drive --reconcile-orphans` (deletes pruned Sheet rows, moves their Drive folders to `DOE Applications/_Archive/` with an `archived_at` stamp, then reconciles: any **active** J-* folder whose `job_id` is no longer in the Sheet — manual deletes, legacy state — is also archived with `archive_reason: orphan`. Layered safeguards: empty-sheet guard, 10% threshold guard, 12h grace period for in-flight uploads, override via `--force-reconcile`. Permanently deletes folders that have been in `_Archive/` for 14+ days) → `cleanup_orphan_application_folders --targets both --apply --yes` (fail-soft, no `--force`, deletes local/active-Drive folders absent from the Sheet only when safety gates pass) → `hydrate_volume_from_drive --since-days 365` (downloads any active DOE Applications/J-* folder Drive has but the Volume is missing — best-effort, never blocks the next stage) → `update_cover_letter_dates` (mutates the right-aligned date paragraph in the DOCX in place; re-renders the PDF via fpdf2 from the body cached in `letter_meta.json` — no LLM, no template re-build). On every cron firing the OAuth health check (`_check_oauth_health`) runs first; failure emails `[DOE pipeline OAUTH FAIL]` and stops the run, day-5/6 age sends a `[OAUTH WARN]`. Coverage gap >5% triggers an alert email. Success summary email closes each run with cleanup / hydrate / re-stamp / reconcile counts. Finishes before the 05:45 local apply window. |
 | **Modal (cloud)** | Weekly digest | On-demand only — `modal run execution/modal_pipeline.py::pipeline_weekly_digest` |
 | **Local (Windows Task Scheduler)** | Re-stamp legacy local `.tmp/applications/` CL dates (transitional) | Daily 05:45 local — `DOE_UpdateCoverLetterDates`, `--skip-drive --min-score 6`. Drive untouched (Modal owns it). Retire when Stage 7 pulls from Drive. |
 | **Local (HITL)** | 7 (apply) | Run manually — Simon submits each application |
@@ -240,29 +241,68 @@ python execution/run_swarm.py --limit 3
 **Input:** Google Sheet (rows with `Status=APPLYING` and empty `Contact_Email`)
 **Output:** Sheet columns `Contact_Person`, `Contact_Email`, `Contact_Source`, `Contact_Confidence`
 
-**Listing-anchored sources, tried in order; first validated email wins:**
-1. **Posting extract** (`extract_contacts.py:extract_contacts_from_posting`) — regex + strict
-   LLM JSON pull of name, email, title, honorific, and grounded `source_quote` from the stored
-   job description.
-2. **Listing-page re-fetch** (`contact_scraper.py:fetch_listing_page_text`) — Playwright
-   re-fetches the listing URL itself and reruns the same extractor so rendered sidebars,
-   widgets, and `mailto:` links are visible.
-3. **Aggregator canonical hop** (`contact_scraper.py:find_canonical_apply_url`) — for known
-   job boards only, Source 2 may follow one high-confidence "apply on company site" link and
-   validate against the canonical host.
-4. **NOT_FOUND** — sheet flagged for manual fill.
+**3-source listing-anchored waterfall, tried in order; first validated email wins:**
+1. **Source 1 — Posting extract** (`extract_contacts.py:extract_contacts_from_posting`) —
+   regex + strict LLM JSON pull of name, email, title, honorific, and grounded `source_quote`
+   from the stored job description. Sets `contact_source=Posting`.
+2. **Source 2 — Listing-page re-fetch** (`contact_scraper.py:fetch_listing_page_text`) —
+   Playwright re-fetches the listing URL itself and reruns the same extractor so rendered
+   sidebars, widgets, and `mailto:` links are visible. May follow one aggregator canonical
+   hop (`find_canonical_apply_url`) for known job boards. For `linkedin.com` listings,
+   `_extract_linkedin_hiring_team_text` prepends the "Meet the hiring team" card to the LLM
+   input so recruiter names surface even when the body alone is silent. Sets
+   `contact_source=Listing_Page`.
+3. **Source 3 — Pattern-anchored construction** (`discover_contacts._source3_pattern_construction`) —
+   when Sources 1+2 found a contact name but no email, derive the company domain via the
+   **free waterfall** (`_resolve_company_domain_free`: job-URL host → JD-body email-domain
+   extraction → URL-guess validated by `fetch_page_text`; no SerpAPI calls), then crawl the
+   company's contact surface with the broader `_COMPANY_CONTACT_PATHS` list (impressum,
+   kontakt, team, management, leadership, people, wer-wir-sind variants; up to 7 pages per
+   company). Three confidence tiers:
+   - `Discovered` (**high**) — a person-specific email on the page matches the extracted name
+   - `Generic_Inbox` (**medium**) — useful generic recruiter inbox (`careers@`, `hr@`,
+     `jobs@`, `bewerbung@`, `personal@`, `recruiting@`) on the company's own domain
+   - `Constructed` (**low**) — pattern inferred from a third-party email; never auto-sent
+     (see [send_followups.md](send_followups.md) low-confidence skip gate)
+
+**Pending-email rescue** (`_rescue_pending_emails`, runs ahead of the name gate) — when
+Sources 1+2 surface an email whose host word-matches the company name (e.g. recruiter inbox
+on an aggregator listing with `expected_domains=∅`), accept it directly:
+person-specific → high, generic recruiter inbox → medium. Auto-sent by follow-ups.
+
+**Terminal-miss states:**
+- `NEEDS_MANUAL` — set when all sources miss AND the listing URL is on a known aggregator
+  (LinkedIn, Indeed, jobs.ch, etc.). Surfaces aggregator-walled rows for batched manual
+  review without overwriting the Status column. Filter the sheet by
+  `Contact_Source=NEEDS_MANUAL` to find them.
+- `NOT_FOUND` — set when the listing URL is on a direct (non-aggregator) host but no email
+  exists on the public web. Manual review unlikely to help.
+
+**`Contact_Source` enum** (`discover_contacts.py:53`):
+`Posting | Listing_Page | Discovered | Generic_Inbox | Constructed | NEEDS_MANUAL | NOT_FOUND`.
+Only `Contact_Source`, `Contact_Confidence`, `Contact_Person`, `Contact_Email` are ever
+written by Stage 4.5 — `Status` is never touched. Existing non-empty `Contact_Email` values
+short-circuit the row so manual entries are never overwritten.
 
 **Validation:** free-mail domains are always rejected. Direct company listings validate only
 against their listing host. Aggregator/job-board listings do not trust the board host; they
 seed expected domains from JD-body emails while skipping free-mail and aggregator-owned
 domains such as `jobs.ch`, `indeed.com`, or `jobagent.ch`.
 
-**Cache:** per-company results stored in `.tmp/company_cache.json` (30-day TTL). Source 2
-listing-page extraction results are also cached by URL in `.tmp/listing_page_cache.json`
-(30 days for hits, 7 days for misses).
+**Caches** (all under `.tmp/`):
+| File | Scope | TTL (hits / misses) |
+|---|---|---|
+| `company_cache.json` | per-company resolution | 30d / 30d |
+| `listing_page_cache.json` | per-URL Source 2 extraction | 30d / 7d |
+| `pattern_cache.json` | per-domain Source 3 pattern + domain | 90d / 14d |
+| `discover_contacts_checkpoint.json` | row-level dedupe within a cycle | 24h |
+
+`NEEDS_MANUAL` is treated as a terminal-miss like `NOT_FOUND` for cache and partition logic.
+
 **Failure mode:** every error path swallowed; the script always exits 0 so a slow
 website / blocked port 25 / DNS hiccup cannot abort the parent pipeline. Worst case:
-column reads `Contact_Source=NOT_FOUND` and the next 2-hour run retries the row.
+column reads `Contact_Source=NOT_FOUND` or `NEEDS_MANUAL` and the next on-demand run
+retries the row once the cache expires.
 
 **Cover letter integration:** when discovery returns an honorific (`Frau` / `Herr`), the
 post-LLM `_greeting_for_contact()` in `generate_cover_letter.py` upgrades the salutation
@@ -403,7 +443,7 @@ vs salutation) actually moved your reply rate. Phase 3 tuning is informed by thi
 - `directives/setup_google_auth.md` — Google OAuth setup for Sheets + Gmail
 
 ## Learnings (auto-updated)
-- Stages 4+5 run on Modal as part of the unified `pipeline_full` (Tue/Thu 18:00 CEST) for any new job scoring >= 6. Four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup) — the same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap. Date freshness on subsequent days is handled by `pipeline_daily_maintenance` (06:00 CEST) which re-stamps every score≥6 cover letter to today and pushes the refresh to Drive without re-running the LLM.
+- Stages 4+5 run on Modal as part of the unified `pipeline_full` (Mon/Wed 15:00 UTC = 17:00 CEST / 16:00 CET) for any new job scoring >= 6. Stage 4.5 (contact discovery) is split off and runs on-demand only via `pipeline_discover_contacts` (schedule removed 2026-05-17 to stay under Modal's 5-cron free-plan cap). Four independent dedup layers (checkpoint, sheet filter, folder existence, Drive name-dedup) — the same `job_id` cannot produce duplicate artifacts even if checkpoints are wiped or two runs overlap. Date freshness on subsequent days is handled by `pipeline_daily_maintenance` (01:00 UTC = 03:00 CEST / 02:00 CET) which re-stamps every score≥6 cover letter to today and pushes the refresh to Drive without re-running the LLM.
 - A preflight check runs before any cloud LLM stage. Failures are emailed to `simonobemair@gmail.com` and the run aborts before burning tokens.
 - `_write_oauth_files()` validates secret presence + base64 decode up front; missing/rotated secrets produce clear `Modal secret missing: <NAME>` errors instead of `binascii.Error`.
 - `volume.commit()` runs after every stage so partial progress (e.g. CL done, CV crashes) survives a mid-run failure.

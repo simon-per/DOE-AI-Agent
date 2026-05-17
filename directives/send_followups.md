@@ -44,7 +44,13 @@ means most rows actually have a real `Contact_Email` to reach.
 - **DRY RUN by default**: must pass `--send` to actually send emails
 - **Cloud trigger**: on-demand only via `modal run execution/modal_pipeline.py::pipeline_send_followups`
   after verifying contact recipients
-- **LLM**: OpenRouter (Qwen3 235B) primary, Gemini 3 Flash fallback
+- **Low-confidence skip gate** (`send_followups.py:552`): rows with
+  `Contact_Confidence=low` are never auto-sent. This protects against Source 3
+  `Constructed` emails (pattern-inferred guesses, never verified against the
+  recipient inbox) reaching the wrong person. Reviewer must either replace the
+  `Contact_Email` with a verified address (then clear the confidence cell, or set
+  to `high`/`medium`) or trigger the send manually after sanity-checking.
+- **LLM**: DeepSeek V4 Flash primary, Qwen3 235B fallback (all via OpenRouter — single billing surface)
 - **Temperature**: 0.3 (slightly creative but consistent)
 - **Rate limit**: 5s between email sends
 - **Sender**: Configured via Gmail OAuth (the authenticated account)
