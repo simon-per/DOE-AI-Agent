@@ -12,7 +12,7 @@ Deletion modes:
       - Score <= --max-score (empty Score is ignored / treated as unknown).
     Rows with neither date parseable AND no low score are kept (safe default).
 
-  Applied age-out (default: 60 days):
+  Applied age-out (default: 45 days):
     Status=Applied rows are deleted when Date_Applied is older than
     --applied-days and no response/interview marker is present. This clears
     ghosted applications without touching rows that have outcome evidence.
@@ -21,7 +21,7 @@ Usage:
     python -m execution.prune_stale_jobs --dry-run
     python -m execution.prune_stale_jobs --yes
     python -m execution.prune_stale_jobs --days 30 --max-score 4 --yes
-    python -m execution.prune_stale_jobs --applied-days 60 --dry-run
+    python -m execution.prune_stale_jobs --applied-days 45 --dry-run
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ log = logging.getLogger("prune_stale_jobs")
 DEFAULT_SHEET_NAME = "Swiss Job Search Pipeline"
 DEFAULT_STATUSES = "New,Rejected"
 DEFAULT_UNCONDITIONAL_STATUSES = "Expired,Duplicate,Irrelevant"
-DEFAULT_APPLIED_DAYS = 60
+DEFAULT_APPLIED_DAYS = 45
 DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y")
 YES_VALUES = {"yes", "y", "true", "1", "ja", "j", "x"}
 

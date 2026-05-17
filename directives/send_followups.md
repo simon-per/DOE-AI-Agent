@@ -37,7 +37,7 @@ means most rows actually have a real `Contact_Email` to reach.
 - **Cadence (fixed)**: 3 / 6 / 12 business days since `Date_Applied`. Each row may
   receive up to 3 touches total. After touch 3, no further follow-ups are sent —
   `prune_stale_jobs` eventually prunes old `Applied` rows after the separate
-  `--applied-days` window (default 60 calendar days) when no response/interview
+  `--applied-days` window (default 45 calendar days) when no response/interview
   marker exists.
 - **Maximum wait**: 30 calendar days (configurable via `--max-days`). Sanity guard
   for very stale rows; covers touch 3 (12 bd ≈ 17 cal days) plus weekend slack.
