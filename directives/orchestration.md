@@ -14,12 +14,12 @@ Stage 4.5: Contacts   → Discover Contact_Email + Contact_Person from 5 free so
 Stage 5:   CV         → PDF + DOCX tailored CVs
 Stage 6:   Follow-up  → 3-touch sequence (3 / 6 / 12 business days)
 Stage 7:   Swarm      → Browser-based auto-apply (HITL)
-+ Weekly digest       → Reply-rate metrics emailed every Sunday evening
++ Weekly digest       → Reply-rate metrics emailed on demand
 ```
 
 ## Execution Model: Cloud vs Local
 
-The full preparation pipeline (Stages 1–6 + Stage 4.5 + weekly digest) runs
+The full preparation pipeline (Stages 1–6 + Stage 4.5) runs
 autonomously on Modal. Drive is the canonical fresh source for cover letters.
 The laptop runs Stage 7 (apply) plus one transitional cron that re-stamps the
 legacy local `.tmp/applications/` files for ad-hoc apply runs — both will
@@ -28,9 +28,9 @@ retire once Stage 7 fully reads from Drive.
 | Where | Stages | Trigger |
 |---|---|---|
 | **Modal (cloud)** | **1–5 + 4.5 (full pipeline, scrape → CV)** | **Tue+Thu 18:00 CEST cron** — `pipeline_full`, `--min-score 6`, no manual gate. CLs stamped with that day's date during generation; uploaded to Drive automatically. |
-| **Modal (cloud)** | 6 (send follow-ups, multi-touch) | Mon-Fri 08:00 CEST cron |
+| **Modal (cloud)** | 6 (send follow-ups, multi-touch) | On-demand only — `modal run execution/modal_pipeline.py::pipeline_send_followups` after verifying contacts |
 | **Modal (cloud)** | Maintenance: prune stale rows + archive Drive folders + reconcile orphans + cleanup orphan folders + hydrate Volume from Drive + re-stamp every score≥6 CL date → Drive | Daily 03:00 CEST / 02:00 CET — `pipeline_daily_maintenance`, `--min-score 6`, timeout 2h40m. Stages: `prune_stale_jobs --days 14 --archive-drive --reconcile-orphans` (deletes pruned Sheet rows, moves their Drive folders to `DOE Applications/_Archive/` with an `archived_at` stamp, then reconciles: any **active** J-* folder whose `job_id` is no longer in the Sheet — manual deletes, legacy state — is also archived with `archive_reason: orphan`. Layered safeguards: empty-sheet guard, 10% threshold guard, 12h grace period for in-flight uploads, override via `--force-reconcile`. Permanently deletes folders that have been in `_Archive/` for 14+ days) → `cleanup_orphan_application_folders --targets both --apply --yes` (fail-soft, no `--force`, deletes local/active-Drive folders absent from the Sheet only when safety gates pass) → `hydrate_volume_from_drive --since-days 365` (downloads any active DOE Applications/J-* folder Drive has but the Volume is missing — best-effort, never blocks the next stage) → `update_cover_letter_dates` (mutates the right-aligned date paragraph in the DOCX in place; re-renders the PDF via fpdf2 from the body cached in `letter_meta.json` — no LLM, no template re-build). On every cron firing the OAuth health check (`_check_oauth_health`) runs first; failure emails `[DOE pipeline OAUTH FAIL]` and stops the run, day-5/6 age sends a `[OAUTH WARN]`. Coverage gap >5% triggers an alert email. Success summary email closes each run with cleanup / hydrate / re-stamp / reconcile counts. Finishes before the 05:45 local apply window. |
-| **Modal (cloud)** | Weekly digest | Sun 18:00 CEST cron |
+| **Modal (cloud)** | Weekly digest | On-demand only — `modal run execution/modal_pipeline.py::pipeline_weekly_digest` |
 | **Local (Windows Task Scheduler)** | Re-stamp legacy local `.tmp/applications/` CL dates (transitional) | Daily 05:45 local — `DOE_UpdateCoverLetterDates`, `--skip-drive --min-score 6`. Drive untouched (Modal owns it). Retire when Stage 7 pulls from Drive. |
 | **Local (HITL)** | 7 (apply) | Run manually — Simon submits each application |
 
@@ -287,8 +287,9 @@ byte-for-byte to today's neutral salutation when no honorific is detected.
 - **Touch 2** — 6 bd: value-add angle (mention a relevant insight or offer to share more)
 - **Touch 3** — 12 bd: soft close (final note, leaves the door open, signals availability)
 
-**Cron:** Mon-Fri 08:00 CET. Each daily run picks up only the touches that came due that
-day; running again the same day is a no-op (touch_count already incremented).
+**Modal trigger:** `modal run execution/modal_pipeline.py::pipeline_send_followups`.
+Run only after verifying contact recipients. Each run picks up only touches due
+that day; running again the same day is a no-op (touch_count already incremented).
 
 **Backwards-compat:** rows from before Phase 2 with empty `Follow_Up_Count` and
 `Follow_Up_Sent=Yes` are interpreted as `touch_count=1` (touch 1 already done) → next
@@ -302,9 +303,9 @@ by Stage 4.5; user only needs to check the NOT_FOUND rows manually.
 - `--max-days 30` — skip rows older than this many calendar days (default 30)
 - `--reset-checkpoint` — clear local checkpoint and recheck all rows
 
-### Weekly digest (no manual trigger)
+### Weekly digest (on demand)
 **Script:** `execution/weekly_digest.py`
-**Cron:** Sun 18:00 CET — read-only on the sheet, sends one plaintext email
+**Modal trigger:** `modal run execution/modal_pipeline.py::pipeline_weekly_digest` — read-only on the sheet, sends one plaintext email
 **Output:** Reply rate by score band, by Contact_Source, by has-contact-name vs not;
 follow-up touch distribution; top 5 quality scores this week; trend vs prior 4 weeks.
 **Why it matters:** without outcome data, every "improvement" is a vibes call. After 2–3

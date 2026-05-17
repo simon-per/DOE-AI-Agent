@@ -42,7 +42,8 @@ means most rows actually have a real `Contact_Email` to reach.
 - **Maximum wait**: 30 calendar days (configurable via `--max-days`). Sanity guard
   for very stale rows; covers touch 3 (12 bd ≈ 17 cal days) plus weekend slack.
 - **DRY RUN by default**: must pass `--send` to actually send emails
-- **Cron (cloud)**: Mon-Fri 08:00 CET (06:00 UTC) — daily, weekdays only
+- **Cloud trigger**: on-demand only via `modal run execution/modal_pipeline.py::pipeline_send_followups`
+  after verifying contact recipients
 - **LLM**: OpenRouter (Qwen3 235B) primary, Gemini 3 Flash fallback
 - **Temperature**: 0.3 (slightly creative but consistent)
 - **Rate limit**: 5s between email sends
