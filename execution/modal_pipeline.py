@@ -135,6 +135,7 @@ WORKSPACE = Path("/root/workspace")
 TMP_DIR = WORKSPACE / ".tmp"
 STAGE_LOG_DIR = TMP_DIR / "stage_logs"
 ALERT_EMAIL = "simonobemair@gmail.com"
+MODAL_CV_PHOTO_PATH = WORKSPACE / "cv_photo.jpg"
 
 # Age cutoff for prune_stale_jobs (passed via --days). Aggressive vs the
 # script default of 30d because Swiss listings typically die within 1-2
@@ -205,6 +206,11 @@ def _write_oauth_files() -> None:
                 f"and update the secret in the Modal dashboard."
             ) from exc
         path.write_bytes(decoded)
+
+
+def _set_modal_cv_photo_path() -> None:
+    """Force CV generation to use the private photo baked into the Modal image."""
+    os.environ["CV_PHOTO_PATH"] = str(MODAL_CV_PHOTO_PATH)
 
 
 def _send_email(subject: str, body: str, to: str = ALERT_EMAIL) -> bool:
@@ -717,7 +723,7 @@ def pipeline_full() -> None:
     Per-stage volume.commit() preserves partial progress on mid-run failure.
     On any stage's non-zero exit _run() emails the alert mailbox and raises.
     """
-    os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
+    _set_modal_cv_photo_path()
     _pipeline_startup("pipeline_full", single_flight=True)
 
     try:
@@ -998,7 +1004,7 @@ def preflight() -> None:
 
     Invoke:  modal run execution/modal_pipeline.py::preflight
     """
-    os.environ.setdefault("CV_PHOTO_PATH", "/root/workspace/cv_photo.jpg")
+    _set_modal_cv_photo_path()
     _write_oauth_files()
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     _run("preflight.py", "--cloud", stage_label="preflight", timeout=270)

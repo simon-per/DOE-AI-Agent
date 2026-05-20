@@ -27,9 +27,11 @@ Auto-generate tailored CVs (PDF + DOCX) for high-scoring jobs, with Swiss format
 
 **Input:** `.tmp/scored_jobs.json`
 **Output:**
-- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_{company}.pdf`
-- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_{company}.docx`
-**Template:** `execution/cv_template.html` (PDF only; DOCX uses python-docx directly)
+- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair.pdf`
+- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair.docx`
+- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_ATS.pdf`
+- `.tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_ATS.docx`
+**Templates:** `execution/cv_template.html` and `execution/cv_template_ats.html` for PDFs; DOCX uses python-docx directly.
 
 ### Usage
 ```bash
@@ -72,19 +74,28 @@ Static: education, certs, languages, photo, personal info.
 - All content localized (DE/EN/IT) using same labels as PDF
 - **Purpose:** User can edit text, reorder sections, or customize before submitting
 
+### ATS Layout (PDF + DOCX)
+Parser-oriented layout with minimal styling:
+- Single main content flow for summary, skills, achievements, experience, projects, education, certifications, languages, and interests.
+- Header contains name, subtitle, contact/personal details on the left and the same profile photo on the right.
+- If `CV_PHOTO_PATH` or the default `.tmp/CV_picture 24.06.2025_sizeAdjusted.jpg` is missing, the ATS outputs render the existing text-only header.
+- Keep the experience `role_official` parenthetical inline with the role title for ATS parser compatibility.
+
 ### Output Structure (per job)
 ```
 .tmp/applications/{company}_{title}/
 ├── Cover_Letter_Simon_Oberpertinger_Mair_{company}.pdf
 ├── Cover_Letter_Simon_Oberpertinger_Mair_{company}.docx
-├── CV_Simon_Oberpertinger_Mair_{company}.pdf
-└── CV_Simon_Oberpertinger_Mair_{company}.docx
+├── CV_Simon_Oberpertinger_Mair.pdf
+├── CV_Simon_Oberpertinger_Mair.docx
+├── CV_Simon_Oberpertinger_Mair_ATS.pdf
+└── CV_Simon_Oberpertinger_Mair_ATS.docx
 ```
 
 ### Privacy
 - OpenRouter/Qwen3 receives anonymized profile (no name, email, phone, employer name)
 - Google Gemini receives full profile
-- Photo and PII are only in the PDF output, never sent to LLMs
+- Photo and PII are only in the final PDF/DOCX outputs, never sent to LLMs
 - **`role_official` is CV-display-only and must never appear in LLM prompts.** `Experience.official_line()` is the only authorized rendering path. If you add a new LLM-driven step, do NOT pass `role_official` to it — the contract title is intentionally stripped from both `profile_anonymous()` and `profile_full()`.
 
 ## Dependencies
@@ -120,3 +131,5 @@ After `pip install playwright`, run: `python -m playwright install chromium`
 - **Line-height for German (2026-02-11):** Body `line-height: 1.45` was too tight for German text (longer words, more umlauts). Increased to `line-height: 1.55` in `cv_template.html`.
 - **Photo path from env:** `CV_PHOTO_PATH` env var overrides the hardcoded photo path. Falls back to `.tmp/CV_picture 24.06.2025_sizeAdjusted.jpg`. Logs warning if photo not found.
 - **Empty parentheses in titles (2026-03-11):** Fixed in `clean_job_title()` — strips `()` left after percentage removal. Affects folder names and subject lines.
+- **ATS header photo (2026-05-20):** ATS PDF and DOCX intentionally include the same profile photo as the visual CV in a minimal header-right layout. This preserves the parser-oriented section flow while keeping Swiss applications visually complete. Missing-photo fallback remains text-only.
+- **Photo path robustness (2026-05-20):** Resolve relative `CV_PHOTO_PATH` values against the project root before `as_uri()` / DOCX embedding. ATS DOCX image insertion must catch unsupported or corrupt image errors so CV generation still succeeds.

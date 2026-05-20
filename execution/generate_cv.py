@@ -7,7 +7,8 @@ Primary: OpenRouter (Qwen3 235B) - reliable, paid (low cost, no rate limits)
 Fallback: Google AI Studio (Gemini 3 Flash) - free but rate-limited
 
 Input:  .tmp/scored_jobs.json
-Output: .tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_{company}.pdf + .docx
+Output: .tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair.pdf + .docx
+        .tmp/applications/{company}_{title}/CV_Simon_Oberpertinger_Mair_ATS.pdf + .docx
 
 Usage:
     python execution/generate_cv.py
@@ -48,15 +49,22 @@ logging.getLogger("fontTools").setLevel(logging.WARNING)
 TMP_DIR = PROJECT_ROOT / ".tmp"
 INPUT_FILE = TMP_DIR / "scored_jobs.json"
 OUTPUT_DIR = TMP_DIR / "applications"
-# Photo path: check env var first, fallback to default
-_photo_env = os.getenv("CV_PHOTO_PATH", "").strip()
-PHOTO_PATH = Path(_photo_env) if _photo_env else TMP_DIR / "CV_picture 24.06.2025_sizeAdjusted.jpg"
-if not PHOTO_PATH.exists():
-    log.warning(
-        f"CV photo not found: {PHOTO_PATH}. "
-        f"Set CV_PHOTO_PATH in .env or place file at expected path. "
-        f"CVs will be generated without photo."
-    )
+
+
+def _configured_photo_path() -> Path:
+    """Resolve CV_PHOTO_PATH relative to the project, or use the default photo."""
+    photo_env = os.getenv("CV_PHOTO_PATH", "").strip()
+    if photo_env:
+        path = Path(photo_env).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path.resolve(strict=False)
+
+    return (TMP_DIR / "CV_picture 24.06.2025_sizeAdjusted.jpg").resolve(strict=False)
+
+
+PHOTO_PATH = _configured_photo_path()
+_PHOTO_WARNING_EMITTED = False
 TEMPLATE_DIR = Path(__file__).resolve().parent
 CHECKPOINT_FILE = TMP_DIR / "cv_checkpoint.json"
 
@@ -75,6 +83,31 @@ from execution.utils import (
     has_cv_outputs,
 )
 from execution.profile_loader import load_profile as _load_profile
+
+
+def _get_photo_path() -> Path | None:
+    """Return the configured profile photo path, logging a missing file once."""
+    global _PHOTO_WARNING_EMITTED
+
+    if PHOTO_PATH.exists():
+        return PHOTO_PATH
+
+    if not _PHOTO_WARNING_EMITTED:
+        log.warning(
+            f"CV photo not found: {PHOTO_PATH}. "
+            f"Set CV_PHOTO_PATH in .env or place file at expected path. "
+            f"CVs will be generated without photo."
+        )
+        _PHOTO_WARNING_EMITTED = True
+    return None
+
+
+def _resolve_photo_uri() -> str:
+    """Return the local profile photo as a file URI, or empty string if missing."""
+    photo_path = _get_photo_path()
+    if photo_path:
+        return photo_path.as_uri()
+    return ""
 
 CV_TAILOR_PROMPT = """You are tailoring a CV for a specific job application.
 
@@ -293,15 +326,9 @@ def generate_cv_pdf(
     projects: list[dict] | None = None,
 ) -> Path:
     """Render the CV HTML template to PDF via Playwright (headless Chromium)."""
+    output_path = Path(output_path).resolve(strict=False)
     env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
     template = env.get_template("cv_template.html")
-
-    # Resolve photo as file:// URI for the browser
-    photo_uri = ""
-    if PHOTO_PATH.exists():
-        photo_uri = PHOTO_PATH.as_uri()
-    else:
-        log.warning(f"  CV photo not found: {PHOTO_PATH} — CV will be generated without photo")
 
     labels = _get_labels(lang_code)
     if experience_bullets is None:
@@ -313,7 +340,7 @@ def generate_cv_pdf(
 
     html_content = template.render(
         lang_code=lang_code,
-        photo_path=photo_uri,
+        photo_path=_resolve_photo_uri(),
         labels=labels,
         skills=skills,
         languages=languages,
@@ -657,7 +684,7 @@ def generate_cv_docx(
 
 
 # ---------------------------------------------------------------------------
-# ATS-friendly CV generation (single-column, no photo, no graphics)
+# ATS-friendly CV generation (parser-oriented layout with optional header photo)
 # ---------------------------------------------------------------------------
 
 def _get_certifications(lang_code: str) -> list[dict]:
@@ -678,7 +705,8 @@ def generate_cv_ats_pdf(
     achievements: list[dict] | None = None,
     projects: list[dict] | None = None,
 ) -> Path:
-    """Render ATS-friendly CV (single-column, no graphics) to PDF via Playwright."""
+    """Render ATS-friendly CV to PDF via Playwright."""
+    output_path = Path(output_path).resolve(strict=False)
     env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
     template = env.get_template("cv_template_ats.html")
 
@@ -692,6 +720,7 @@ def generate_cv_ats_pdf(
 
     html_content = template.render(
         lang_code=lang_code,
+        photo_path=_resolve_photo_uri(),
         labels=labels,
         skills=skills,
         languages=languages,
@@ -742,10 +771,12 @@ def generate_cv_ats_docx(
     achievements: list[dict] | None = None,
     projects: list[dict] | None = None,
 ) -> Path:
-    """Generate ATS-friendly CV as DOCX (single column, no table, no graphics)."""
+    """Generate ATS-friendly CV as DOCX with a minimal header photo when available."""
     from docx import Document
     from docx.shared import Pt, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml.ns import qn
 
     labels = _get_labels(lang_code)
     if experience_bullets is None:
@@ -794,14 +825,29 @@ def generate_cv_ats_docx(
         p.space_after = space_after
         return p
 
-    # --- Name + Subtitle ---
-    p = doc.add_paragraph()
-    run = p.add_run(_p.name)
-    run.bold = True
-    run.font.size = Pt(16)
-    p.space_after = Pt(0)
+    def add_cell_text(cell, text, size=Pt(9), bold=False, space_after=Pt(2)):
+        p = cell.add_paragraph()
+        run = p.add_run(text)
+        run.font.size = size
+        run.bold = bold
+        p.space_after = space_after
+        return p
 
-    add_text(subtitle, size=Pt(10), space_after=Pt(4))
+    def remove_table_borders(table):
+        tbl = table._tbl
+        tbl_pr = tbl.tblPr if tbl.tblPr is not None else tbl.makeelement(qn("w:tblPr"), {})
+        borders = tbl_pr.makeelement(qn("w:tblBorders"), {})
+        for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            border = borders.makeelement(qn(f"w:{border_name}"), {
+                qn("w:val"): "none",
+                qn("w:sz"): "0",
+                qn("w:space"): "0",
+                qn("w:color"): "auto",
+            })
+            borders.append(border)
+        tbl_pr.append(borders)
+        if tbl.tblPr is None:
+            tbl.append(tbl_pr)
 
     # --- Contact info (plain text, no hyperlinks) ---
     contact_lines = [
@@ -810,8 +856,55 @@ def generate_cv_ats_docx(
         f"{labels['date_of_birth']}: {_p.dob} | {labels['nationality']}: {labels['nationality_value']} | {labels['permit']}: {labels['permit_value']}",
         f"{labels['availability_label']}: {labels['availability_value']} | {labels['license_label']}: {labels['license_value']}",
     ]
-    for line in contact_lines:
-        add_text(line, size=Pt(8.5), space_after=Pt(1))
+
+    # --- Header ---
+    photo_path = _get_photo_path()
+    if photo_path:
+        table = doc.add_table(rows=1, cols=2)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        left_width = Cm(13.2)
+        right_width = Cm(3.3)
+        table.columns[0].width = left_width
+        table.columns[1].width = right_width
+        remove_table_borders(table)
+
+        left = table.cell(0, 0)
+        right = table.cell(0, 1)
+        left.width = left_width
+        right.width = right_width
+        left.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+        right.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+
+        left.paragraphs[0].text = ""
+        p = left.paragraphs[0]
+        run = p.add_run(_p.name)
+        run.bold = True
+        run.font.size = Pt(16)
+        p.space_after = Pt(0)
+
+        add_cell_text(left, subtitle, size=Pt(10), space_after=Pt(4))
+        for line in contact_lines:
+            add_cell_text(left, line, size=Pt(8.5), space_after=Pt(1))
+
+        photo_p = right.paragraphs[0]
+        photo_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        photo_p.space_after = Pt(0)
+        try:
+            photo_run = photo_p.add_run()
+            photo_run.add_picture(str(photo_path), width=Cm(3.0))
+        except Exception as e:
+            log.warning(f"Could not embed CV photo in ATS DOCX ({photo_path}): {e}")
+    else:
+        p = doc.add_paragraph()
+        run = p.add_run(_p.name)
+        run.bold = True
+        run.font.size = Pt(16)
+        p.space_after = Pt(0)
+
+        add_text(subtitle, size=Pt(10), space_after=Pt(4))
+        for line in contact_lines:
+            add_text(line, size=Pt(8.5), space_after=Pt(1))
 
     # --- Summary ---
     add_heading(labels["summary_heading"])
@@ -1081,7 +1174,7 @@ def generate_cv_for_job(
         result["pdf_path"] = str(pdf_path)
         result["docx_path"] = str(docx_path)
 
-    # ATS-friendly CV (single-column, no photo, no graphics)
+    # ATS-friendly CV (parser-oriented layout with optional header photo)
     if not skip_ats:
         ats_pdf_path = OUTPUT_DIR / folder_name / f"CV_{safe_name}_ATS.pdf"
         ats_pdf = generate_cv_ats_pdf(

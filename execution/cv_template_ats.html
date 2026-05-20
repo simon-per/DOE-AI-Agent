@@ -26,6 +26,31 @@
     margin: 0 auto;
   }
 
+  .header {
+    display: flex;
+    align-items: flex-start;
+    gap: 8mm;
+    margin-bottom: 2mm;
+  }
+
+  .header-main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .header-photo {
+    flex: 0 0 28mm;
+    text-align: right;
+  }
+
+  .header-photo img {
+    width: 26mm;
+    height: 26mm;
+    object-fit: cover;
+    border-radius: 50%;
+    border: 1px solid #555;
+  }
+
   h1 {
     font-size: 16pt;
     font-weight: 700;
@@ -42,7 +67,7 @@
   .contact-block {
     font-size: 8.5pt;
     color: #333;
-    margin-bottom: 1.5mm;
+    margin-bottom: 0;
     line-height: 1.6;
   }
 
@@ -172,14 +197,24 @@
 <body>
 <div class="page">
 
-  <h1>{{ personal.name }}</h1>
-  <div class="subtitle">{{ subtitle }}</div>
+  <div class="header">
+    <div class="header-main">
+      <h1>{{ personal.name }}</h1>
+      <div class="subtitle">{{ subtitle }}</div>
 
-  <div class="contact-block">
-    {{ personal.email }} | {{ personal.phone }} | {{ labels.location_value }}<br>
-    LinkedIn: {{ personal.linkedin }} | GitHub: {{ personal.github }}<br>
-    {{ labels.date_of_birth }}: {{ cv_dob }} | {{ labels.nationality }}: {{ labels.nationality_value }} | {{ labels.permit }}: {{ labels.permit_value }}<br>
-    {{ labels.availability_label }}: {{ labels.availability_value }} | {{ labels.license_label }}: {{ labels.license_value }}
+      <div class="contact-block">
+        {{ personal.email }} | {{ personal.phone }} | {{ labels.location_value }}<br>
+        LinkedIn: {{ personal.linkedin }} | GitHub: {{ personal.github }}<br>
+        {{ labels.date_of_birth }}: {{ cv_dob }} | {{ labels.nationality }}: {{ labels.nationality_value }} | {{ labels.permit }}: {{ labels.permit_value }}<br>
+        {{ labels.availability_label }}: {{ labels.availability_value }} | {{ labels.license_label }}: {{ labels.license_value }}
+      </div>
+    </div>
+
+    {% if photo_path %}
+    <div class="header-photo">
+      <img src="{{ photo_path }}" alt="Profile photo">
+    </div>
+    {% endif %}
   </div>
 
   <h2>{{ labels.summary_heading }}</h2>
