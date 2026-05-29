@@ -485,18 +485,41 @@ def matching_pattern_keys(pattern_map: dict[str, list[str]], text: str) -> list[
     return [key for key, patterns in pattern_map.items() if any_pattern(patterns, text)]
 
 
+def _live_commute_lookup(city: str) -> tuple[int, str] | None:
+    """Live ORS lookup, no-op when no API key is configured. Imported lazily
+    so the static path keeps working without dotenv / network / sqlite3 setup."""
+    try:
+        from execution.commute_scoring import is_enabled, live_commute_minutes
+    except Exception:  # noqa: BLE001 - never let scoring break on import errors
+        return None
+    if not is_enabled():
+        return None
+    query = city if "," in city else f"{city}, Switzerland"
+    try:
+        result = live_commute_minutes(query)
+    except Exception:  # noqa: BLE001 - network/HTTP/SQLite errors never abort scoring
+        return None
+    if result is None:
+        return None
+    return result.minutes, result.mode
+
+
 def estimate_commute(city: str, override_minutes: int | None = None) -> tuple[int | None, str, str]:
     if override_minutes is not None:
         minutes = override_minutes
         mode = "manual override"
     else:
-        normalized_city = normalize_for_match(city)
-        minutes = None
-        mode = "unknown"
-        for candidate, estimate in sorted(COMMUTE_ESTIMATES.items(), key=lambda item: len(item[0]), reverse=True):
-            if normalize_for_match(candidate) in normalized_city:
-                minutes, mode = estimate
-                break
+        live = _live_commute_lookup(city) if city else None
+        if live is not None:
+            minutes, mode = live
+        else:
+            normalized_city = normalize_for_match(city)
+            minutes = None
+            mode = "unknown"
+            for candidate, estimate in sorted(COMMUTE_ESTIMATES.items(), key=lambda item: len(item[0]), reverse=True):
+                if normalize_for_match(candidate) in normalized_city:
+                    minutes, mode = estimate
+                    break
 
     if minutes is None:
         return None, "unknown", mode

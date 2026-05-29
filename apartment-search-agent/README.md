@@ -87,6 +87,21 @@ type .tmp/batch.txt | python execution/manual_paste.py --dry-run
 
 Block format is documented in `execution/manual_paste.py`'s docstring.
 
+## Live Commute Scoring (Optional)
+
+Without setup the pipeline scores commute against a hand-curated city →
+minutes lookup. Setting `OPENROUTESERVICE_API_KEY` in `.env` switches the
+scorer to live e-bike routing against PHENOGY's coordinates, with a SQLite
+cache (`data/commute_cache.sqlite`) so each address only hits the API once.
+
+```powershell
+python execution/commute_scoring.py "Buchrain, Switzerland"
+# -> 'Buchrain, Switzerland': 22 min via e-bike (live) (6.4 km)
+```
+
+If the API is missing, rate-limited, or down, scoring silently falls back
+to the static table — listings never break for lack of routing.
+
 The script creates/updates `data/listings.sqlite`, dedupes listings, scores commute/rent/WG fit, flags exclusions and scam risk, and writes:
 
 - `data/application_queue.csv`
