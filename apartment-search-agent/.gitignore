@@ -1,0 +1,14 @@
+.env
+.tmp/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite
+data/application_queue.csv
+data/message_drafts.md
+credentials.json
+token.json
