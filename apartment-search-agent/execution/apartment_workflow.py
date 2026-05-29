@@ -38,6 +38,8 @@ from execution.apartment_pipeline import (  # noqa: E402
     print_queue,
     safe_daily_plan,
 )
+import imaplib  # noqa: E402
+
 from execution.email_alert_ingest import (  # noqa: E402
     DEFAULT_BATCH_LIMIT as EMAILS_DEFAULT_LIMIT,
     DEFAULT_DAYS as EMAILS_DEFAULT_DAYS,
@@ -230,8 +232,9 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
                     f"updated={email_stats.listings_updated}, "
                     f"skipped={email_stats.listings_skipped}"
                 )
-            except SystemExit as exc:
-                # Missing credentials should not abort the rest of the workflow.
+            except (SystemExit, imaplib.IMAP4.error, OSError) as exc:
+                # Missing/invalid creds or transient IMAP/network errors should
+                # surface a clear note but never abort the rest of the workflow.
                 print(f"Email alert ingestion unavailable: {exc}")
 
         if args.skip_export:

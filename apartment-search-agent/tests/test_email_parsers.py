@@ -168,6 +168,49 @@ class FlatfoxParserTest(_UrlExtractionMixin, unittest.TestCase):
     listing_url = "https://flatfox.ch/en/flat/luzern/abc-def/"
 
 
+class FooterAndSearchPageRejectionTest(unittest.TestCase):
+    """Saved-search alerts always include footer / search-page links that
+    look almost like listings. The patterns must reject them or every alert
+    pollutes the tracker with bogus rows."""
+
+    def test_wgzimmer_rejects_search_page_url(self) -> None:
+        msg = make_message(
+            sender="no-reply@wgzimmer.ch",
+            html="<a href='https://www.wgzimmer.ch/wgzimmer/search/mate'>all results</a>",
+        )
+        self.assertEqual(WGZimmerParser().parse(msg), [])
+
+    def test_homegate_rejects_landing_pages(self) -> None:
+        msg = make_message(
+            sender="news@homegate.ch",
+            html=(
+                "<a href='https://www.homegate.ch/rent'>view all results</a>"
+                "<a href='https://www.homegate.ch/mieten/luzern'>category</a>"
+            ),
+        )
+        self.assertEqual(HomegateParser().parse(msg), [])
+
+    def test_newhome_rejects_search_results_url(self) -> None:
+        msg = make_message(
+            sender="noreply@newhome.ch",
+            html=(
+                "<a href='https://www.newhome.ch/de/mieten/suchen/wohnung/kanton_luzern'>"
+                "search</a>"
+            ),
+        )
+        self.assertEqual(NewhomeParser().parse(msg), [])
+
+    def test_immoscout24_rejects_search_results_url(self) -> None:
+        msg = make_message(
+            sender="noreply@immoscout24.ch",
+            html=(
+                "<a href='https://www.immoscout24.ch/de/d/wohnung-mieten/luzern'>"
+                "all listings</a>"
+            ),
+        )
+        self.assertEqual(ImmoScout24Parser().parse(msg), [])
+
+
 class RawTextCarriesSubjectTest(unittest.TestCase):
     def test_subject_prefixes_raw_text(self) -> None:
         url = "https://www.homegate.ch/rent/4002233"

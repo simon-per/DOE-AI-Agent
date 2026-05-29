@@ -17,6 +17,7 @@ import argparse
 import email
 import imaplib
 import os
+import re
 import sqlite3
 import sys
 from contextlib import closing
@@ -124,11 +125,18 @@ def record_seen(
 
 def connect_imap(host: str, address: str, password: str, mailbox: str) -> imaplib.IMAP4_SSL:
     client = imaplib.IMAP4_SSL(host)
-    client.login(address, password)
-    status, _ = client.select(mailbox, readonly=True)
-    if status != "OK":
-        client.logout()
-        raise SystemExit(f"Could not select mailbox {mailbox!r}: status={status}")
+    try:
+        client.login(address, password)
+        status, _ = client.select(mailbox, readonly=True)
+        if status != "OK":
+            raise SystemExit(f"Could not select mailbox {mailbox!r}: status={status}")
+    except BaseException:
+        # Make sure we don't leak the SSL socket if login or select fails.
+        try:
+            client.shutdown()
+        except (imaplib.IMAP4.error, OSError):
+            pass
+        raise
     return client
 
 
@@ -180,11 +188,15 @@ def message_identifier(msg: Message, uid: bytes) -> str:
     return mid or f"imap-uid:{uid.decode('ascii', 'replace')}"
 
 
+_SENDER_DOMAIN_RE = re.compile(r"@([\w.-]+)")
+
+
 def dump_unrouted(msg: Message, uid: bytes) -> Path:
     UNROUTED_DUMP_DIR.mkdir(parents=True, exist_ok=True)
-    sender = (msg.get("From") or "unknown").replace("/", "_").replace("\\", "_")
-    safe_sender = "".join(ch for ch in sender if ch.isalnum() or ch in "._-@")[:60]
-    target = UNROUTED_DUMP_DIR / f"unrouted_{safe_sender}_{uid.decode('ascii', 'replace')}.eml"
+    domain_match = _SENDER_DOMAIN_RE.search(msg.get("From") or "")
+    sender_label = (domain_match.group(1) if domain_match else "unknown")[:40]
+    safe_label = "".join(ch for ch in sender_label if ch.isalnum() or ch in ".-_")
+    target = UNROUTED_DUMP_DIR / f"unrouted_{safe_label or 'unknown'}_{uid.decode('ascii', 'replace')}.eml"
     target.write_bytes(msg.as_bytes())
     return target
 
@@ -204,6 +216,13 @@ def listing_input_from_parsed(parsed, fallback_subject: str) -> ListingInput:
     )
 
 
+@dataclass(frozen=True)
+class MessageOutcome:
+    touched: int
+    parsed_ok: bool
+    parser_source: str | None
+
+
 def process_message(
     msg: Message,
     uid: bytes,
@@ -212,8 +231,12 @@ def process_message(
     *,
     dry_run: bool,
     verbose: bool,
-) -> int:
-    """Returns the number of listings created or updated from this message."""
+) -> MessageOutcome:
+    """Parse one message and upsert listings; returns parse status for the caller.
+
+    `parsed_ok=False` means the caller must NOT mark this message as seen — a
+    later code fix should be able to retry without `--reprocess`.
+    """
     from_header = msg.get("From") or ""
     parser = parser_for_sender(from_header)
     if parser is None:
@@ -224,7 +247,9 @@ def process_message(
                 print(f"  unrouted: from={from_header!r} dumped={dumped}")
         elif verbose:
             print(f"  unrouted: from={from_header!r} (dry-run, not dumped)")
-        return 0
+        # Unrouted messages still get recorded so we don't re-dump them every
+        # run; the dump itself is the artifact for parser-registry extension.
+        return MessageOutcome(touched=0, parsed_ok=True, parser_source=None)
 
     try:
         parsed_listings = parser.parse(msg)
@@ -232,7 +257,7 @@ def process_message(
         stats.errors.append(f"parse-error from={from_header!r}: {exc!r}")
         if verbose:
             print(f"  parse error: {exc!r}")
-        return 0
+        return MessageOutcome(touched=0, parsed_ok=False, parser_source=parser.source)
 
     stats.routed += 1
     subject = (msg.get("Subject") or "").strip()
@@ -261,7 +286,7 @@ def process_message(
                 f"{parser.source} {scored.decision} score={scored.priority_score} "
                 f"{parsed.url}"
             )
-    return touched
+    return MessageOutcome(touched=touched, parsed_ok=True, parser_source=parser.source)
 
 
 def iter_messages(
@@ -298,7 +323,7 @@ def sync_email_alerts(args: argparse.Namespace) -> IngestStats:
                     if args.verbose:
                         print(f"  skip: already processed message_id={identifier}")
                     continue
-                touched = process_message(
+                outcome = process_message(
                     msg,
                     uid,
                     conn,
@@ -306,10 +331,15 @@ def sync_email_alerts(args: argparse.Namespace) -> IngestStats:
                     dry_run=args.dry_run,
                     verbose=args.verbose,
                 )
-                if not args.dry_run:
-                    parser = parser_for_sender(msg.get("From") or "")
-                    source_label = parser.source if parser else "unknown"
-                    record_seen(conn, identifier, source_label, touched)
+                # Only mark seen when parsing succeeded — a parse failure must
+                # remain retryable after a code fix without `--reprocess`.
+                if not args.dry_run and outcome.parsed_ok:
+                    record_seen(
+                        conn,
+                        identifier,
+                        outcome.parser_source or "unknown",
+                        outcome.touched,
+                    )
             if not args.dry_run:
                 conn.commit()
         finally:

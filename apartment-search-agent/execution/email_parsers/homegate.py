@@ -13,8 +13,9 @@ class HomegateParser(BaseEmailParser):
         re.compile(r"[@.]homegate\.ch\b", re.IGNORECASE),
     )
     imap_search_domains = ("homegate.ch",)
-    # Homegate listing detail pages: /rent/<id> or /mieten/<id> or /buy/<id>.
+    # Detail pages end with the numeric listing id. Require it so /rent (the
+    # alert footer "all results" link) and similar landing pages don't match.
     listing_url_pattern = re.compile(
-        r"homegate\.ch/(?:rent|mieten|buy|kaufen)/[^\s\"'>]+",
+        r"homegate\.ch/(?:rent|mieten|buy|kaufen)/\d+",
         re.IGNORECASE,
     )

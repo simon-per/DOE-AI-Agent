@@ -13,8 +13,9 @@ class ImmoScout24Parser(BaseEmailParser):
         re.compile(r"[@.]immoscout24\.ch\b", re.IGNORECASE),
     )
     imap_search_domains = ("immoscout24.ch",)
-    # ImmoScout24 detail pages: /Mietobjekt/<id> or /de/d/wohnung-mieten/...
+    # Detail pages end with a numeric id. Require it so the alert footer's
+    # /de/d/wohnungen-mieten/luzern (search page) doesn't match.
     listing_url_pattern = re.compile(
-        r"immoscout24\.ch/(?:Mietobjekt|Kaufobjekt|de/d|fr/d|it/d|en/d)/[^\s\"'>]+",
+        r"immoscout24\.ch/(?:(?:Miet|Kauf)objekt/\d+|(?:de|fr|it|en)/d/[a-z0-9-]+/\d+)",
         re.IGNORECASE,
     )

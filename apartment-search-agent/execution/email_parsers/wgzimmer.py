@@ -14,8 +14,9 @@ class WGZimmerParser(BaseEmailParser):
         re.compile(r"[@.]wgzimmer\.com\b", re.IGNORECASE),
     )
     imap_search_domains = ("wgzimmer.ch", "wgzimmer.com")
-    # WGZimmer ad pages look like /wgzimmer/search/mate/ad/<uuid>.html
+    # WGZimmer ad pages look like /wgzimmer/search/mate/ad/<id>.html — require
+    # the ad/ segment + .html suffix so search-results pages don't match.
     listing_url_pattern = re.compile(
-        r"wgzimmer\.ch/wgzimmer/(?:search/)?(?:mate|wohnung)/(?:ad/)?[^\s\"'>]+",
+        r"wgzimmer\.ch/wgzimmer/(?:search/)?(?:mate|wohnung)/ad/[A-Za-z0-9._-]+\.html",
         re.IGNORECASE,
     )

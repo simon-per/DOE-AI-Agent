@@ -13,8 +13,9 @@ class NewhomeParser(BaseEmailParser):
         re.compile(r"[@.]newhome\.ch\b", re.IGNORECASE),
     )
     imap_search_domains = ("newhome.ch",)
-    # Newhome detail pages live under /de/mieten/.../id-<digits> or /de/kaufen/...
+    # Detail pages always carry the id-<digits> token. Anchor on that so the
+    # /suchen and /agentur footer links in every alert don't false-positive.
     listing_url_pattern = re.compile(
-        r"newhome\.ch/(?:de|fr|it|en)/(?:mieten|kaufen)/[^\s\"'>]+",
+        r"newhome\.ch/(?:de|fr|it|en)/(?:mieten|kaufen)/[^\s\"'>]*?id-\d+",
         re.IGNORECASE,
     )

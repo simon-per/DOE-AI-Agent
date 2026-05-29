@@ -1,4 +1,5 @@
 import argparse
+import imaplib
 import sqlite3
 import tempfile
 import unittest
@@ -148,6 +149,84 @@ class IngestRoutingTest(_IngestTestBase):
         self.assertEqual(count, 0)
         self.assertEqual(seen_count, 0)
 
+    def test_parse_error_keeps_message_retryable(self) -> None:
+        """A parser failure must NOT mark the message seen — a code fix should
+        re-process it without --reprocess."""
+        messages = [
+            make_email(
+                sender="news@homegate.ch",
+                subject="will explode",
+                html="<a href='https://www.homegate.ch/rent/4003333'>x</a>",
+                message_id="<retryable@fixture>",
+            ),
+        ]
+        fake = FakeIMAP(messages)
+
+        original = ingest.parser_for_sender
+
+        def explode(from_header):
+            parser = original(from_header)
+            if parser is not None:
+                # Wrap to raise from .parse(); preserves sender_patterns access.
+                class Exploder:
+                    source = parser.source
+                    sender_patterns = parser.sender_patterns
+                    imap_search_domains = parser.imap_search_domains
+
+                    def matches_sender(self, h):
+                        return parser.matches_sender(h)
+
+                    def parse(self, msg):
+                        raise RuntimeError("boom")
+
+                return Exploder()
+            return parser
+
+        with patch.object(ingest, "imap_credentials", return_value=("a@b.com", "pw")), \
+             patch.object(ingest, "connect_imap", return_value=fake), \
+             patch.object(ingest, "parser_for_sender", side_effect=explode):
+            stats = ingest.sync_email_alerts(self._build_args())
+
+        self.assertEqual(len(stats.errors), 1)
+        self.assertIn("boom", stats.errors[0])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            seen_count = conn.execute(
+                "SELECT COUNT(*) FROM email_alert_seen"
+            ).fetchone()[0]
+            listings_count = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        self.assertEqual(seen_count, 0, "parse failure must keep message retryable")
+        self.assertEqual(listings_count, 0)
+
+    def test_reprocess_updates_seen_row_via_on_conflict(self) -> None:
+        """--reprocess must hit the ON CONFLICT path and bump processed_at."""
+        messages = [
+            make_email(
+                sender="news@homegate.ch",
+                subject="Repeat alert",
+                html="<a href='https://www.homegate.ch/rent/4002222'>Wohnung</a>",
+                message_id="<reprocess@fixture>",
+            ),
+        ]
+        fake = FakeIMAP(messages)
+
+        with patch.object(ingest, "imap_credentials", return_value=("a@b.com", "pw")), \
+             patch.object(ingest, "connect_imap", return_value=fake):
+            ingest.sync_email_alerts(self._build_args())
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                first_ts = conn.execute(
+                    "SELECT processed_at FROM email_alert_seen "
+                    "WHERE message_id = ?", ("<reprocess@fixture>",),
+                ).fetchone()[0]
+            # Re-run with --reprocess to force the ON CONFLICT path.
+            ingest.sync_email_alerts(self._build_args(reprocess=True))
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT message_id, processed_at FROM email_alert_seen"
+                ).fetchall()
+
+        self.assertEqual(len(rows), 1, "ON CONFLICT must update, not insert")
+        self.assertGreaterEqual(rows[0][1], first_ts)
+
     def test_seen_table_dedupes_repeated_runs(self) -> None:
         messages = [
             make_email(
@@ -191,6 +270,35 @@ class ImapCredentialsTest(unittest.TestCase):
             addr, pwd = ingest.imap_credentials()
         self.assertEqual(addr, "x@y.com")
         self.assertEqual(pwd, "abcdefghijklmnop")
+
+
+class ConnectImapTest(unittest.TestCase):
+    """Lock down the compliance invariant: mailbox MUST be opened read-only."""
+
+    def test_select_is_readonly(self) -> None:
+        fake = FakeIMAP([])
+        with patch.object(ingest.imaplib, "IMAP4_SSL", return_value=fake):
+            client = ingest.connect_imap("imap.test", "u@v", "pw", "INBOX")
+        self.assertIs(client, fake)
+        self.assertTrue(fake.selected_readonly,
+                        "connect_imap must open the mailbox read-only")
+
+    def test_login_failure_closes_socket(self) -> None:
+        class FailingIMAP:
+            shutdown_called = False
+
+            def login(self, *_args):
+                raise imaplib.IMAP4.error("bad credentials")
+
+            def shutdown(self):
+                FailingIMAP.shutdown_called = True
+
+        failing = FailingIMAP()
+        with patch.object(ingest.imaplib, "IMAP4_SSL", return_value=failing):
+            with self.assertRaises(imaplib.IMAP4.error):
+                ingest.connect_imap("imap.test", "u@v", "wrong", "INBOX")
+        self.assertTrue(FailingIMAP.shutdown_called,
+                        "socket must be torn down on login failure")
 
 
 class HelperTest(unittest.TestCase):
