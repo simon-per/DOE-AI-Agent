@@ -19,6 +19,12 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"[ \t ]+")
 
 
+_RENT_RE = re.compile(
+    r"(?:CHF|Fr\.?)\s*([0-9][0-9'.,]{2,})|([0-9][0-9'.,]{2,})\s*(?:CHF|Fr\.?)",
+    re.IGNORECASE,
+)
+
+
 class ParseError(Exception):
     """Raised when an email matches a parser's sender but cannot be parsed."""
 
@@ -94,6 +100,45 @@ def dedupe_urls(urls: Iterable[str]) -> list[str]:
     return out
 
 
+_ANCHOR_TEMPLATE = (
+    r"<a\b[^>]*\bhref\s*=\s*[\"']{url}[\"'][^>]*>(?P<inner>.*?)</a>"
+)
+
+
+def extract_anchor_text(html: str, url: str) -> str | None:
+    """Return the visible text inside <a href="URL">...</a> if present.
+
+    Portal alerts usually wrap each listing URL in an anchor whose visible
+    text is the listing's headline (city, room count, rent). That's a much
+    better `title` than the digest-style subject we'd otherwise fall back to.
+    """
+    if not html or not url:
+        return None
+    pattern = _ANCHOR_TEMPLATE.format(url=re.escape(url))
+    match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    inner = html_to_text(match.group("inner")).strip()
+    return inner or None
+
+
+def extract_rent_chf(text: str) -> int | None:
+    """First CHF-tagged amount in `text`, normalized to int. Returns None
+    when nothing parseable shows up. Skips amounts under 100 (almost never
+    monthly rent) and over 10,000 (deposits and yearly figures rolled in)."""
+    if not text:
+        return None
+    for match in _RENT_RE.finditer(text):
+        raw = match.group(1) or match.group(2) or ""
+        cleaned = raw.replace("'", "").replace(".", "").replace(",", "")
+        if not cleaned.isdigit():
+            continue
+        value = int(cleaned)
+        if 100 <= value <= 10_000:
+            return value
+    return None
+
+
 class BaseEmailParser:
     """Parsers extract listing URLs on the portal's own domain and a context
     window for each. Subclasses set portal-specific identifiers."""
@@ -114,6 +159,27 @@ class BaseEmailParser:
         listing = (u for u in urls if self.listing_url_pattern.search(u))
         return dedupe_urls(listing)
 
+    def enrich(
+        self,
+        url: str,
+        window: str,
+        html: str,
+        anchor_text: str | None,
+        subject: str,
+    ) -> dict:
+        """Per-portal hook to extract rent/city/title/move_in.
+
+        Default behavior: anchor text → title (richer than subject), generic
+        CHF regex → rent_chf. Subclasses override to apply portal-specific
+        HTML structure when needed (e.g. tables in Homegate alerts).
+        """
+        return {
+            "title": anchor_text or subject or None,
+            "rent_chf": extract_rent_chf(window) or extract_rent_chf(subject),
+            "city": None,
+            "move_in": None,
+        }
+
     def parse(self, msg: Message) -> list[ParsedListing]:
         plain, html = extract_message_body(msg)
         text_from_html = html_to_text(html)
@@ -124,19 +190,21 @@ class BaseEmailParser:
         urls = self.listing_urls(url_source)
         if not urls:
             return []
+        subject = (msg.get("Subject") or "").strip()
         out: list[ParsedListing] = []
         for url in urls:
             window = context_window(combined, url)
-            subject = (msg.get("Subject") or "").strip()
             raw_text = "\n".join(part for part in (subject, window) if part)
+            anchor_text = extract_anchor_text(html, url)
+            fields = self.enrich(url, window, html, anchor_text, subject)
             out.append(
                 ParsedListing(
                     url=url,
                     source=self.source,
-                    title=subject or None,
-                    rent_chf=None,
-                    city=None,
-                    move_in=None,
+                    title=fields.get("title") or subject or None,
+                    rent_chf=fields.get("rent_chf"),
+                    city=fields.get("city"),
+                    move_in=fields.get("move_in"),
                     raw_text=raw_text,
                 )
             )

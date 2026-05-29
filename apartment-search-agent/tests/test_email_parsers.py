@@ -17,7 +17,9 @@ from execution.email_parsers.base import (
     BaseEmailParser,
     context_window,
     dedupe_urls,
+    extract_anchor_text,
     extract_message_body,
+    extract_rent_chf,
     html_to_text,
 )
 
@@ -77,6 +79,35 @@ class HelperTest(unittest.TestCase):
         plain, html = extract_message_body(msg)
         self.assertIn("plaintext body", plain)
         self.assertIn("<p>html body</p>", html)
+
+
+class StructuredExtractionHelperTest(unittest.TestCase):
+    def test_extract_anchor_text_returns_visible_text(self) -> None:
+        html = "<a href='https://example.test/x'>WG in Buchrain CHF 750</a>"
+        self.assertEqual(
+            extract_anchor_text(html, "https://example.test/x"),
+            "WG in Buchrain CHF 750",
+        )
+
+    def test_extract_anchor_text_returns_none_when_url_absent(self) -> None:
+        self.assertIsNone(extract_anchor_text("<a href='other'>x</a>", "missing"))
+        self.assertIsNone(extract_anchor_text("", "any"))
+
+    def test_extract_rent_chf_parses_chf_prefix(self) -> None:
+        self.assertEqual(extract_rent_chf("CHF 850"), 850)
+        self.assertEqual(extract_rent_chf("CHF 1'250"), 1250)
+        self.assertEqual(extract_rent_chf("Fr. 720"), 720)
+        self.assertEqual(extract_rent_chf("720 CHF"), 720)
+
+    def test_extract_rent_chf_skips_implausible_amounts(self) -> None:
+        # Numbers under 100 (e.g. apartment number "12") and over 10_000
+        # (annual/deposit lump) shouldn't be picked.
+        self.assertIsNone(extract_rent_chf("Wohnung Nr. 12 CHF"))
+        self.assertIsNone(extract_rent_chf("CHF 25000 Jahresmiete"))
+
+    def test_extract_rent_chf_handles_empty(self) -> None:
+        self.assertIsNone(extract_rent_chf(""))
+        self.assertIsNone(extract_rent_chf("no money mentioned"))
 
 
 class ParserDispatchTest(unittest.TestCase):
@@ -281,8 +312,24 @@ class RawTextCarriesSubjectTest(unittest.TestCase):
         )
         parsed = HomegateParser().parse(msg)
         self.assertEqual(len(parsed), 1)
+        # Subject still feeds the raw_text the apartment_pipeline scores from.
         self.assertIn("Neue Inserate", parsed[0].raw_text)
-        self.assertEqual(parsed[0].title, "Neue Inserate: Wohnung in Luzern CHF 920")
+        # Structured extraction now prefers anchor text for the title and pulls
+        # the rent from the subject/window.
+        self.assertEqual(parsed[0].title, "open listing")
+        self.assertEqual(parsed[0].rent_chf, 920)
+
+    def test_anchor_text_wins_when_richer_than_subject(self) -> None:
+        url = "https://www.homegate.ch/rent/4002244"
+        msg = make_message(
+            sender="news@homegate.ch",
+            subject="Homegate alert",
+            html=f"<a href='{url}'>2.5 Zimmer in Buchrain, CHF 1'250</a>",
+        )
+        parsed = HomegateParser().parse(msg)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].title, "2.5 Zimmer in Buchrain, CHF 1'250")
+        self.assertEqual(parsed[0].rent_chf, 1250)
 
 
 if __name__ == "__main__":
