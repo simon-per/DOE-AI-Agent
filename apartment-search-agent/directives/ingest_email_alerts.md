@@ -4,7 +4,8 @@
 
 Pull new apartment listings into the local tracker from saved-search email
 alerts on portals that block direct scraping. As of 2026-05-29 this covers
-**WGZimmer, Homegate, Newhome, ImmoScout24, and Flatfox**.
+**WGZimmer, Homegate, Newhome, ImmoScout24, Flatfox, Comparis, Anibis,
+Tutti, and Ronorp**.
 
 This is the compliant alternative to scraping those portals — each one
 returns HTTP 403 to direct requests, and `directives/anti_ban_rules.md`
@@ -82,6 +83,18 @@ Set up these searches once. They're free on every portal.
 
 **Flatfox.ch** — public API path is primary, but alert subscriptions back
 up the API in case it lags. No special filters needed.
+
+**Comparis.ch** — "Suchabo" with Luzern + Zug, max CHF 1000, mieten.
+
+**Anibis.ch** — "Suchabo speichern" on the apartment-rental category for
+Luzern/Zug. Anibis includes private and small-portal listings the larger
+portals miss.
+
+**Tutti.ch** — "Suchauftrag" on the immobilien category for Luzern. Often
+the source for private one-room sublets.
+
+**Ronorp.net** — "Insert-Alarm" on the Zentralschweiz wohnen category.
+Strong source for Luzern WG rooms specifically.
 
 ## Parser registry
 

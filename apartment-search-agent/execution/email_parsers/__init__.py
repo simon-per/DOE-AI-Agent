@@ -7,11 +7,15 @@ to normalize and score.
 
 from __future__ import annotations
 
+from .anibis import AnibisParser
 from .base import BaseEmailParser, ParseError, ParsedListing
+from .comparis import ComparisParser
 from .flatfox import FlatfoxParser
 from .homegate import HomegateParser
 from .immoscout24 import ImmoScout24Parser
 from .newhome import NewhomeParser
+from .ronorp import RonorpParser
+from .tutti import TuttiParser
 from .wgzimmer import WGZimmerParser
 
 REGISTERED_PARSERS: tuple[BaseEmailParser, ...] = (
@@ -20,6 +24,10 @@ REGISTERED_PARSERS: tuple[BaseEmailParser, ...] = (
     NewhomeParser(),
     ImmoScout24Parser(),
     FlatfoxParser(),
+    ComparisParser(),
+    AnibisParser(),
+    TuttiParser(),
+    RonorpParser(),
 )
 
 

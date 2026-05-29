@@ -2,10 +2,14 @@ import unittest
 from email.message import EmailMessage
 
 from execution.email_parsers import (
+    AnibisParser,
+    ComparisParser,
     FlatfoxParser,
     HomegateParser,
     ImmoScout24Parser,
     NewhomeParser,
+    RonorpParser,
+    TuttiParser,
     WGZimmerParser,
     parser_for_sender,
 )
@@ -83,6 +87,10 @@ class ParserDispatchTest(unittest.TestCase):
             "alert@newhome.ch": NewhomeParser,
             "noreply@immoscout24.ch": ImmoScout24Parser,
             "owner.foo@user.flatfox.ch": FlatfoxParser,
+            "noreply@comparis.ch": ComparisParser,
+            "alerts@anibis.ch": AnibisParser,
+            "no-reply@tutti.ch": TuttiParser,
+            "info@ronorp.net": RonorpParser,
         }
         for from_header, expected_cls in cases.items():
             with self.subTest(from_header=from_header):
@@ -168,6 +176,30 @@ class FlatfoxParserTest(_UrlExtractionMixin, unittest.TestCase):
     listing_url = "https://flatfox.ch/en/flat/luzern/abc-def/"
 
 
+class ComparisParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = ComparisParser()
+    sender = "noreply@comparis.ch"
+    listing_url = "https://www.comparis.ch/immobilien/marktplatz/details/show/123456789"
+
+
+class AnibisParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = AnibisParser()
+    sender = "alerts@anibis.ch"
+    listing_url = "https://www.anibis.ch/de/d/wohnung-mieten-luzern-3-zimmer-44556677"
+
+
+class TuttiParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = TuttiParser()
+    sender = "no-reply@tutti.ch"
+    listing_url = "https://www.tutti.ch/de/a/55667788"
+
+
+class RonorpParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = RonorpParser()
+    sender = "info@ronorp.net"
+    listing_url = "https://www.ronorp.net/zentralschweiz/ronorp/inserate/wohnen/wg-zimmer-luzern-998877"
+
+
 class FooterAndSearchPageRejectionTest(unittest.TestCase):
     """Saved-search alerts always include footer / search-page links that
     look almost like listings. The patterns must reject them or every alert
@@ -209,6 +241,34 @@ class FooterAndSearchPageRejectionTest(unittest.TestCase):
             ),
         )
         self.assertEqual(ImmoScout24Parser().parse(msg), [])
+
+    def test_comparis_rejects_marketplace_landing(self) -> None:
+        msg = make_message(
+            sender="noreply@comparis.ch",
+            html="<a href='https://www.comparis.ch/immobilien/marktplatz/luzern'>all</a>",
+        )
+        self.assertEqual(ComparisParser().parse(msg), [])
+
+    def test_anibis_rejects_category_landing(self) -> None:
+        msg = make_message(
+            sender="alerts@anibis.ch",
+            html="<a href='https://www.anibis.ch/de/c/immobilien/wohnung-mieten'>cat</a>",
+        )
+        self.assertEqual(AnibisParser().parse(msg), [])
+
+    def test_tutti_rejects_category_landing(self) -> None:
+        msg = make_message(
+            sender="no-reply@tutti.ch",
+            html="<a href='https://www.tutti.ch/de/li/luzern/immobilien'>cat</a>",
+        )
+        self.assertEqual(TuttiParser().parse(msg), [])
+
+    def test_ronorp_rejects_category_landing(self) -> None:
+        msg = make_message(
+            sender="info@ronorp.net",
+            html="<a href='https://www.ronorp.net/zentralschweiz/ronorp/inserate/wohnen'>cat</a>",
+        )
+        self.assertEqual(RonorpParser().parse(msg), [])
 
 
 class RawTextCarriesSubjectTest(unittest.TestCase):

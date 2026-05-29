@@ -81,6 +81,10 @@ Saved-search setup is per-portal (do once):
 - [ ] Homegate.ch — "Suchabo" for Luzern, ≤ CHF 1000, Wohnung/Studio/WG-Zimmer
 - [ ] Newhome.ch — "Suchauftrag" with same filters
 - [ ] ImmoScout24.ch — "Suchauftrag" Luzern/Zug ≤ CHF 1000
+- [ ] Comparis.ch — "Suchabo" Luzern/Zug ≤ CHF 1000
+- [ ] Anibis.ch — "Suchabo speichern" apartment-rental Luzern/Zug
+- [ ] Tutti.ch — "Suchauftrag" immobilien Luzern
+- [ ] Ronorp.net — "Insert-Alarm" Zentralschweiz wohnen
 
 Commands:
 
