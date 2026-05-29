@@ -77,6 +77,16 @@ python execution/apartment_pipeline.py daily-plan --daily-limit 10 --site-daily-
 python execution/apartment_pipeline.py export
 ```
 
+For multiple listings at once (Facebook groups, private leads, any portal
+without an alert path), use the batch CLI — paste blocks separated by `===`:
+
+```powershell
+python execution/manual_paste.py --file .tmp/batch.txt --verbose
+type .tmp/batch.txt | python execution/manual_paste.py --dry-run
+```
+
+Block format is documented in `execution/manual_paste.py`'s docstring.
+
 The script creates/updates `data/listings.sqlite`, dedupes listings, scores commute/rent/WG fit, flags exclusions and scam risk, and writes:
 
 - `data/application_queue.csv`
