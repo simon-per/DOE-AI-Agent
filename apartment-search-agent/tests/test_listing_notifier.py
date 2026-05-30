@@ -129,6 +129,21 @@ class NotifySelectionTest(_DbTest):
         result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
         self.assertEqual(result.candidates, 1)
 
+    def test_expired_status_excluded(self) -> None:
+        # A taken-down listing the liveness reconcile marked 'expired' must not
+        # appear in the morning brief.
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="apply-expired")
+            conn.execute(
+                "UPDATE listings SET status='expired', expired_at='2026-05-26T00:00:00+00:00' "
+                "WHERE canonical_key=?",
+                ("apply-expired",),
+            )
+            conn.commit()
+            _insert(conn, key="apply-live")
+        result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
+        self.assertEqual(result.candidates, 1)
+
     def test_promoted_listing_via_updated_at_window(self) -> None:
         # Reviewer H1: a row created 30d ago (outside the 7d window) but
         # re-scored/promoted to apply today (fresh updated_at) must still surface.

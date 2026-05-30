@@ -14,6 +14,7 @@ from execution.apartment_pipeline import (
     estimate_commute,
     extract_rent,
     init_db,
+    list_queue,
     mark_sent,
     normalize_listing,
     rescore_all,
@@ -523,6 +524,94 @@ class RescoreTest(unittest.TestCase):
                 rescored, changed = rescore_all(conn)
         self.assertEqual(rescored, 1)
         self.assertIn(changed, (0, 1))
+
+
+class FreshnessTest(unittest.TestCase):
+    """last_seen stamping, expiry reactivation, and expired-row exclusion."""
+
+    def _listing(self, **kw) -> ListingInput:
+        defaults = dict(
+            url="https://flatfox.ch/en/flat/test/777/",
+            source="flatfox.ch",
+            title="WG Root",
+            rent_chf=780,
+            city="Root",
+            move_in="16.07.",
+            contact_name=None,
+            contact_email=None,
+            raw_text="ruhig sauber Anmeldung",
+            commute_minutes=None,
+        )
+        defaults.update(kw)
+        return ListingInput(**defaults)
+
+    def test_insert_stamps_last_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db)) as conn:
+                init_db(conn)
+                lid, created = upsert_listing(conn, score_listing(normalize_listing(self._listing())))
+                row = conn.execute(
+                    "SELECT last_seen, created_at, expired_at FROM listings WHERE id = ?", (lid,)
+                ).fetchone()
+        self.assertTrue(created)
+        self.assertIsNotNone(row["last_seen"])
+        self.assertEqual(row["last_seen"], row["created_at"])
+        self.assertIsNone(row["expired_at"])
+
+    def test_resighting_reactivates_expired_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db)) as conn:
+                init_db(conn)
+                lid, _ = upsert_listing(conn, score_listing(normalize_listing(self._listing())))
+                conn.execute(
+                    "UPDATE listings SET status='expired', expired_at='2026-05-26T00:00:00+00:00', "
+                    "last_seen='2026-05-20T00:00:00+00:00' WHERE id = ?",
+                    (lid,),
+                )
+                conn.commit()
+                # Same canonical_key -> updates the existing row.
+                lid2, created = upsert_listing(conn, score_listing(normalize_listing(self._listing())))
+                row = conn.execute(
+                    "SELECT status, expired_at, last_seen FROM listings WHERE id = ?", (lid,)
+                ).fetchone()
+        self.assertEqual(lid2, lid)
+        self.assertFalse(created)
+        self.assertEqual(row["status"], "new")          # reactivated
+        self.assertIsNone(row["expired_at"])            # expiry cleared
+        self.assertNotEqual(row["last_seen"], "2026-05-20T00:00:00+00:00")  # refreshed
+
+    def test_resighting_does_not_resurrect_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db)) as conn:
+                init_db(conn)
+                lid, _ = upsert_listing(conn, score_listing(normalize_listing(self._listing())))
+                approve_listing(conn, lid, note="ok")
+                mark_sent(conn, lid, note="sent")
+                upsert_listing(conn, score_listing(normalize_listing(self._listing())))
+                status = conn.execute("SELECT status FROM listings WHERE id = ?", (lid,)).fetchone()[0]
+        self.assertEqual(status, "sent")  # sent_at wins over the expired->new flip
+
+    def test_expired_excluded_from_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db)) as conn:
+                init_db(conn)
+                # Distinct content (title/rent/url) so they don't dedupe together.
+                keep, _ = upsert_listing(conn, score_listing(normalize_listing(self._listing(
+                    url="https://flatfox.ch/en/flat/a/1/", title="WG Root A", rent_chf=780))))
+                gone, _ = upsert_listing(conn, score_listing(normalize_listing(self._listing(
+                    url="https://flatfox.ch/en/flat/b/2/", title="WG Root B", rent_chf=820))))
+                conn.execute(
+                    "UPDATE listings SET status='expired', expired_at='2026-05-26T00:00:00+00:00' WHERE id = ?",
+                    (gone,),
+                )
+                conn.commit()
+                ids = {row["id"] for row in list_queue(conn, limit=50)}
+        self.assertIn(keep, ids)
+        self.assertNotIn(gone, ids)
 
 
 if __name__ == "__main__":

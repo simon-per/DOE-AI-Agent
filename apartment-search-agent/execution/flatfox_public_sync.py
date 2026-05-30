@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 import urllib.error
@@ -19,6 +20,7 @@ import urllib.parse
 import urllib.request
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from execution.apartment_pipeline import (  # noqa: E402
     init_db,
     normalize_for_match,
     normalize_listing,
+    now_iso,
     score_listing,
     upsert_listing,
 )
@@ -114,6 +117,35 @@ class SyncStats:
         for key, value in changes.items():
             values[key] += value
         return SyncStats(**values)
+
+
+@dataclass(frozen=True)
+class ReconcileStats:
+    candidates: int = 0    # actionable + stale rows considered
+    checked: int = 0       # rows actually queried (parseable pk, in a valid batch)
+    still_active: int = 0  # API confirms still live -> last_seen refreshed
+    expired: int = 0       # API confirms gone -> status='expired'
+    skipped: int = 0       # unparseable pk, or a failed/ambiguous batch (fail-safe)
+
+    def add(self, **changes: int) -> "ReconcileStats":
+        values = self.__dict__.copy()
+        for key, value in changes.items():
+            values[key] += value
+        return ReconcileStats(**values)
+
+
+_FLATFOX_PK_RE = re.compile(r"/(\d+)/?$")
+
+
+def flatfox_pk_from_url(url: str | None) -> int | None:
+    """Parse the trailing numeric listing id from a Flatfox URL (they end
+    ``/<pk>/``). Returns None when not parseable, so the caller skips that row
+    rather than risk a wrong expiry."""
+    if not url:
+        return None
+    path = urllib.parse.urlsplit(url).path
+    match = _FLATFOX_PK_RE.search(path)
+    return int(match.group(1)) if match else None
 
 
 def full_url(base_url: str, path_or_url: str) -> str:
@@ -528,6 +560,141 @@ def sync_flatfox_public(args: argparse.Namespace) -> SyncStats:
     return stats
 
 
+def reconcile_active_listings(
+    conn,
+    client: FlatfoxPublicClient,
+    *,
+    stale_hours: float = 20.0,
+    max_checks: int = 60,
+    batch_size: int = 25,
+    page_limit: int = 100,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> ReconcileStats:
+    """Confirm still-actionable Flatfox listings are live; expire the ones the API
+    says are gone.
+
+    The sync pages a *global* feed capped at a few pages, so "absent from the
+    feed" never proves a listing is gone. This instead asks the documented API
+    about specific listing ``pk``s and expires only those it confirms are no
+    longer active. It is **fail-safe**: an API/network error or an ambiguous
+    response (pk filter ignored) skips the batch — it never expires on doubt.
+    """
+    init_db(conn)
+    cutoff = (datetime.now(UTC) - timedelta(hours=stale_hours)).replace(microsecond=0).isoformat()
+    rows = conn.execute(
+        """
+        SELECT id, url, canonical_url, city, last_seen
+        FROM listings
+        WHERE source LIKE 'flatfox%'
+          AND decision IN ('apply', 'consider', 'manual_review')
+          AND status = 'new'
+          AND expired_at IS NULL
+          AND (last_seen IS NULL OR last_seen < ?)
+        ORDER BY (last_seen IS NULL) DESC, last_seen ASC, id ASC
+        LIMIT ?
+        """,
+        (cutoff, int(max_checks)),
+    ).fetchall()
+
+    stats = ReconcileStats(candidates=len(rows))
+
+    targets: list[tuple[int, int, str]] = []  # (listing_id, pk, city)
+    for row in rows:
+        pk = flatfox_pk_from_url(row["url"]) or flatfox_pk_from_url(row["canonical_url"])
+        if pk is None:
+            stats = stats.add(skipped=1)
+            if verbose:
+                print(f"skip id={row['id']}: no pk parseable from url")
+            continue
+        targets.append((int(row["id"]), pk, row["city"] or "?"))
+
+    if dry_run:
+        print(
+            f"[reconcile] {len(targets)} candidate(s) would be liveness-checked "
+            f"(stale>{stale_hours}h, cap {max_checks}) — no API calls:"
+        )
+        for listing_id, pk, city in targets:
+            print(f"   id={listing_id} pk={pk} {city}")
+        return stats
+
+    now = now_iso()
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start : start + batch_size]
+        requested = {pk for _, pk, _ in batch}
+        url = build_public_listing_url(
+            client.base_url, limit=page_limit, offset=0, status="act", pk=sorted(requested)
+        )
+        try:
+            body = client.get_json(url)
+        except (FlatfoxApiError, OSError) as exc:
+            # Fail-safe: never expire on an API/network error.
+            stats = stats.add(skipped=len(batch))
+            print(
+                f"[reconcile] liveness batch failed, skipping {len(batch)} listing(s): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        returned = {
+            int(item["pk"])
+            for item in (body.get("results") or [])
+            if item.get("pk") is not None
+        }
+        # Validity guard: a response containing pks we did not request means the
+        # pk filter was ignored — inconclusive, so skip the whole batch.
+        if not returned <= requested:
+            stats = stats.add(skipped=len(batch))
+            print(
+                f"[reconcile] ambiguous response (pk filter ignored), "
+                f"skipping {len(batch)} listing(s).",
+                file=sys.stderr,
+            )
+            continue
+        for listing_id, pk, city in batch:
+            stats = stats.add(checked=1)
+            if pk in returned:
+                conn.execute(
+                    "UPDATE listings SET last_seen = ? WHERE id = ?", (now, listing_id)
+                )
+                stats = stats.add(still_active=1)
+            else:
+                conn.execute(
+                    "UPDATE listings SET status = 'expired', expired_at = ? WHERE id = ?",
+                    (now, listing_id),
+                )
+                stats = stats.add(expired=1)
+                if verbose:
+                    print(f"expired id={listing_id} pk={pk} {city}")
+        conn.commit()
+
+    return stats
+
+
+def run_reconcile(args: argparse.Namespace) -> ReconcileStats:
+    client = FlatfoxPublicClient(
+        base_url=args.base_url,
+        timeout_seconds=args.timeout_seconds,
+        max_retries=args.max_retries,
+    )
+    with closing(connect(args.db)) as conn:
+        stats = reconcile_active_listings(
+            conn,
+            client,
+            stale_hours=args.stale_hours,
+            max_checks=args.max_checks,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+    print(
+        "Flatfox liveness reconcile complete: "
+        f"candidates={stats.candidates}, checked={stats.checked}, "
+        f"still_active={stats.still_active}, expired={stats.expired}, "
+        f"skipped={stats.skipped}"
+        + (" (dry-run, no API calls)" if args.dry_run else "")
+    )
+    return stats
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch documented Flatfox public listings and ingest relevant ones into the local tracker."
@@ -571,11 +738,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-over-budget", action="store_true")
     parser.add_argument("--include-unknown-rent", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+
+    # Liveness reconcile (per-pk expiry of taken-down listings).
+    parser.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help="Skip ingestion; only run the per-pk Flatfox liveness reconcile (expire gone listings).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --reconcile-only: list candidate listings and make zero API calls.",
+    )
+    parser.add_argument(
+        "--stale-hours",
+        type=float,
+        default=20.0,
+        help="Only liveness-check listings not re-seen within this many hours (default 20).",
+    )
+    parser.add_argument(
+        "--max-checks",
+        type=int,
+        default=60,
+        help="Cap on listings liveness-checked per reconcile run (default 60).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.reconcile_only:
+        if args.max_checks < 1:
+            raise SystemExit("--max-checks must be at least 1.")
+        run_reconcile(args)
+        return 0
     if args.max_pages < 1:
         raise SystemExit("--max-pages must be at least 1.")
     if args.limit < 1 or args.limit > 100:

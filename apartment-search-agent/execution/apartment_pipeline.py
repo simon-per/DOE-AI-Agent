@@ -1007,6 +1007,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE listings ADD COLUMN openrouter_score INTEGER")
     if "openrouter_reason" not in columns:
         conn.execute("ALTER TABLE listings ADD COLUMN openrouter_reason TEXT")
+    if "last_seen" not in columns:
+        # Last time this listing was confirmed live in its source feed (stamped on
+        # every re-sighting, independent of updated_at). Drives freshness/expiry.
+        conn.execute("ALTER TABLE listings ADD COLUMN last_seen TEXT")
+    if "expired_at" not in columns:
+        # Set when a per-pk Flatfox liveness check (flatfox_public_sync.reconcile_
+        # active_listings) confirms the listing is gone; cleared if it reappears.
+        conn.execute("ALTER TABLE listings ADD COLUMN expired_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_listings_content_key ON listings(content_key)"
     )
@@ -1160,6 +1168,7 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
         "address": n.get("address") or "",
         "created_at": timestamp,
         "updated_at": timestamp,
+        "last_seen": timestamp,
     }
 
     existing = conn.execute(
@@ -1229,9 +1238,16 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 END,
                 status = CASE
                     WHEN sent_at IS NOT NULL THEN status
+                    WHEN status = 'expired' THEN 'new'
                     WHEN :reset_approval = 1 THEN 'new'
                     ELSE status
                 END,
+                -- Re-sighting refreshes liveness: a re-listed flat that was
+                -- expired comes back to 'new' (above), and the expiry stamp is
+                -- always cleared. last_seen is bumped independently of
+                -- updated_at so a daily re-sync doesn't widen the notifier window.
+                last_seen = :last_seen,
+                expired_at = NULL,
                 -- notified_at is intentionally NOT reset on re-ingest: a
                 -- re-scored row keeps its "already emailed" stamp so
                 -- listing_notifier never re-sends. Its candidate window admits
@@ -1257,7 +1273,8 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 decision, recommended_action, priority_score, commute_class,
                 commute_minutes, commute_mode, price_score, wg_fit_score,
                 gender_status, scam_risk, flags_json, message_variant,
-                message_draft, latitude, longitude, address, created_at, updated_at
+                message_draft, latitude, longitude, address, created_at, updated_at,
+                last_seen
             )
             VALUES (
                 :canonical_key, :content_key, :canonical_url, :url, :source, :title, :rent_chf,
@@ -1265,7 +1282,8 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 :decision, :recommended_action, :priority_score, :commute_class,
                 :commute_minutes, :commute_mode, :price_score, :wg_fit_score,
                 :gender_status, :scam_risk, :flags_json, :message_variant,
-                :message_draft, :latitude, :longitude, :address, :created_at, :updated_at
+                :message_draft, :latitude, :longitude, :address, :created_at, :updated_at,
+                :last_seen
             )
             """,
             payload,
@@ -1318,7 +1336,7 @@ def list_queue(conn: sqlite3.Connection, limit: int, include_skip: bool = False)
         SELECT *
         FROM listings
         WHERE decision IN ({placeholders})
-          AND status NOT IN ('sent', 'archived')
+          AND status NOT IN ('sent', 'archived', 'expired')
         ORDER BY
           CASE decision
             WHEN 'apply' THEN 0

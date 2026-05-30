@@ -21,6 +21,7 @@ from execution.google_sheets_sync import (
     SUMMARY_SHEET,
     SETTINGS_SHEET,
     cleanup_worksheets_gspread,
+    enrich_listing_row,
     load_google_client,
     build_workbook_values,
     load_google_service,
@@ -76,6 +77,24 @@ class GoogleSheetsSyncTest(unittest.TestCase):
             self.assertIn("system_decision", workbook[PIPELINE_SHEET][0])
             self.assertIn("final_message", workbook[PIPELINE_SHEET][0])
             self.assertEqual(workbook[SUMMARY_SHEET][0], ["metric", "value"])
+
+    def test_enrich_is_active_and_last_seen_reflect_freshness(self) -> None:
+        live = enrich_listing_row({
+            "id": 1, "status": "new", "sent_at": None, "decision": "consider",
+            "created_at": "2026-05-28T00:00:00+00:00",
+            "last_seen": "2026-05-30T00:00:00+00:00",
+        })
+        self.assertEqual(live["is_active"], "yes")
+        self.assertEqual(live["last_seen"], "2026-05-30T00:00:00+00:00")
+
+        expired = enrich_listing_row({
+            "id": 2, "status": "expired", "sent_at": None, "decision": "consider",
+            "created_at": "2026-05-28T00:00:00+00:00",
+            "expired_at": "2026-05-29T00:00:00+00:00",
+            "last_seen": "2026-05-28T00:00:00+00:00",
+        })
+        self.assertEqual(expired["is_active"], "no")  # expired -> not active
+        self.assertEqual(expired["first_seen"], "2026-05-28T00:00:00+00:00")
 
     def test_dry_run_does_not_load_google_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

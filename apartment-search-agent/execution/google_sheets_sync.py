@@ -449,8 +449,13 @@ def enrich_listing_row(row: dict[str, Any]) -> dict[str, Any]:
             "message_hash": message_hash(row.get("message_draft")),
             "description_excerpt": short_excerpt(row.get("raw_text")),
             "first_seen": row.get("created_at"),
-            "last_seen": row.get("updated_at"),
-            "is_active": "yes" if not row.get("sent_at") and row.get("status") != "archived" else "no",
+            # Real liveness now: last_seen is stamped on every re-sighting, and a
+            # listing the Flatfox liveness check expired (or that was sent/archived)
+            # is no longer active.
+            "last_seen": row.get("last_seen") or row.get("updated_at"),
+            "is_active": "no" if (
+                row.get("sent_at") or row.get("status") in ("archived", "expired")
+            ) else "yes",
             "duplicate_of": "",
         }
     )
@@ -509,7 +514,7 @@ def queue_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         SELECT *
         FROM listings
         WHERE decision IN ('apply', 'consider', 'manual_review')
-          AND status NOT IN ('sent', 'archived')
+          AND status NOT IN ('sent', 'archived', 'expired')
         ORDER BY
           CASE decision
             WHEN 'apply' THEN 0
@@ -581,7 +586,7 @@ def application_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def default_pipeline_status(row: dict[str, Any]) -> str:
     tracker_status = str(row.get("status") or "")
     decision = str(row.get("decision") or "")
-    if tracker_status in {"sent", "archived"}:
+    if tracker_status in {"sent", "archived", "expired"}:
         return tracker_status
     if decision == "skip":
         return "irrelevant"

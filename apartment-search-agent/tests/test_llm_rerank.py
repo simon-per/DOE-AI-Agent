@@ -222,6 +222,23 @@ class RunTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(post.call_count, 2)
 
+    def test_expired_consider_row_not_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = self._db(tmpdir)
+            with closing(connect(db_path)) as conn:
+                init_db(conn)
+                live, gone = _seed_consider(conn, n=2)
+                conn.execute(
+                    "UPDATE listings SET status='expired', expired_at='2026-05-26T00:00:00+00:00' "
+                    "WHERE id=?",
+                    (gone,),
+                )
+                conn.commit()
+                candidates = lr.select_candidates(conn, 40)
+            ids = {row["id"] for row in candidates}
+        self.assertIn(live, ids)
+        self.assertNotIn(gone, ids)
+
     def test_no_candidates_is_clean_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = self._db(tmpdir)

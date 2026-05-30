@@ -86,7 +86,7 @@ def fetch_candidates(conn, since: str, max_rows: int) -> list[dict]:
         FROM listings
         WHERE decision = ?
           AND notified_at IS NULL
-          AND status NOT IN ('sent', 'archived')
+          AND status NOT IN ('sent', 'archived', 'expired')
           AND (created_at >= ? OR updated_at >= ?)
         ORDER BY priority_score DESC, created_at DESC
         LIMIT ?

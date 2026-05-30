@@ -104,7 +104,7 @@ def select_candidates(conn, limit: int) -> list[dict[str, Any]]:
         """
         SELECT * FROM listings
         WHERE decision = 'consider'
-          AND status NOT IN ('sent', 'archived')
+          AND status NOT IN ('sent', 'archived', 'expired')
         ORDER BY priority_score DESC, id ASC
         LIMIT ?
         """,

@@ -82,7 +82,7 @@ def tracker_counts(db_path: Path) -> dict[str, int]:
             "queue": """
                 SELECT COUNT(*) FROM listings
                 WHERE decision IN ('apply', 'consider', 'manual_review')
-                  AND status NOT IN ('sent', 'archived')
+                  AND status NOT IN ('sent', 'archived', 'expired')
             """,
             "apply": "SELECT COUNT(*) FROM listings WHERE decision = 'apply'",
             "consider": "SELECT COUNT(*) FROM listings WHERE decision = 'consider'",
