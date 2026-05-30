@@ -18,6 +18,7 @@ to a logged no-op and scoring is completely unaffected.
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import os
 import re
@@ -78,15 +79,17 @@ def fetch_candidates(conn, since: str, max_rows: int) -> list[dict]:
     rows = conn.execute(
         """
         SELECT id, title, city, rent_chf, commute_class, commute_minutes,
-               commute_mode, priority_score, url, canonical_url, move_in, created_at
+               commute_mode, priority_score, url, canonical_url, move_in,
+               message_draft, wg_fit_score, price_score, contact_email, source,
+               recommended_action, decision, created_at, updated_at
         FROM listings
         WHERE decision = ?
           AND notified_at IS NULL
-          AND created_at >= ?
+          AND (created_at >= ? OR updated_at >= ?)
         ORDER BY priority_score DESC, created_at DESC
         LIMIT ?
         """,
-        (NOTIFY_DECISION, cutoff, max_rows),
+        (NOTIFY_DECISION, cutoff, cutoff, max_rows),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -97,38 +100,118 @@ def _commute_text(row: dict) -> str:
     return f"{minutes} min ({mode})" if minutes is not None else str(mode)
 
 
-def format_summary(rows: list[dict]) -> tuple[str, str]:
+def _rent_text(row: dict) -> str:
+    return f"CHF {row['rent_chf']}" if row.get("rent_chf") else "rent n/a"
+
+
+def _headline(index: int, row: dict) -> str:
+    title = (row.get("title") or "Untitled listing").strip()
+    move_in = f" · frei ab {row['move_in']}" if row.get("move_in") else ""
+    klass = row.get("commute_class") or "?"
+    return f"{index}. [{klass}] {title} · {_rent_text(row)} · {_commute_text(row)}{move_in}"
+
+
+def _meta_text(row: dict) -> str:
+    wg = row.get("wg_fit_score")
+    wg_text = f"WG-fit {wg}" if wg is not None else "WG-fit ?"
+    return (
+        f"   {row.get('city') or '?'} · {wg_text} · "
+        f"price: {row.get('price_score') or '?'} · via {row.get('source') or '?'}"
+    )
+
+
+def format_summary(rows: list[dict]) -> tuple[str, str, str]:
+    """Return (subject, text_body, html_body). Each listing is a complete action
+    packet: headline, meta, apply link/contact, and the ready-to-send draft."""
     count = len(rows)
     plural = "s" if count != 1 else ""
     subject = f"Apartment search — {count} new apply-tier listing{plural}"
-    lines = [f"{count} new apply-tier listing{plural} near Root D4:", ""]
+
+    text = [f"{count} new apply-tier listing{plural} near Root D4.", ""]
     for index, row in enumerate(rows, start=1):
-        rent = f"CHF {row['rent_chf']}" if row.get("rent_chf") else "rent n/a"
-        city = row.get("city") or "?"
-        title = (row.get("title") or "Untitled listing").strip()
         url = row.get("url") or row.get("canonical_url") or "(no url)"
-        move_in = f" · frei ab {row['move_in']}" if row.get("move_in") else ""
-        klass = row.get("commute_class") or "?"
-        lines.append(f"{index}. [{klass}] {title}")
-        lines.append(f"   {city} · {rent} · {_commute_text(row)}{move_in}")
-        lines.append(f"   {url}")
-        lines.append("")
-    lines.append("These are decision=apply rows — you still review and send each one.")
-    return subject, "\n".join(lines)
+        text.append(_headline(index, row))
+        text.append(_meta_text(row))
+        text.append(f"   Apply: {url}")
+        if row.get("contact_email"):
+            text.append(f"   Email: {row['contact_email']}")
+        text.append("   ----- ready-to-send draft -----")
+        for line in (row.get("message_draft") or "").strip().splitlines():
+            text.append(f"   {line}" if line else "")
+        text.append("   --------------------------------")
+        text.append("")
+    text.append("decision=apply rows — review and send each one yourself.")
+
+    return subject, "\n".join(text), _format_html(rows, count, plural)
+
+
+def _format_html(rows: list[dict], count: int, plural: str) -> str:
+    blocks = [
+        f"<p>{count} new apply-tier listing{plural} near Root D4. "
+        "You still review and send each one.</p>"
+    ]
+    for index, row in enumerate(rows, start=1):
+        url = row.get("url") or row.get("canonical_url") or ""
+        klass = html.escape(row.get("commute_class") or "?")
+        title = html.escape((row.get("title") or "Untitled listing").strip())
+        rent = html.escape(_rent_text(row))
+        commute = html.escape(_commute_text(row))
+        city = html.escape(row.get("city") or "?")
+        wg = row.get("wg_fit_score")
+        wg_text = f"WG-fit {wg}" if wg is not None else "WG-fit ?"
+        price = html.escape(str(row.get("price_score") or "?"))
+        source = html.escape(row.get("source") or "?")
+        move_in = (
+            f" · frei ab {html.escape(str(row['move_in']))}" if row.get("move_in") else ""
+        )
+        draft = html.escape((row.get("message_draft") or "").strip())
+        apply_html = (
+            f'<a href="{html.escape(url, quote=True)}">Apply &#9656;</a>'
+            if url else "(no url)"
+        )
+        contact = ""
+        if row.get("contact_email"):
+            email = html.escape(row["contact_email"])
+            contact = f' · <a href="mailto:{html.escape(row["contact_email"], quote=True)}">{email}</a>'
+        blocks.append(
+            f"<h3>{index}. [{klass}] {title}</h3>"
+            f"<p>{city} · {rent} · {commute}{move_in}<br>"
+            f"{wg_text} · price: {price} · via {source}<br>"
+            f"{apply_html}{contact}</p>"
+            f'<pre style="white-space:pre-wrap;border:1px solid #ddd;'
+            f'padding:8px;border-radius:4px;">{draft}</pre>'
+        )
+    return '<div style="font-family:sans-serif;font-size:14px;">' + "".join(blocks) + "</div>"
+
+
+_SEND_EMAIL_CACHE: list = []  # memo box: [] = unresolved, [callable|None] = resolved
 
 
 def _load_send_email():
-    """Load send_email from the parent project by file path, or None."""
-    if not _PARENT_GMAIL_PATH.exists():
-        return None
-    try:
-        spec = importlib.util.spec_from_file_location("doe_gmail_send", _PARENT_GMAIL_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # also loads the parent .env (GMAIL creds)
-        return getattr(module, "send_email", None)
-    except Exception as exc:  # noqa: BLE001 - never let notification break the run
-        print(f"[listing_notifier] could not load parent send_email: {exc}", file=sys.stderr)
-        return None
+    """Load send_email from the parent project by file path, or None.
+
+    Memoized so repeated --send calls in one process don't re-exec the parent
+    module (and re-run its dotenv load) each time.
+    """
+    if _SEND_EMAIL_CACHE:
+        return _SEND_EMAIL_CACHE[0]
+    resolved = None
+    if _PARENT_GMAIL_PATH.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("doe_gmail_send", _PARENT_GMAIL_PATH)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"no import spec for {_PARENT_GMAIL_PATH}")
+            module = importlib.util.module_from_spec(spec)
+            # Register before exec so the module can resolve itself if it ever
+            # grows internal imports; also loads the parent .env (GMAIL creds).
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            resolved = getattr(module, "send_email", None)
+        except Exception as exc:  # noqa: BLE001 - never let notification break the run
+            print(f"[listing_notifier] could not load parent send_email: {exc}", file=sys.stderr)
+            resolved = None
+    _SEND_EMAIL_CACHE.append(resolved)
+    return resolved
 
 
 def _default_recipient() -> str | None:
@@ -155,9 +238,11 @@ def notify_new_listings(
     max_rows: int = DEFAULT_MAX_ROWS,
     dry_run: bool = True,
     recipient: str | None = None,
+    preview: bool = False,
 ) -> NotifyResult:
-    """Email a single summary of new apply-tier rows. Stamps notified_at only on
-    a confirmed send. Returns a NotifyResult; never raises on send failure."""
+    """Email a single action brief of new apply-tier rows. Stamps notified_at
+    only on a confirmed send. Returns a NotifyResult; never raises on send
+    failure. With preview=True, prints the rendered text body in dry-run."""
     with closing(connect(db_path)) as conn:
         init_db(conn)
         rows = fetch_candidates(conn, since, max_rows)
@@ -165,6 +250,10 @@ def notify_new_listings(
             return NotifyResult(0, False, reason="no new apply-tier listings")
         ids = [int(row["id"]) for row in rows]
         if dry_run:
+            if preview:
+                subject, text_body, _ = format_summary(rows)
+                print(f"Subject: {subject}\n")
+                print(text_body)
             return NotifyResult(len(rows), False, reason="dry-run")
 
         send_email = _load_send_email()
@@ -174,8 +263,8 @@ def notify_new_listings(
         if not to:
             return NotifyResult(len(rows), False, reason="no recipient (set APARTMENT_NOTIFY_TO or GMAIL_ADDRESS)")
 
-        subject, body = format_summary(rows)
-        if not send_email(subject, body, to):
+        subject, text_body, html_body = format_summary(rows)
+        if not send_email(subject, text_body, to, html=html_body):
             return NotifyResult(len(rows), False, reason="send_email returned False")
         _stamp_notified(conn, ids)
         return NotifyResult(len(rows), True, tuple(ids), reason="sent")
@@ -189,6 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--since", default=DEFAULT_SINCE, help="Look-back window: 7d, 48h, 2w, or a day count.")
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS)
     parser.add_argument("--to", help="Recipient. Defaults to APARTMENT_NOTIFY_TO or GMAIL_ADDRESS.")
+    parser.add_argument("--preview", action="store_true",
+                        help="In dry-run, print the rendered action brief instead of just the count.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--dry-run", dest="dry_run", action="store_true", default=True,
                        help="Report candidates without sending (default).")
@@ -199,10 +290,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.preview:
+        # The brief uses · and — ; keep them readable in a Windows console.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     try:
         result = notify_new_listings(
             args.db, since=args.since, max_rows=args.max_rows,
-            dry_run=args.dry_run, recipient=args.to,
+            dry_run=args.dry_run, recipient=args.to, preview=args.preview,
         )
     except ValueError as exc:
         raise SystemExit(str(exc))

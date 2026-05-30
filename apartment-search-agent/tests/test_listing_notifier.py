@@ -19,6 +19,7 @@ def _insert(
     key,
     decision="apply",
     created_at=None,
+    updated_at=None,
     notified_at=None,
     priority_score=80,
     city="Luzern",
@@ -29,8 +30,11 @@ def _insert(
     commute_mode="oeV (live)",
     title="WG in Luzern",
     move_in="2026-07-16",
+    message_draft="Hoi zaeme, ich interessiere mich fuer das Zimmer.",
+    contact_email=None,
 ):
     created_at = created_at or _iso_days_ago(0)
+    updated_at = updated_at or created_at
     url = url or ("https://x.test/" + key)
     conn.execute(
         """
@@ -40,16 +44,16 @@ def _insert(
             commute_class, commute_minutes, commute_mode, price_score,
             wg_fit_score, gender_status, scam_risk, flags_json,
             message_variant, message_draft, status, approval_status,
-            created_at, updated_at, notified_at
-        ) VALUES (?,?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?)
+            contact_email, created_at, updated_at, notified_at
+        ) VALUES (?,?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?)
         """,
         (
             key, "flatfox.ch", title, rent, city, url, move_in,
             "hash-" + key, decision, "Apply after approval", priority_score,
             commute_class, commute_minutes, commute_mode, "good",
             60, "eligible", "low", "[]",
-            "v1", "draft text", "new", "not_requested",
-            created_at, created_at, notified_at,
+            "v1", message_draft, "new", "not_requested",
+            contact_email, created_at, updated_at, notified_at,
         ),
     )
     conn.commit()
@@ -112,6 +116,17 @@ class NotifySelectionTest(_DbTest):
         result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
         self.assertEqual(result.candidates, 1)
 
+    def test_promoted_listing_via_updated_at_window(self) -> None:
+        # Reviewer H1: a row created 30d ago (outside the 7d window) but
+        # re-scored/promoted to apply today (fresh updated_at) must still surface.
+        with closing(connect(self.db)) as conn:
+            _insert(
+                conn, key="promoted",
+                created_at=_iso_days_ago(30), updated_at=_iso_days_ago(0),
+            )
+        result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
+        self.assertEqual(result.candidates, 1)
+
 
 class NotifySendTest(_DbTest):
     def test_dry_run_reports_without_loading_sender(self) -> None:
@@ -139,9 +154,13 @@ class NotifySendTest(_DbTest):
         self.assertEqual(result.candidates, 2)
         sender.assert_called_once()
         subject, body, to = sender.call_args.args
+        html_body = sender.call_args.kwargs.get("html")
         self.assertIn("2 new apply-tier", subject)
         self.assertEqual(to, "me@test.ch")
         self.assertIn("WG in Luzern", body)
+        self.assertIn("ich interessiere mich", body)  # the ready-to-send draft
+        self.assertIsNotNone(html_body)
+        self.assertIn("<pre", html_body)
         self.assertIsNotNone(self._notified_at("a"))
         self.assertIsNotNone(self._notified_at("b"))
 
@@ -176,6 +195,44 @@ class NotifySendTest(_DbTest):
         self.assertEqual(to, "fallback@test.ch")
 
 
+class ActionPacketTest(_DbTest):
+    def _render(self):
+        from execution.listing_notifier import fetch_candidates, format_summary
+        with closing(connect(self.db)) as conn:
+            rows = fetch_candidates(conn, "7d", 25)
+        return format_summary(rows)
+
+    def test_packet_has_draft_apply_link_commute_and_wgfit(self) -> None:
+        with closing(connect(self.db)) as conn:
+            _insert(
+                conn, key="a", url="https://flatfox.ch/x/123",
+                commute_minutes=11, commute_mode="oeV 11 / e-bike 35 (live)",
+                message_draft="Hoi zaeme, das Zimmer passt super.",
+            )
+        subject, text_body, html_body = self._render()
+        self.assertIn("1 new apply-tier listing", subject)
+        self.assertIn("oeV 11 / e-bike 35 (live)", text_body)
+        self.assertIn("WG-fit 60", text_body)
+        self.assertIn("https://flatfox.ch/x/123", text_body)
+        self.assertIn("Hoi zaeme, das Zimmer passt super.", text_body)
+        self.assertIn('href="https://flatfox.ch/x/123"', html_body)
+        self.assertIn("<pre", html_body)
+
+    def test_html_escapes_draft(self) -> None:
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="a", message_draft="<script>alert(1)</script>")
+        _, _, html_body = self._render()
+        self.assertNotIn("<script>", html_body)
+        self.assertIn("&lt;script&gt;", html_body)
+
+    def test_contact_email_surfaced_when_present(self) -> None:
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="a", contact_email="anna@example.ch")
+        _, text_body, html_body = self._render()
+        self.assertIn("anna@example.ch", text_body)
+        self.assertIn("mailto:anna@example.ch", html_body)
+
+
 class CliTest(_DbTest):
     def test_main_dry_run_default_makes_no_send(self) -> None:
         with closing(connect(self.db)) as conn:
@@ -184,6 +241,21 @@ class CliTest(_DbTest):
             rc = ln.main(["--db", str(self.db), "--since", "7d"])
         self.assertEqual(rc, 0)
         loader.assert_not_called()
+
+    def test_preview_prints_body_without_sending(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="a", message_draft="Hoi zaeme, preview test.")
+        buf = io.StringIO()
+        with patch.object(ln, "_load_send_email") as loader, redirect_stdout(buf):
+            rc = ln.main(["--db", str(self.db), "--since", "7d", "--preview"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        loader.assert_not_called()
+        self.assertIn("Subject:", out)
+        self.assertIn("Hoi zaeme, preview test.", out)
 
 
 class WorkflowSkipNotifyTest(unittest.TestCase):

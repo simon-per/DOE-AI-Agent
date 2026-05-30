@@ -114,13 +114,17 @@ that leg is silently skipped.
 ## New-Listing Notifications
 
 A+/A listings are invisible until you open the Google Sheet. `execution/listing_notifier.py`
-bundles new `decision=apply` rows into a single Gmail summary so strong matches
-reach you immediately. It reuses the parent project's `gmail_send` helper (Gmail
-app password) and stamps each notified row so it is never re-sent.
+bundles new `decision=apply` rows into a single Gmail message so strong matches
+reach you immediately. Each listing is a complete **action packet** — both
+commute legs, WG-fit, rent verdict, the direct apply link (and contact email
+when known), and the ready-to-send German draft — so you can act from your phone
+without opening the Sheet. The email is sent as text + HTML (tappable links,
+copy-friendly draft block). It reuses the parent project's `gmail_send` helper
+(Gmail app password) and stamps each notified row so it is never re-sent.
 
 ```powershell
-python execution/listing_notifier.py --dry-run --since 7d   # report only
-python execution/listing_notifier.py --send --since 2d      # actually email
+python execution/listing_notifier.py --dry-run --preview --since 7d  # see the brief
+python execution/listing_notifier.py --send --since 2d               # actually email
 ```
 
 The full workflow runs it automatically after scoring (disable with

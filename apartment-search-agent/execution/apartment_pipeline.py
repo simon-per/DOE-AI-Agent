@@ -1056,6 +1056,11 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                     WHEN :reset_approval = 1 THEN 'new'
                     ELSE status
                 END,
+                -- notified_at is intentionally NOT reset on re-ingest: a
+                -- re-scored row keeps its "already emailed" stamp so
+                -- listing_notifier never re-sends. Its candidate window admits
+                -- updated_at precisely so a row promoted to decision='apply'
+                -- here still surfaces (gated by notified_at IS NULL).
                 updated_at = :updated_at
             WHERE id = :existing_id
             """,
