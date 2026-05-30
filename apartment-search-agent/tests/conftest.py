@@ -17,3 +17,8 @@ import os
 os.environ["TRANSPORT_OPENDATA_ENABLED"] = "0"
 # Empty (not absent) so a parent .env can't re-enable the e-bike path via dotenv.
 os.environ["OPENROUTESERVICE_API_KEY"] = ""
+# Empty GMAIL creds so listing_notifier's send path is a guaranteed no-op even
+# when the workflow runs notification live — no test ever sends a real email.
+# (gmail_send loads the parent .env with override=False, so these "" win.)
+os.environ["GMAIL_ADDRESS"] = ""
+os.environ["GMAIL_APP_PASSWORD"] = ""

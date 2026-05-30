@@ -938,6 +938,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE listings ADD COLUMN content_key TEXT")
     if "approved_raw_hash" not in columns:
         conn.execute("ALTER TABLE listings ADD COLUMN approved_raw_hash TEXT")
+    if "notified_at" not in columns:
+        # Stamped by execution/listing_notifier.py once a new apply-tier row has
+        # been emailed, so the summary is never re-sent for the same listing.
+        conn.execute("ALTER TABLE listings ADD COLUMN notified_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_listings_content_key ON listings(content_key)"
     )

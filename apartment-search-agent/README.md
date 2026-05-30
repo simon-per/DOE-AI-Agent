@@ -111,6 +111,24 @@ When both resolve, the tracker shows both legs (e.g. `oeV 11 / e-bike 35
 (live)`) and ranks on the minimum. If an API is missing, rate-limited, or down,
 that leg is silently skipped.
 
+## New-Listing Notifications
+
+A+/A listings are invisible until you open the Google Sheet. `execution/listing_notifier.py`
+bundles new `decision=apply` rows into a single Gmail summary so strong matches
+reach you immediately. It reuses the parent project's `gmail_send` helper (Gmail
+app password) and stamps each notified row so it is never re-sent.
+
+```powershell
+python execution/listing_notifier.py --dry-run --since 7d   # report only
+python execution/listing_notifier.py --send --since 2d      # actually email
+```
+
+The full workflow runs it automatically after scoring (disable with
+`--skip-notify`, defaults to a 2-day look-back via `--notify-since`). Set
+`APARTMENT_NOTIFY_TO` to send somewhere other than your own `GMAIL_ADDRESS`.
+DRY RUN by default — it only emails with `--send` or from a live (non-dry-run)
+workflow.
+
 The script creates/updates `data/listings.sqlite`, dedupes listings, scores commute/rent/WG fit, flags exclusions and scam risk, and writes:
 
 - `data/application_queue.csv`

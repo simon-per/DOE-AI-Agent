@@ -258,6 +258,23 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
             print_queue(plan)
             print("No messages were sent. Simon still approves/sends each application.")
 
+        if args.skip_notify:
+            print("New apply-tier email notification skipped.")
+        else:
+            # Lazy import keeps the parent gmail_send module out of the import
+            # path unless notification actually runs.
+            from execution.listing_notifier import notify_new_listings
+            notify_result = notify_new_listings(
+                db_path, since=args.notify_since, dry_run=args.dry_run,
+            )
+            if notify_result.sent:
+                print(f"Emailed a summary of {notify_result.candidates} new apply-tier listing(s).")
+            else:
+                print(
+                    f"Apply-tier notification: {notify_result.candidates} candidate(s), "
+                    f"not sent ({notify_result.reason})."
+                )
+
         google_synced = False
         if args.skip_google:
             print("Google Sheets sync skipped.")
@@ -319,6 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-daily-plan", action="store_true")
     parser.add_argument("--daily-limit", type=int, default=DEFAULT_DAILY_LIMIT)
     parser.add_argument("--site-daily-limit", type=int, default=DEFAULT_SITE_DAILY_LIMIT)
+
+    parser.add_argument("--skip-notify", action="store_true",
+                        help="Skip the Gmail summary of new apply-tier listings.")
+    parser.add_argument("--notify-since", default="2d",
+                        help="Look-back window for the new-listing summary (e.g. 2d, 48h).")
 
     parser.add_argument("--skip-google", action="store_true")
     parser.add_argument("--sheet-name", default=DEFAULT_SHEET_NAME)
