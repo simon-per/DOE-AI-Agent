@@ -125,16 +125,25 @@ class LiveTransitTest(unittest.TestCase):
         self.addCleanup(enabled.stop)
 
     def test_query_then_cache(self) -> None:
+        expected = 18 + ts.TRANSIT_ACCESS_BUFFER_MIN  # raw stop-to-stop + access
         with patch.object(cs, "_http_json", return_value=_fake_connections("00d00:18:00")):
             first = ts.live_transit_minutes("Luzern", cache_path=self.cache_path)
         self.assertIsNotNone(first)
-        self.assertEqual(first.minutes, 18)
+        self.assertEqual(first.minutes, expected)
         self.assertEqual(first.mode, ts.TRANSIT_MODE)
         # Second call is a cache hit — no further HTTP.
         with patch.object(cs, "_http_json") as http2:
             second = ts.live_transit_minutes("Luzern", cache_path=self.cache_path)
-        self.assertEqual(second.minutes, 18)
+        self.assertEqual(second.minutes, expected)
         http2.assert_not_called()
+
+    def test_access_buffer_added_to_raw_stop_to_stop(self) -> None:
+        # The raw 2-min stop-to-stop (the Buchrain artifact) must become a
+        # realistic door-to-door once the access/egress buffer is added.
+        with patch.object(cs, "_http_json", return_value=_fake_connections("00d00:02:00")):
+            result = ts.live_transit_minutes("Buchrain", cache_path=self.cache_path)
+        self.assertEqual(result.minutes, 2 + ts.TRANSIT_ACCESS_BUFFER_MIN)
+        self.assertGreaterEqual(result.minutes, 10)
 
     def test_empty_address_returns_none(self) -> None:
         with patch.object(cs, "_http_json") as http:
@@ -154,7 +163,7 @@ class LiveTransitTest(unittest.TestCase):
             )
         with patch.object(cs, "_http_json", return_value=_fake_connections("00d00:16:00")):
             transit = ts.live_transit_minutes("Luzern", cache_path=self.cache_path)
-        self.assertEqual(transit.minutes, 16)
+        self.assertEqual(transit.minutes, 16 + ts.TRANSIT_ACCESS_BUFFER_MIN)
         # The e-bike row must still be intact under its own (unsuffixed) key.
         with closing(cs.init_cache(self.cache_path)) as conn:
             ebike = cs.cache_get(conn, cs.normalize_key("Luzern"), work_key)

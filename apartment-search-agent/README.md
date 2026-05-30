@@ -97,17 +97,20 @@ never break for lack of routing. Both results cache in
 - **E-bike** — OpenRouteService routing to PHENOGY's coordinates. Opt-in: set
   `OPENROUTESERVICE_API_KEY` in `.env` (2,000 free requests/day).
 - **Public transport (oeV)** — transport.opendata.ch, **no key required, on by
-  default**. This is what lifts Lucerne-core listings from B to A: ~11 min by
-  train vs ~35 min by bike. Set `TRANSPORT_OPENDATA_ENABLED=0` to disable.
+  default**. This is what lifts Lucerne-core listings from B to A: ~23 min
+  door-to-door vs ~35 min by bike. The raw API gives stop-to-stop time only, so
+  a fixed access/egress buffer (`TRANSIT_ACCESS_BUFFER_MIN`, walk + wait + walk
+  from the Root D4 stop) is added to keep near-town estimates realistic and
+  comparable to the e-bike leg. Set `TRANSPORT_OPENDATA_ENABLED=0` to disable.
 
 ```powershell
 python execution/commute_scoring.py "Buchrain, Switzerland"
 # -> 'Buchrain, Switzerland': 22 min via e-bike (live) (6.4 km)
 python execution/transit_scoring.py "Luzern" --to "Root D4"
-# -> 'Luzern' -> 'Root D4': 11 min via oeV (live)
+# -> 'Luzern' -> 'Root D4': 23 min via oeV (live)
 ```
 
-When both resolve, the tracker shows both legs (e.g. `oeV 11 / e-bike 35
+When both resolve, the tracker shows both legs (e.g. `oeV 23 / e-bike 35
 (live)`) and ranks on the minimum. If an API is missing, rate-limited, or down,
 that leg is silently skipped.
 

@@ -49,6 +49,11 @@ MORNING_DEPARTURE = "08:00"
 
 DEFAULT_CONNECTION_LIMIT = 3
 TRANSIT_MODE = "oeV (live)"
+# The connections API returns stop-to-stop time only. Real door-to-door also
+# needs walk-to-origin-stop + wait + walk-from-Root-D4-stop-to-office. Without
+# this, near towns get absurd values (Buchrain "2 min") that both mislead drafts
+# and unfairly beat the e-bike leg, which is already true door-to-door.
+TRANSIT_ACCESS_BUFFER_MIN = 12
 # Keeps transit rows distinct from e-bike rows in the shared commute_cache,
 # whose primary key is (origin_key, work_key).
 _TRANSIT_WORK_SUFFIX = " #oev"
@@ -157,9 +162,12 @@ def live_transit_minutes(
         cached = cs.cache_get(conn, origin_key, work_key)
         if cached:
             return cached
-        minutes = _query_transit_minutes(origin_text, dest_text)
-        if minutes is None:
+        raw_minutes = _query_transit_minutes(origin_text, dest_text)
+        if raw_minutes is None:
             return None
+        # Add the access/egress buffer so the cached value is realistic
+        # door-to-door and comparable to the e-bike leg.
+        minutes = raw_minutes + TRANSIT_ACCESS_BUFFER_MIN
         result = cs.RouteResult(minutes=minutes, mode=TRANSIT_MODE, distance_km=None)
         cs.cache_put(conn, origin_key, work_key, result)
         return result
