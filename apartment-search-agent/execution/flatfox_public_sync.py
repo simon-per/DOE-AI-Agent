@@ -392,6 +392,18 @@ def raw_text_from_public_listing(item: dict[str, Any]) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
+def public_address(item: dict[str, Any]) -> str:
+    """Compose 'Street, ZIP City' for precise transit stop resolution."""
+    zip_city = " ".join(
+        part for part in (
+            str(item.get("zipcode") or "").strip(),
+            str(item.get("city") or "").strip(),
+        ) if part
+    )
+    parts = [str(item.get("public_address") or "").strip(), zip_city]
+    return ", ".join(part for part in parts if part)
+
+
 def listing_input_from_public_listing(item: dict[str, Any], base_url: str) -> ListingInput:
     title = item.get("public_title") or item.get("short_title") or item.get("rent_title")
     return ListingInput(
@@ -405,6 +417,9 @@ def listing_input_from_public_listing(item: dict[str, Any], base_url: str) -> Li
         contact_email=None,
         raw_text=raw_text_from_public_listing(item),
         commute_minutes=None,
+        latitude=as_float(item.get("latitude")),
+        longitude=as_float(item.get("longitude")),
+        address=public_address(item),
     )
 
 

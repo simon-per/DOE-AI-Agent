@@ -2,16 +2,21 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
+from execution import apartment_pipeline as ap
+from execution import commute_scoring as cs
 from execution.apartment_pipeline import (
     ListingInput,
     approve_listing,
     canonicalize_url,
     connect,
+    estimate_commute,
     extract_rent,
     init_db,
     mark_sent,
     normalize_listing,
+    rescore_all,
     safe_daily_plan,
     score_listing,
     upsert_listing,
@@ -373,6 +378,118 @@ class ApartmentPipelineTest(unittest.TestCase):
                 plan = safe_daily_plan(conn, daily_limit=5, site_daily_limit=1)
 
                 self.assertEqual(plan, [])
+
+
+class CoordCommuteTest(unittest.TestCase):
+    """estimate_commute must prefer the listing's coords/address over the city."""
+
+    def test_estimate_commute_passes_coords_and_address_to_live_lookup(self) -> None:
+        captured: dict = {}
+
+        def fake_live(query, *, origin_coords=None):
+            captured["query"] = query
+            captured["coords"] = origin_coords
+            return cs.RouteResult(minutes=16, mode="e-bike (live)", distance_km=4.8)
+
+        with patch.object(cs, "is_enabled", return_value=True), \
+             patch("execution.commute_scoring.live_commute_minutes", side_effect=fake_live), \
+             patch("execution.transit_scoring.live_transit_minutes", return_value=None):
+            minutes, klass, mode = estimate_commute(
+                "Luzern",
+                coords=(47.0502, 8.3093),
+                address="Bruchstrasse 12, 6003 Luzern",
+            )
+        self.assertEqual(minutes, 16)
+        self.assertEqual(klass, "A+")
+        # e-bike leg routed from the exact coords; address (not bare city) is the key.
+        self.assertEqual(captured["coords"], (47.0502, 8.3093))
+        self.assertEqual(captured["query"], "Bruchstrasse 12, 6003 Luzern")
+
+    def test_estimate_commute_address_drives_transit_query(self) -> None:
+        captured: dict = {}
+
+        def fake_transit(location):
+            captured["location"] = location
+            return None  # force fallback to e-bike-only path
+
+        with patch.object(cs, "is_enabled", return_value=True), \
+             patch("execution.commute_scoring.live_commute_minutes",
+                   return_value=cs.RouteResult(minutes=22, mode="e-bike (live)", distance_km=6.1)), \
+             patch("execution.transit_scoring.live_transit_minutes", side_effect=fake_transit):
+            estimate_commute(
+                "Ebikon", coords=(47.08, 8.34), address="Riedmattstrasse 9, 6030 Ebikon",
+            )
+        self.assertEqual(captured["location"], "Riedmattstrasse 9, 6030 Ebikon")
+
+
+class RescoreTest(unittest.TestCase):
+    """rescore_all refreshes scoring from stored coords/address but must never
+    disturb lifecycle columns (status/approval/sent/notified/created)."""
+
+    def _seed(self, conn, *, commute_minutes_override=5) -> int:
+        listing = ListingInput(
+            url="https://flatfox.ch/listing/rescore-1",
+            source="flatfox",
+            title="Schoenes Zimmer Luzern",
+            rent_chf=780,
+            city="Luzern",
+            move_in="16.07.",
+            contact_name=None,
+            contact_email=None,
+            raw_text="ruhig sauber Anmeldung",
+            commute_minutes=commute_minutes_override,
+            latitude=47.0502,
+            longitude=8.3093,
+            address="Bruchstrasse 12, 6003 Luzern",
+        )
+        listing_id, _ = upsert_listing(conn, score_listing(normalize_listing(listing)))
+        return listing_id
+
+    def test_rescore_preserves_status_and_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db_path)) as conn:
+                init_db(conn)
+                listing_id = self._seed(conn)
+                approve_listing(conn, listing_id, note="approved")
+                mark_sent(conn, listing_id, note="sent")
+
+                before = dict(conn.execute(
+                    "SELECT status, approval_status, sent_at, notified_at, created_at "
+                    "FROM listings WHERE id = ?", (listing_id,),
+                ).fetchone())
+
+                # Static fallback for Luzern (no live key in tests) is 30 min — so
+                # the stored 5-min "manual override" gets replaced on rescore.
+                rescored, changed = rescore_all(conn)
+
+                after = dict(conn.execute(
+                    "SELECT status, approval_status, sent_at, notified_at, created_at, "
+                    "commute_minutes, commute_mode FROM listings WHERE id = ?",
+                    (listing_id,),
+                ).fetchone())
+
+        self.assertEqual(rescored, 1)
+        # Lifecycle columns are untouched.
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["approval_status"], before["approval_status"])
+        self.assertEqual(after["sent_at"], before["sent_at"])
+        self.assertEqual(after["notified_at"], before["notified_at"])
+        self.assertEqual(after["created_at"], before["created_at"])
+        # Scoring was refreshed away from the stale override.
+        self.assertNotEqual(after["commute_mode"], "manual override")
+
+    def test_rescore_reports_decision_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db_path)) as conn:
+                init_db(conn)
+                # Seed with a 5-min override → A+ apply; rescore drops the override
+                # so the row re-scores on the real (static) commute and may move tier.
+                self._seed(conn, commute_minutes_override=5)
+                rescored, changed = rescore_all(conn)
+        self.assertEqual(rescored, 1)
+        self.assertIn(changed, (0, 1))
 
 
 if __name__ == "__main__":

@@ -215,6 +215,9 @@ class ListingInput:
     contact_email: str | None
     raw_text: str
     commute_minutes: int | None
+    latitude: float | None = None
+    longitude: float | None = None
+    address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -470,6 +473,9 @@ def normalize_listing(listing: ListingInput) -> dict[str, Any]:
         "raw_text": raw_text,
         "raw_hash": hash_text(raw_text or f"{canonical_url}|{title}|{rent}|{city}"),
         "commute_minutes_override": listing.commute_minutes,
+        "latitude": listing.latitude,
+        "longitude": listing.longitude,
+        "address": normalize_space(listing.address) or "",
     }
     normalized["content_key"] = content_key(normalized)
     normalized["canonical_key"] = canonical_key(normalized)
@@ -485,9 +491,12 @@ def matching_pattern_keys(pattern_map: dict[str, list[str]], text: str) -> list[
     return [key for key, patterns in pattern_map.items() if any_pattern(patterns, text)]
 
 
-def _live_ebike_lookup(query: str) -> tuple[int, str] | None:
-    """Live ORS e-bike lookup, no-op when no API key is configured. Imported
-    lazily so the static path keeps working without dotenv / network setup."""
+def _live_ebike_lookup(
+    query: str, coords: tuple[float, float] | None = None
+) -> tuple[int, str] | None:
+    """Live ORS e-bike lookup, no-op when no API key is configured. When coords
+    are known (e.g. from Flatfox), routes straight from them and skips the
+    geocode; otherwise `query` is geocoded. Lazily imported."""
     try:
         from execution.commute_scoring import is_enabled, live_commute_minutes
     except Exception:  # noqa: BLE001 - never let scoring break on import errors
@@ -495,35 +504,42 @@ def _live_ebike_lookup(query: str) -> tuple[int, str] | None:
     if not is_enabled():
         return None
     try:
-        result = live_commute_minutes(query)
+        result = live_commute_minutes(query, origin_coords=coords)
     except Exception:  # noqa: BLE001 - network/HTTP/SQLite errors never abort scoring
         return None
     return (result.minutes, result.mode) if result is not None else None
 
 
-def _live_transit_lookup(city: str) -> tuple[int, str] | None:
+def _live_transit_lookup(location: str) -> tuple[int, str] | None:
     """Live public-transport (oeV) lookup. Needs no API key, so it runs even
-    when ORS is unconfigured — this is what lifts Lucerne-core listings to A."""
+    when ORS is unconfigured. `location` is the full address when known (more
+    precise stop resolution) else the city."""
     try:
         from execution.transit_scoring import live_transit_minutes
     except Exception:  # noqa: BLE001 - never let scoring break on import errors
         return None
     try:
-        result = live_transit_minutes(city)
+        result = live_transit_minutes(location)
     except Exception:  # noqa: BLE001 - network/HTTP/SQLite errors never abort scoring
         return None
     return (result.minutes, result.mode) if result is not None else None
 
 
-def _live_commute_lookup(city: str) -> tuple[int, str] | None:
+def _live_commute_lookup(
+    city: str,
+    *,
+    coords: tuple[float, float] | None = None,
+    address: str | None = None,
+) -> tuple[int, str] | None:
     """Best live door-to-door commute to Root D4: min(e-bike, oeV).
 
-    Queries both modes (each lazily imported, each fail-silent) and returns the
-    faster. When both resolve, the mode label shows both legs so the tracker
-    explains why a listing ranks where it does."""
-    query = city if "," in city else f"{city}, Switzerland"
-    ebike = _live_ebike_lookup(query)
-    transit = _live_transit_lookup(city)
+    Prefers the listing's exact coordinates for e-bike routing and its full
+    address for transit stop resolution, falling back to the city. Each mode is
+    lazily imported and fail-silent; when both resolve the label shows both legs."""
+    ebike_query = address or (city if "," in city else f"{city}, Switzerland")
+    transit_query = address or city
+    ebike = _live_ebike_lookup(ebike_query, coords=coords)
+    transit = _live_transit_lookup(transit_query)
     if ebike is None and transit is None:
         return None
     if ebike is not None and transit is not None:
@@ -532,12 +548,22 @@ def _live_commute_lookup(city: str) -> tuple[int, str] | None:
     return ebike if ebike is not None else transit
 
 
-def estimate_commute(city: str, override_minutes: int | None = None) -> tuple[int | None, str, str]:
+def estimate_commute(
+    city: str,
+    override_minutes: int | None = None,
+    *,
+    coords: tuple[float, float] | None = None,
+    address: str | None = None,
+) -> tuple[int | None, str, str]:
     if override_minutes is not None:
         minutes = override_minutes
         mode = "manual override"
     else:
-        live = _live_commute_lookup(city) if city else None
+        live = (
+            _live_commute_lookup(city, coords=coords, address=address)
+            if (city or coords or address)
+            else None
+        )
         if live is not None:
             minutes, mode = live
         else:
@@ -825,9 +851,14 @@ def score_listing(normalized: dict[str, Any]) -> ScoredListing:
         str(normalized.get(field) or "")
         for field in ("title", "city", "move_in", "raw_text")
     )
+    lat = normalized.get("latitude")
+    lon = normalized.get("longitude")
+    coords = (float(lat), float(lon)) if lat is not None and lon is not None else None
     minutes, commute_class, mode = estimate_commute(
         str(normalized.get("city") or ""),
         normalized.get("commute_minutes_override"),
+        coords=coords,
+        address=(normalized.get("address") or None),
     )
     gender_status = classify_gender(combined_text)
     scam_flags = matching_pattern_keys(SCAM_PATTERNS, combined_text)
@@ -963,6 +994,19 @@ def init_db(conn: sqlite3.Connection) -> None:
         # Stamped by execution/listing_notifier.py once a new apply-tier row has
         # been emailed, so the summary is never re-sent for the same listing.
         conn.execute("ALTER TABLE listings ADD COLUMN notified_at TEXT")
+    if "latitude" not in columns:
+        # Exact listing location (Flatfox provides it) so commute is routed from
+        # the door, not the city centroid; also feeds the rescore command.
+        conn.execute("ALTER TABLE listings ADD COLUMN latitude REAL")
+    if "longitude" not in columns:
+        conn.execute("ALTER TABLE listings ADD COLUMN longitude REAL")
+    if "address" not in columns:
+        conn.execute("ALTER TABLE listings ADD COLUMN address TEXT")
+    if "openrouter_score" not in columns:
+        # Advisory LLM re-rank (execution/llm_rerank.py); never overrides decision.
+        conn.execute("ALTER TABLE listings ADD COLUMN openrouter_score INTEGER")
+    if "openrouter_reason" not in columns:
+        conn.execute("ALTER TABLE listings ADD COLUMN openrouter_reason TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_listings_content_key ON listings(content_key)"
     )
@@ -973,6 +1017,90 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["flags"] = json.loads(result.pop("flags_json") or "[]")
     return result
+
+
+def _normalized_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a scoring-input dict from a stored row. commute is recomputed
+    fresh from saved coords/address (override cleared), which is the whole point
+    of a rescore — the backlog's stale 'manual override' values get replaced."""
+    return {
+        "url": row.get("url") or "",
+        "canonical_url": row.get("canonical_url"),
+        "source": row.get("source"),
+        "title": row.get("title"),
+        "rent_chf": row.get("rent_chf"),
+        "city": row.get("city") or "",
+        "move_in": row.get("move_in") or "",
+        "contact_name": row.get("contact_name"),
+        "contact_email": row.get("contact_email") or "",
+        "raw_text": row.get("raw_text") or "",
+        "raw_hash": row.get("raw_hash"),
+        "commute_minutes_override": None,
+        "latitude": row.get("latitude"),
+        "longitude": row.get("longitude"),
+        "address": row.get("address") or "",
+        "content_key": row.get("content_key"),
+        "canonical_key": row.get("canonical_key"),
+    }
+
+
+def rescore_all(conn: sqlite3.Connection, limit: int | None = None) -> tuple[int, int]:
+    """Re-run scoring over stored listings using their saved coords/address.
+
+    Refreshes the scoring columns (commute, decision, priority, draft, …) but
+    NEVER touches status / approval / approved_at / sent_at / notified_at /
+    created_at. Returns (rescored, decisions_changed)."""
+    init_db(conn)
+    query = "SELECT * FROM listings ORDER BY id"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    rows = [row_to_dict(r) for r in conn.execute(query).fetchall()]
+    rescored = 0
+    changed = 0
+    for row in rows:
+        scored = score_listing(_normalized_from_row(row))
+        if scored.decision != row.get("decision"):
+            changed += 1
+        conn.execute(
+            """
+            UPDATE listings SET
+                decision = :decision,
+                recommended_action = :recommended_action,
+                priority_score = :priority_score,
+                commute_class = :commute_class,
+                commute_minutes = :commute_minutes,
+                commute_mode = :commute_mode,
+                price_score = :price_score,
+                wg_fit_score = :wg_fit_score,
+                gender_status = :gender_status,
+                scam_risk = :scam_risk,
+                flags_json = :flags_json,
+                message_variant = :message_variant,
+                message_draft = :message_draft,
+                updated_at = :updated_at
+            WHERE id = :id
+            """,
+            {
+                "id": row["id"],
+                "decision": scored.decision,
+                "recommended_action": scored.recommended_action,
+                "priority_score": scored.priority_score,
+                "commute_class": scored.commute_class,
+                "commute_minutes": scored.commute_minutes,
+                "commute_mode": scored.commute_mode,
+                "price_score": scored.price_score,
+                "wg_fit_score": scored.wg_fit_score,
+                "gender_status": scored.gender_status,
+                "scam_risk": scored.scam_risk,
+                "flags_json": json.dumps(scored.flags, ensure_ascii=True),
+                "message_variant": scored.message_variant,
+                "message_draft": scored.message_draft,
+                "updated_at": now_iso(),
+            },
+        )
+        rescored += 1
+    conn.commit()
+    return rescored, changed
 
 
 def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int, bool]:
@@ -1006,6 +1134,9 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
         "flags_json": json.dumps(scored.flags, ensure_ascii=True),
         "message_variant": scored.message_variant,
         "message_draft": scored.message_draft,
+        "latitude": n.get("latitude"),
+        "longitude": n.get("longitude"),
+        "address": n.get("address") or "",
         "created_at": timestamp,
         "updated_at": timestamp,
     }
@@ -1060,6 +1191,9 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 flags_json = :flags_json,
                 message_variant = :message_variant,
                 message_draft = :message_draft,
+                latitude = :latitude,
+                longitude = :longitude,
+                address = :address,
                 approval_status = CASE
                     WHEN :reset_approval = 1 THEN 'not_requested'
                     ELSE approval_status
@@ -1102,7 +1236,7 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 decision, recommended_action, priority_score, commute_class,
                 commute_minutes, commute_mode, price_score, wg_fit_score,
                 gender_status, scam_risk, flags_json, message_variant,
-                message_draft, created_at, updated_at
+                message_draft, latitude, longitude, address, created_at, updated_at
             )
             VALUES (
                 :canonical_key, :content_key, :canonical_url, :url, :source, :title, :rent_chf,
@@ -1110,7 +1244,7 @@ def upsert_listing(conn: sqlite3.Connection, scored: ScoredListing) -> tuple[int
                 :decision, :recommended_action, :priority_score, :commute_class,
                 :commute_minutes, :commute_mode, :price_score, :wg_fit_score,
                 :gender_status, :scam_risk, :flags_json, :message_variant,
-                :message_draft, :created_at, :updated_at
+                :message_draft, :latitude, :longitude, :address, :created_at, :updated_at
             )
             """,
             payload,
@@ -1423,6 +1557,13 @@ def build_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="Show one listing and its draft.")
     show.add_argument("listing_id", type=int)
 
+    rescore = subparsers.add_parser(
+        "rescore",
+        help="Re-score stored listings from saved coords/address (refreshes "
+        "commute/decision/draft; preserves status, approval, sent_at).",
+    )
+    rescore.add_argument("--limit", type=int, default=None, help="Cap the number of rows re-scored.")
+
     return parser
 
 
@@ -1476,6 +1617,11 @@ def main(argv: list[str] | None = None) -> int:
             print_queue([item])
             print("\nDraft:\n")
             print(item["message_draft"])
+            return 0
+
+        if args.command == "rescore":
+            rescored, changed = rescore_all(conn, args.limit)
+            print(f"Re-scored {rescored} listing(s); {changed} changed decision.")
             return 0
 
     return 0

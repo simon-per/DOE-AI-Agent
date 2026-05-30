@@ -299,23 +299,36 @@ def route_ebike(
     return RouteResult(minutes=minutes, mode="e-bike (live)", distance_km=distance_km)
 
 
+def _coord_key(coords: tuple[float, float] | None) -> str:
+    """Cache key for coordinate origins, rounded to ~11 m so near-identical
+    points share a cache row."""
+    if not coords:
+        return ""
+    return f"{round(coords[0], 4)},{round(coords[1], 4)}"
+
+
 def live_commute_minutes(
     address_text: str,
     *,
+    origin_coords: tuple[float, float] | None = None,
     work_address: str | None = None,
     work_coords: tuple[float, float] | None = None,
     cache_path: Path = DEFAULT_CACHE_PATH,
 ) -> RouteResult | None:
     """Returns a live e-bike commute to work, or None if the live path is
-    unavailable for any reason. Callers must fall back to a static estimate."""
+    unavailable for any reason. Callers must fall back to a static estimate.
+
+    When `origin_coords` is supplied, route straight from them and skip the
+    geocode — `address_text` then only seeds the cache key (use the listing's
+    address for a readable, well-deduped key)."""
     if not is_enabled():
         return None
     origin_text = (address_text or "").strip()
-    if not origin_text:
+    if not origin_text and origin_coords is None:
         return None
     work_text = (work_address or WORK_DEFAULT_ADDRESS).strip()
     work_key = normalize_key(work_text)
-    origin_key = normalize_key(origin_text)
+    origin_key = normalize_key(origin_text) or _coord_key(origin_coords)
 
     with closing(init_cache(cache_path)) as conn:
         cached = cache_get(conn, origin_key, work_key)
@@ -326,10 +339,10 @@ def live_commute_minutes(
             geocoded_dest = geocode(work_text, conn)
             if geocoded_dest:
                 dest = geocoded_dest
-        origin_coords = geocode(origin_text, conn)
-        if not origin_coords:
+        origin = origin_coords if origin_coords is not None else geocode(origin_text, conn)
+        if not origin:
             return None
-        result = route_ebike(origin_coords, dest)
+        result = route_ebike(origin, dest)
         if result is None:
             return None
         cache_put(conn, origin_key, work_key, result)

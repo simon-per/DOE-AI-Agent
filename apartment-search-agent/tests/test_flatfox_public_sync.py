@@ -247,6 +247,35 @@ class FlatfoxPublicSyncTest(unittest.TestCase):
         self.assertIn("Balkon, Lift", listing.raw_text)
         self.assertEqual(attribute_name({"name": "Washer"}), "Washer")
 
+    def test_public_listing_maps_coords_and_address(self) -> None:
+        # Flatfox exposes exact lat/lon + a street address; both must flow into
+        # ListingInput so commute scoring can route from the precise location.
+        listing = listing_input_from_public_listing(
+            {
+                **ROOT_SHARED_LISTING,
+                "latitude": 47.108,
+                "longitude": 8.347,
+                "public_address": "Kirchbreiteweg 1",
+                "zipcode": 6033,
+                "city": "Buchrain",
+            },
+            FLATFOX_BASE_URL,
+        )
+        self.assertEqual(listing.latitude, 47.108)
+        self.assertEqual(listing.longitude, 8.347)
+        self.assertEqual(listing.address, "Kirchbreiteweg 1, 6033 Buchrain")
+
+    def test_public_address_handles_missing_parts(self) -> None:
+        from execution.flatfox_public_sync import public_address
+
+        self.assertEqual(
+            public_address({"public_address": "Seestrasse 5", "zipcode": 6005, "city": "Luzern"}),
+            "Seestrasse 5, 6005 Luzern",
+        )
+        # No street → just the zip/city; no leading comma.
+        self.assertEqual(public_address({"zipcode": 6033, "city": "Buchrain"}), "6033 Buchrain")
+        self.assertEqual(public_address({}), "")
+
     def test_sync_ingests_only_relevant_flatfox_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "listings.sqlite"

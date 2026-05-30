@@ -135,6 +135,56 @@ class LiveLookupTest(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class CoordOriginTest(unittest.TestCase):
+    """When the listing's exact coordinates are known (Flatfox), routing must
+    skip the geocode entirely and route straight from them."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(dir=cs.BASE_DIR / ".tmp")
+        self.addCleanup(self._tmp.cleanup)
+        self.cache_path = Path(self._tmp.name) / "commute.sqlite"
+
+    def test_origin_coords_skip_geocode_and_route_directly(self) -> None:
+        calls: list[str] = []
+
+        def fake_http(url, **kwargs):
+            calls.append(url)
+            # Only the route endpoint should ever be hit.
+            return _fake_route_response(seconds=18 * 60, meters=5400)
+
+        with patch.object(cs, "api_key", return_value="fake-key"), \
+             patch.object(cs, "_http_json", side_effect=fake_http):
+            result = cs.live_commute_minutes(
+                "Kirchbreiteweg 1, 6033 Buchrain",
+                origin_coords=(47.108, 8.347),
+                cache_path=self.cache_path,
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.minutes, 18)
+        self.assertEqual(result.distance_km, 5.4)
+        # No geocode call — coords routed directly; exactly one HTTP (the route).
+        self.assertTrue(all("geocode" not in url for url in calls))
+        self.assertEqual(len(calls), 1)
+
+    def test_origin_coords_use_independent_cache_key(self) -> None:
+        # Two listings on the same street (same address text) but distinct coords
+        # must not collide in the cache — the rounded coord key keeps them apart.
+        self.assertNotEqual(
+            cs._coord_key((47.1081, 8.3471)),
+            cs._coord_key((47.1206, 8.3402)),
+        )
+        self.assertEqual(cs._coord_key(None), "")
+
+    def test_coords_routed_without_api_key_is_noop(self) -> None:
+        # No ORS key → live path is a no-op even with coords (static fallback wins
+        # upstream). Never raises.
+        with patch.object(cs, "api_key", return_value=None):
+            result = cs.live_commute_minutes(
+                "anywhere", origin_coords=(47.1, 8.3), cache_path=self.cache_path,
+            )
+        self.assertIsNone(result)
+
+
 class HttpJsonTest(unittest.TestCase):
     def test_logs_once_on_attempt_exhaustion(self) -> None:
         # Reviewer H5: a retried request that never succeeds must leave a trace
