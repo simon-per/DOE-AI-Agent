@@ -100,6 +100,28 @@ class ApartmentPipelineTest(unittest.TestCase):
         self.assertEqual(scored.gender_status, "eligible")
         self.assertIn("Hoi Lena", scored.message_draft)
         self.assertIn("PHENOGY", scored.message_draft)
+        # WS3: a strong listing cites the concrete commute time as the sell.
+        self.assertIsNotNone(scored.commute_minutes)
+        self.assertIn(f"rund {scored.commute_minutes} Minuten", scored.message_draft)
+
+    def test_unknown_commute_draft_has_no_none_minutes(self) -> None:
+        # WS3 guard: an unknown commute must not leak "None Minuten" into a draft.
+        listing = ListingInput(
+            url="https://x.test/xyz",
+            source="flatfox",
+            title="WG in Xyztown",
+            rent_chf=800,
+            city="Xyztown",
+            move_in=None,
+            contact_name=None,
+            contact_email=None,
+            raw_text="WG Zimmer, ruhig und sauber",
+            commute_minutes=None,
+        )
+        scored = score_listing(normalize_listing(listing))
+        self.assertEqual(scored.commute_class, "unknown")
+        self.assertNotIn("None", scored.message_draft)
+        self.assertNotIn("rund None", scored.message_draft)
 
     def test_hard_gender_restriction_skips(self) -> None:
         listing = ListingInput(

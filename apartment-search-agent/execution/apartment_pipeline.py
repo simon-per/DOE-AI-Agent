@@ -684,14 +684,29 @@ def seeded_choice(options: list[str], seed: str) -> str:
     return options[rng.randrange(len(options))]
 
 
-def personalization_sentence(normalized: dict[str, Any], flags: list[str], commute_class: str) -> str:
+def personalization_sentence(
+    normalized: dict[str, Any],
+    flags: list[str],
+    commute_class: str,
+    commute_minutes: int | None = None,
+    commute_mode: str | None = None,
+) -> str:
     city = normalized.get("city") or "der Gegend"
     move_in = normalized.get("move_in") or "Mitte Juli"
     pieces: list[str] = []
     if commute_class in {"A+", "A"}:
-        pieces.append(
-            f"Die Lage in {city} ist fuer mich besonders spannend, weil ich ab dem 16.07. bei PHENOGY in Root D4 starte."
-        )
+        if commute_minutes:
+            # Cite the concrete advantage — far more convincing than a vague
+            # "good location". Only for A+/A, where the number is actually a sell.
+            pieces.append(
+                f"Die Verbindung von {city} nach Root D4 ist mit rund {commute_minutes} "
+                "Minuten ideal fuer meinen Arbeitsweg, und genau dort starte ich ab dem "
+                "16.07. bei PHENOGY."
+            )
+        else:
+            pieces.append(
+                f"Die Lage in {city} ist fuer mich besonders spannend, weil ich ab dem 16.07. bei PHENOGY in Root D4 starte."
+            )
     else:
         pieces.append(
             f"{city} koennte fuer mich gut passen, wenn die Verbindung nach Root D4 im Alltag verlaesslich ist."
@@ -712,6 +727,8 @@ def generate_message(
     flags: list[str],
     gender_status: str,
     commute_class: str,
+    commute_minutes: int | None = None,
+    commute_mode: str | None = None,
 ) -> tuple[str, str]:
     text = "\n".join(
         str(normalized.get(field) or "")
@@ -721,7 +738,9 @@ def generate_message(
     city = normalized.get("city") or "eurer Gegend"
     contact_name = normalized.get("contact_name") or ""
     greeting = f"Hoi {contact_name}".strip() if contact_name else "Hoi zaeme"
-    personalization = personalization_sentence(normalized, flags, commute_class)
+    personalization = personalization_sentence(
+        normalized, flags, commute_class, commute_minutes, commute_mode
+    )
     budget_sentence = (
         "Das Budget aus dem Inserat passt fuer mich."
         if normalized.get("rent_chf") and int(normalized["rent_chf"]) <= MAX_RENT_CHF
@@ -848,6 +867,8 @@ def score_listing(normalized: dict[str, Any]) -> ScoredListing:
         flags,
         gender_status,
         commute_class,
+        minutes,
+        mode,
     )
     return ScoredListing(
         normalized=normalized,
