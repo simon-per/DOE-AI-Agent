@@ -87,6 +87,9 @@ class _IngestTestBase(unittest.TestCase):
             reprocess=False,
             dry_run=False,
             verbose=False,
+            # Keep unrouted .eml samples inside the test's temp dir, never in the
+            # project's real .tmp/email_samples/.
+            dump_dir=Path(self._tmp.name) / "email_samples",
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -123,6 +126,18 @@ class IngestRoutingTest(_IngestTestBase):
             row = conn.execute("SELECT source, url FROM listings").fetchone()
         self.assertEqual(row[0], "homegate.ch")
         self.assertIn("homegate.ch/rent/4001111", row[1])
+
+    def test_unrouted_dump_honors_dump_dir(self) -> None:
+        dump_dir = Path(self._tmp.name) / "email_samples"
+        messages = [
+            make_email(sender="random@unknown.example.com", subject="x", plain="hi"),
+        ]
+        fake = FakeIMAP(messages)
+        with patch.object(ingest, "imap_credentials", return_value=("a@b.com", "pw")), \
+             patch.object(ingest, "connect_imap", return_value=fake):
+            ingest.sync_email_alerts(self._build_args(dump_dir=dump_dir))
+        dumped = list(dump_dir.glob("unrouted_*.eml"))
+        self.assertEqual(len(dumped), 1, "unrouted sample must land in the configured dir")
 
     def test_dry_run_does_not_write(self) -> None:
         messages = [

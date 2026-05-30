@@ -191,12 +191,13 @@ def message_identifier(msg: Message, uid: bytes) -> str:
 _SENDER_DOMAIN_RE = re.compile(r"@([\w.-]+)")
 
 
-def dump_unrouted(msg: Message, uid: bytes) -> Path:
-    UNROUTED_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+def dump_unrouted(msg: Message, uid: bytes, dump_dir: Path | None = None) -> Path:
+    target_dir = dump_dir or UNROUTED_DUMP_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     domain_match = _SENDER_DOMAIN_RE.search(msg.get("From") or "")
     sender_label = (domain_match.group(1) if domain_match else "unknown")[:40]
     safe_label = "".join(ch for ch in sender_label if ch.isalnum() or ch in ".-_")
-    target = UNROUTED_DUMP_DIR / f"unrouted_{safe_label or 'unknown'}_{uid.decode('ascii', 'replace')}.eml"
+    target = target_dir / f"unrouted_{safe_label or 'unknown'}_{uid.decode('ascii', 'replace')}.eml"
     target.write_bytes(msg.as_bytes())
     return target
 
@@ -231,6 +232,7 @@ def process_message(
     *,
     dry_run: bool,
     verbose: bool,
+    dump_dir: Path | None = None,
 ) -> MessageOutcome:
     """Parse one message and upsert listings; returns parse status for the caller.
 
@@ -242,7 +244,7 @@ def process_message(
     if parser is None:
         stats.unrouted += 1
         if not dry_run:
-            dumped = dump_unrouted(msg, uid)
+            dumped = dump_unrouted(msg, uid, dump_dir)
             if verbose:
                 print(f"  unrouted: from={from_header!r} dumped={dumped}")
         elif verbose:
@@ -303,6 +305,10 @@ def sync_email_alerts(args: argparse.Namespace) -> IngestStats:
     _load_env()
     address, password = imap_credentials()
     stats = IngestStats()
+    # Overridable so tests (and ad-hoc runs) don't write sample EMLs into the
+    # project's real .tmp/email_samples/. The workflow's arg-builder omits this,
+    # hence getattr with the module default.
+    dump_dir = getattr(args, "dump_dir", None) or UNROUTED_DUMP_DIR
 
     with closing(connect(args.db)) as conn:
         init_db(conn)
@@ -330,6 +336,7 @@ def sync_email_alerts(args: argparse.Namespace) -> IngestStats:
                     stats,
                     dry_run=args.dry_run,
                     verbose=args.verbose,
+                    dump_dir=dump_dir,
                 )
                 # Only mark seen when parsing succeeded — a parse failure must
                 # remain retryable after a code fix without `--reprocess`.
@@ -368,6 +375,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Parse + score without writing to SQLite or the seen-table.",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        type=Path,
+        default=None,
+        help="Directory for unrouted .eml samples (default: .tmp/email_samples).",
     )
     parser.add_argument("--verbose", action="store_true")
     return parser
