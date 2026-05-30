@@ -19,10 +19,21 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"[ \t ]+")
 
 
+# Currency-tagged amount. Two arms: "CHF 1'250.00" (currency first) and
+# "1'250.- CHF" (amount first). The amount-first arm carries negative
+# lookbehinds so a grouped phone fragment ("079 123 4567 CHF") or a longer
+# digit run can't be misread as rent. Decimal/grouping normalization happens
+# in _normalize_rent_token, not in this pattern.
 _RENT_RE = re.compile(
-    r"(?:CHF|Fr\.?)\s*([0-9][0-9'.,]{2,})|([0-9][0-9'.,]{2,})\s*(?:CHF|Fr\.?)",
+    r"(?:CHF|Fr\.?)\s*(?P<pre>\d[\d'’.,]*\d|\d)"
+    r"|(?<!\d\s)(?<![\d.,'’])(?P<post>\d[\d'’.,]*\d|\d)(?:[.,][-–—])?\s*(?:CHF|Fr\.?)\b",
     re.IGNORECASE,
 )
+
+# Peels a trailing cents group (".00" / ",50") so the integer part can have
+# its thousands separators stripped cleanly afterwards.
+_RENT_CENTS_RE = re.compile(r"^(?P<intpart>.*?)(?:[.,](?P<cents>\d{1,2}))?$")
+_RENT_SEP_CHARS = ".,'’ "
 
 
 class ParseError(Exception):
@@ -100,21 +111,24 @@ def dedupe_urls(urls: Iterable[str]) -> list[str]:
     return out
 
 
-_ANCHOR_TEMPLATE = (
-    r"<a\b[^>]*\bhref\s*=\s*[\"']{url}[\"'][^>]*>(?P<inner>.*?)</a>"
-)
-
-
 def extract_anchor_text(html: str, url: str) -> str | None:
-    """Return the visible text inside <a href="URL">...</a> if present.
+    """Return the visible text inside <a href="URL...">...</a> if present.
 
     Portal alerts usually wrap each listing URL in an anchor whose visible
     text is the listing's headline (city, room count, rent). That's a much
     better `title` than the digest-style subject we'd otherwise fall back to.
+
+    Matches on a URL *prefix* so an href that quotes the listing URL and then
+    appends tracking params (`?utm_source=alert`) still resolves, and tolerates
+    unquoted hrefs (`href=https://...`).
     """
     if not html or not url:
         return None
-    pattern = _ANCHOR_TEMPLATE.format(url=re.escape(url))
+    pattern = (
+        r"<a\b[^>]*\bhref\s*=\s*[\"']?"
+        + re.escape(url)
+        + r"[^\s>\"']*[\"']?[^>]*>(?P<inner>.*?)</a>"
+    )
     match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
     if not match:
         return None
@@ -122,19 +136,44 @@ def extract_anchor_text(html: str, url: str) -> str | None:
     return inner or None
 
 
+def _normalize_rent_token(raw: str) -> int | None:
+    """Turn a matched amount token (`1'250.00`, `850.-`, `1.250`) into an int.
+
+    Strips a trailing cents/dash group first, then thousands separators.
+    Rejects tokens carrying more than one separator in the integer part —
+    those look like dates ("1.7.2026") or grouped phone numbers, not rent.
+    """
+    token = raw.strip().rstrip("-–—.")
+    if not token:
+        return None
+    cents_match = _RENT_CENTS_RE.match(token)
+    intpart = (
+        cents_match.group("intpart")
+        if cents_match and cents_match.group("intpart")
+        else token
+    )
+    if sum(intpart.count(sep) for sep in _RENT_SEP_CHARS) > 1:
+        return None
+    digits = re.sub(r"[.,'’ ]", "", intpart)
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
 def extract_rent_chf(text: str) -> int | None:
-    """First CHF-tagged amount in `text`, normalized to int. Returns None
-    when nothing parseable shows up. Skips amounts under 100 (almost never
-    monthly rent) and over 10,000 (deposits and yearly figures rolled in)."""
+    """First plausible CHF-tagged amount in `text`, normalized to int.
+
+    Returns None when nothing parseable shows up. Skips amounts under 100
+    (almost never monthly rent) and over 10,000 (deposits, yearly figures).
+    Amounts with explicit cents (`CHF 850.00`) and apostrophe grouping
+    (`CHF 1'250`) normalize correctly; dates and phone fragments do not
+    produce a false positive."""
     if not text:
         return None
     for match in _RENT_RE.finditer(text):
-        raw = match.group(1) or match.group(2) or ""
-        cleaned = raw.replace("'", "").replace(".", "").replace(",", "")
-        if not cleaned.isdigit():
-            continue
-        value = int(cleaned)
-        if 100 <= value <= 10_000:
+        raw = match.group("pre") or match.group("post") or ""
+        value = _normalize_rent_token(raw)
+        if value is not None and 100 <= value <= 10_000:
             return value
     return None
 

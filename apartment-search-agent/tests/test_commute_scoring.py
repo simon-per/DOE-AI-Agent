@@ -135,6 +135,69 @@ class LiveLookupTest(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class HttpJsonTest(unittest.TestCase):
+    def test_logs_once_on_attempt_exhaustion(self) -> None:
+        # Reviewer H5: a retried request that never succeeds must leave a trace
+        # on stderr, with the query string (and any api_key) stripped.
+        import io
+        import urllib.error
+        from contextlib import redirect_stderr
+
+        err = urllib.error.HTTPError(
+            "https://api.test/geocode?api_key=secret", 503, "busy", {}, None
+        )
+        buf = io.StringIO()
+        with patch.object(cs.urllib.request, "urlopen", side_effect=err), \
+             patch.object(cs.time, "sleep"), redirect_stderr(buf):
+            result = cs._http_json(
+                "https://api.test/geocode?api_key=secret", max_attempts=2
+            )
+        self.assertIsNone(result)
+        logged = buf.getvalue()
+        self.assertIn("giving up on https://api.test/geocode", logged)
+        self.assertNotIn("secret", logged)
+
+    def test_no_retry_on_permanent_4xx(self) -> None:
+        import urllib.error
+
+        err = urllib.error.HTTPError("https://api.test/x", 400, "bad", {}, None)
+        with patch.object(cs.urllib.request, "urlopen", side_effect=err) as up, \
+             patch.object(cs.time, "sleep"):
+            result = cs._http_json("https://api.test/x", max_attempts=3)
+        self.assertIsNone(result)
+        self.assertEqual(up.call_count, 1)
+
+
+class GeocodeBoundaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(dir=cs.BASE_DIR / ".tmp")
+        self.addCleanup(self._tmp.cleanup)
+        self.cache_path = Path(self._tmp.name) / "commute.sqlite"
+
+    def test_geocode_rejects_out_of_country_hit(self) -> None:
+        # Reviewer M1: ORS boundary.rect is a soft hint; a namesake in Berlin
+        # (lat 52.52, lng 13.40) sits outside the Swiss box and must be dropped.
+        with closing(cs.init_cache(self.cache_path)) as conn, \
+             patch.object(cs, "api_key", return_value="fake-key"), \
+             patch.object(
+                 cs, "_http_json",
+                 return_value=_fake_geocode_response(lat=52.52, lng=13.40),
+             ):
+            self.assertIsNone(cs.geocode("Root, somewhere else", conn))
+
+    def test_geocode_accepts_swiss_hit_and_caches(self) -> None:
+        with closing(cs.init_cache(self.cache_path)) as conn, \
+             patch.object(cs, "api_key", return_value="fake-key"), \
+             patch.object(
+                 cs, "_http_json",
+                 return_value=_fake_geocode_response(lat=47.13, lng=8.45),
+             ) as http:
+            self.assertEqual(cs.geocode("Root D4", conn), (47.13, 8.45))
+            # Second call is served from the cache — no further HTTP.
+            self.assertEqual(cs.geocode("Root D4", conn), (47.13, 8.45))
+            self.assertEqual(http.call_count, 1)
+
+
 class PipelineIntegrationTest(unittest.TestCase):
     """estimate_commute() must keep working when the ORS path is disabled."""
 

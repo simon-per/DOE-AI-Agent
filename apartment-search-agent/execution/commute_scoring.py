@@ -46,7 +46,9 @@ USER_AGENT = "apartment-search-agent/0.1 (+commute scoring; low volume)"
 
 CACHE_TTL_DAYS = 30
 DEFAULT_TIMEOUT = 12
-DEFAULT_RETRIES = 1
+# Total HTTP attempts (1 retry). transport.opendata.ch / ORS only get retried
+# on 429 + 5xx; permanent 4xx returns immediately.
+DEFAULT_MAX_ATTEMPTS = 2
 
 SWITZERLAND_BBOX = "5.95,45.81,10.49,47.81"
 
@@ -83,7 +85,12 @@ def normalize_key(text: str) -> str:
 
 def init_cache(path: Path = DEFAULT_CACHE_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
+    # This cache file is shared with transit_scoring.py — WAL + a busy timeout
+    # let the e-bike and OeV writers touch it concurrently without "database
+    # is locked" errors.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS commute_cache (
@@ -165,7 +172,7 @@ def _http_json(
     headers: dict[str, str] | None = None,
     data: bytes | None = None,
     timeout: int = DEFAULT_TIMEOUT,
-    retries: int = DEFAULT_RETRIES,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> dict[str, Any] | None:
     method = "POST" if data is not None else "GET"
     final_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
@@ -174,7 +181,7 @@ def _http_json(
     if headers:
         final_headers.update(headers)
     last_exc: BaseException | None = None
-    for attempt in range(retries + 1):
+    for attempt in range(max_attempts):
         req = urllib.request.Request(url, data=data, method=method, headers=final_headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -186,8 +193,15 @@ def _http_json(
             last_exc = exc
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
             last_exc = exc
-        if attempt < retries:
+        if attempt < max_attempts - 1:
             time.sleep(0.5 * (attempt + 1))
+    if last_exc is not None:
+        # Drop any query string so a legacy api_key in the URL never lands in logs.
+        print(
+            f"[commute_scoring] giving up on {url.split('?', 1)[0]} "
+            f"after {max_attempts} attempt(s): {last_exc!r}",
+            file=sys.stderr,
+        )
     return None
 
 
@@ -212,7 +226,6 @@ def geocode(
         return float(row[0]), float(row[1])
 
     params = urllib.parse.urlencode({
-        "api_key": key,
         "text": address,
         "boundary.rect.min_lon": boundary_bbox.split(",")[0],
         "boundary.rect.min_lat": boundary_bbox.split(",")[1],
@@ -220,7 +233,11 @@ def geocode(
         "boundary.rect.max_lat": boundary_bbox.split(",")[3],
         "size": "1",
     })
-    body = _http_json(f"{base_url}{GEOCODE_PATH}?{params}")
+    # Key travels in the Authorization header (same as route_ebike) so it never
+    # lands in URL query logs.
+    body = _http_json(
+        f"{base_url}{GEOCODE_PATH}?{params}", headers={"Authorization": key}
+    )
     if not body:
         return None
     features = body.get("features") or []
@@ -230,6 +247,12 @@ def geocode(
     if len(coords) < 2:
         return None
     lng, lat = float(coords[0]), float(coords[1])
+    # ORS treats boundary.rect as a soft hint, so a typo'd address can still
+    # resolve to a far-away namesake. Hard-reject anything outside the box to
+    # keep junk coordinates (and junk routes) out of the cache.
+    min_lon, min_lat, max_lon, max_lat = (float(x) for x in boundary_bbox.split(","))
+    if not (min_lon <= lng <= max_lon and min_lat <= lat <= max_lat):
+        return None
     conn.execute(
         "INSERT OR REPLACE INTO geocode_cache (address_key, lat, lng, cached_at) "
         "VALUES (?, ?, ?, ?)",

@@ -63,6 +63,14 @@ class ParseBlockTest(unittest.TestCase):
         block = "source: anibis\n\nNo URL here, can't dedupe."
         self.assertIsNone(manual_paste.parse_block(block))
 
+    def test_non_http_url_returns_none(self) -> None:
+        # Reviewer M2: a `url:` value that isn't http(s) can't be deduped or
+        # opened, so it's skipped rather than stored as a bogus key.
+        self.assertIsNone(manual_paste.parse_block("url: just-some-text\n\nBody."))
+        self.assertIsNone(
+            manual_paste.parse_block("url: ftp://example.test/x\n\nBody.")
+        )
+
     def test_body_only_block_with_url_in_text_returns_none(self) -> None:
         # URL must appear as a header — body-only blocks can't be tracked.
         block = "https://example.test/x just floats in the body"
@@ -135,6 +143,24 @@ class CliTest(unittest.TestCase):
                 init_db(conn)
             rc = manual_paste.main(["--db", str(db_path), "--file", str(batch_file)])
         self.assertEqual(rc, 0)
+
+    def test_main_reads_bom_prefixed_file(self) -> None:
+        # Reviewer M3: a BOM (Notepad/Excel export) must not break the first
+        # `url:` header — both real listings should still land.
+        tmp_root = manual_paste.BASE_DIR / ".tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as tmpdir:
+            tmp = Path(tmpdir)
+            batch_file = tmp / "batch.txt"
+            batch_file.write_text(SAMPLE_BATCH, encoding="utf-8-sig")  # writes a BOM
+            db_path = tmp / "listings.sqlite"
+            with closing(connect(db_path)) as conn:
+                init_db(conn)
+            rc = manual_paste.main(["--db", str(db_path), "--file", str(batch_file)])
+            self.assertEqual(rc, 0)
+            with closing(sqlite3.connect(db_path)) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        self.assertEqual(count, 2)
 
     def test_main_requires_some_input(self) -> None:
         # No --file, stdin is a TTY → should SystemExit

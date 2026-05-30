@@ -119,6 +119,10 @@ def parse_block(block: str) -> ListingInput | None:
     url = headers.get("url")
     if not url:
         return None
+    # A `url:` value that isn't an http(s) URL can't be deduped or opened —
+    # skip it instead of storing a bogus canonical key.
+    if not url.lower().startswith(("http://", "https://")):
+        return None
 
     rent_raw = headers.get("rent") or headers.get("rent_chf")
     rent_chf = None
@@ -188,7 +192,9 @@ def ingest_blocks(blocks: Iterable[str], args: argparse.Namespace) -> BatchStats
 
 def read_source(args: argparse.Namespace) -> str:
     if args.file:
-        return args.file.read_text(encoding="utf-8")
+        # utf-8-sig transparently strips a leading BOM if the paste came from
+        # Notepad/Excel; plain utf-8 would leave it stuck on the first header.
+        return args.file.read_text(encoding="utf-8-sig")
     if not sys.stdin.isatty():
         return sys.stdin.read()
     raise SystemExit(

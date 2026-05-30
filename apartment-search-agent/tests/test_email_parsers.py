@@ -109,6 +109,36 @@ class StructuredExtractionHelperTest(unittest.TestCase):
         self.assertIsNone(extract_rent_chf(""))
         self.assertIsNone(extract_rent_chf("no money mentioned"))
 
+    def test_extract_rent_chf_handles_decimals_and_grouping(self) -> None:
+        # Reviewer H1: explicit cents must not push the amount past the
+        # plausibility ceiling (85000) and get dropped.
+        self.assertEqual(extract_rent_chf("CHF 850.00"), 850)
+        self.assertEqual(extract_rent_chf("CHF 850,50"), 850)
+        self.assertEqual(extract_rent_chf("CHF 1'250.00"), 1250)
+        self.assertEqual(extract_rent_chf("Miete Fr. 1'250.– pro Monat"), 1250)
+        self.assertEqual(extract_rent_chf("950.- CHF"), 950)
+
+    def test_extract_rent_chf_ignores_dates_and_phone_numbers(self) -> None:
+        # Reviewer H2: dates and grouped phone numbers must not surface a rent.
+        self.assertIsNone(extract_rent_chf("Frei ab 1.7.2026"))
+        self.assertIsNone(extract_rent_chf("Tel. 079 123 4567 CHF"))
+        self.assertIsNone(extract_rent_chf("Kontakt unter +41 79 123 45 67"))
+
+    def test_extract_anchor_text_handles_unquoted_and_tracking_query(self) -> None:
+        # Reviewer H3: unquoted hrefs and appended tracking params must still
+        # resolve to the anchor's visible text.
+        url = "https://example.test/listing/123"
+        self.assertEqual(
+            extract_anchor_text(f"<a href={url}>WG in Root</a>", url),
+            "WG in Root",
+        )
+        self.assertEqual(
+            extract_anchor_text(
+                f"<a href='{url}?utm_source=alert&id=9'>WG in Ebikon CHF 800</a>", url
+            ),
+            "WG in Ebikon CHF 800",
+        )
+
 
 class ParserDispatchTest(unittest.TestCase):
     def test_parser_for_sender_routes_each_portal(self) -> None:
@@ -300,6 +330,24 @@ class FooterAndSearchPageRejectionTest(unittest.TestCase):
             html="<a href='https://www.ronorp.net/zentralschweiz/ronorp/inserate/wohnen'>cat</a>",
         )
         self.assertEqual(RonorpParser().parse(msg), [])
+
+    def test_multiple_footer_urls_do_not_crowd_out_real_listing(self) -> None:
+        # Reviewer M6: a real alert is mostly chrome — home, search-results,
+        # privacy, app-store and unsubscribe links — wrapped around one real
+        # listing. Only the listing (numeric id) may survive.
+        real = "https://www.comparis.ch/immobilien/marktplatz/details/show/123456789"
+        html = (
+            "<a href='https://www.comparis.ch/'>Home</a>"
+            "<a href='https://www.comparis.ch/immobilien/marktplatz/luzern'>All results</a>"
+            "<a href='https://www.comparis.ch/datenschutz'>Datenschutz</a>"
+            "<a href='https://apps.apple.com/app/comparis'>App Store</a>"
+            "<a href='https://www.comparis.ch/account/unsubscribe'>Abmelden</a>"
+            f"<a href='{real}'>3.5 Zimmer in Luzern, CHF 1’850</a>"
+        )
+        msg = make_message(sender="noreply@comparis.ch", html=html)
+        parsed = ComparisParser().parse(msg)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].url, real)
 
 
 class RawTextCarriesSubjectTest(unittest.TestCase):
