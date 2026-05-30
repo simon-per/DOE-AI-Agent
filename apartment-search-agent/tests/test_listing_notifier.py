@@ -116,6 +116,19 @@ class NotifySelectionTest(_DbTest):
         result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
         self.assertEqual(result.candidates, 1)
 
+    def test_already_actioned_status_excluded(self) -> None:
+        # A rescore bumps updated_at on apply rows; one already marked 'sent'
+        # must not resurface in the brief (mirrors select_candidates/queue_rows).
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="apply-sent")
+            conn.execute(
+                "UPDATE listings SET status='sent' WHERE canonical_key=?", ("apply-sent",)
+            )
+            conn.commit()
+            _insert(conn, key="apply-new")
+        result = ln.notify_new_listings(self.db, since="7d", dry_run=True)
+        self.assertEqual(result.candidates, 1)
+
     def test_promoted_listing_via_updated_at_window(self) -> None:
         # Reviewer H1: a row created 30d ago (outside the 7d window) but
         # re-scored/promoted to apply today (fresh updated_at) must still surface.
@@ -231,6 +244,25 @@ class ActionPacketTest(_DbTest):
         _, text_body, html_body = self._render()
         self.assertIn("anna@example.ch", text_body)
         self.assertIn("mailto:anna@example.ch", html_body)
+
+    def test_llm_line_shown_when_scored(self) -> None:
+        # Advisory re-rank score surfaces as an LLM line in both text and HTML.
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="a")
+            conn.execute(
+                "UPDATE listings SET openrouter_score=?, openrouter_reason=? WHERE canonical_key=?",
+                (88, "calm WG, close to Root", "a"),
+            )
+            conn.commit()
+        _, text_body, html_body = self._render()
+        self.assertIn("LLM 88 — calm WG, close to Root", text_body)
+        self.assertIn("LLM 88", html_body)
+
+    def test_no_llm_line_when_unscored(self) -> None:
+        with closing(connect(self.db)) as conn:
+            _insert(conn, key="a")
+        _, text_body, _ = self._render()
+        self.assertNotIn("LLM ", text_body)
 
 
 class CliTest(_DbTest):

@@ -81,10 +81,12 @@ def fetch_candidates(conn, since: str, max_rows: int) -> list[dict]:
         SELECT id, title, city, rent_chf, commute_class, commute_minutes,
                commute_mode, priority_score, url, canonical_url, move_in,
                message_draft, wg_fit_score, price_score, contact_email, source,
-               recommended_action, decision, created_at, updated_at
+               recommended_action, decision, created_at, updated_at,
+               openrouter_score, openrouter_reason
         FROM listings
         WHERE decision = ?
           AND notified_at IS NULL
+          AND status NOT IN ('sent', 'archived')
           AND (created_at >= ? OR updated_at >= ?)
         ORDER BY priority_score DESC, created_at DESC
         LIMIT ?

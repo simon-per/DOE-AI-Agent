@@ -479,6 +479,39 @@ class RescoreTest(unittest.TestCase):
         # Scoring was refreshed away from the stale override.
         self.assertNotEqual(after["commute_mode"], "manual override")
 
+    def test_rescore_noop_preserves_updated_at(self) -> None:
+        # A rescore that produces identical scoring must not bump updated_at, so
+        # it never spuriously widens the notifier's new-listing window.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "listings.sqlite"
+            with closing(connect(db_path)) as conn:
+                init_db(conn)
+                listing = ListingInput(
+                    url="https://flatfox.ch/listing/noop-1",
+                    source="flatfox",
+                    title="Schoenes Zimmer Root",
+                    rent_chf=780,
+                    city="Root",
+                    move_in="16.07.",
+                    contact_name=None,
+                    contact_email=None,
+                    raw_text="ruhig sauber Anmeldung",
+                    commute_minutes=None,
+                )
+                listing_id, _ = upsert_listing(conn, score_listing(normalize_listing(listing)))
+                before = conn.execute(
+                    "SELECT updated_at FROM listings WHERE id = ?", (listing_id,)
+                ).fetchone()[0]
+
+                rescored, changed = rescore_all(conn)
+
+                after = conn.execute(
+                    "SELECT updated_at FROM listings WHERE id = ?", (listing_id,)
+                ).fetchone()[0]
+
+        self.assertEqual((rescored, changed), (1, 0))
+        self.assertEqual(after, before)  # unchanged row keeps its timestamp
+
     def test_rescore_reports_decision_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "listings.sqlite"

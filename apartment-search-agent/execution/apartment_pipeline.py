@@ -1059,8 +1059,29 @@ def rescore_all(conn: sqlite3.Connection, limit: int | None = None) -> tuple[int
     changed = 0
     for row in rows:
         scored = score_listing(_normalized_from_row(row))
-        if scored.decision != row.get("decision"):
+        new_flags_json = json.dumps(scored.flags, ensure_ascii=True)
+        decision_changed = scored.decision != row.get("decision")
+        if decision_changed:
             changed += 1
+        # Only bump updated_at when the score actually moved, so a no-op rescore
+        # doesn't widen the notifier's new-listing window (created_at/updated_at
+        # cutoff) or muddy "last meaningful change". Compare every written column.
+        materially_changed = decision_changed or any(
+            new != row.get(col)
+            for col, new in (
+                ("recommended_action", scored.recommended_action),
+                ("priority_score", scored.priority_score),
+                ("commute_class", scored.commute_class),
+                ("commute_minutes", scored.commute_minutes),
+                ("commute_mode", scored.commute_mode),
+                ("price_score", scored.price_score),
+                ("wg_fit_score", scored.wg_fit_score),
+                ("gender_status", scored.gender_status),
+                ("scam_risk", scored.scam_risk),
+                ("message_variant", scored.message_variant),
+                ("message_draft", scored.message_draft),
+            )
+        ) or new_flags_json != (row.get("flags_json") or "")
         conn.execute(
             """
             UPDATE listings SET
@@ -1092,10 +1113,10 @@ def rescore_all(conn: sqlite3.Connection, limit: int | None = None) -> tuple[int
                 "wg_fit_score": scored.wg_fit_score,
                 "gender_status": scored.gender_status,
                 "scam_risk": scored.scam_risk,
-                "flags_json": json.dumps(scored.flags, ensure_ascii=True),
+                "flags_json": new_flags_json,
                 "message_variant": scored.message_variant,
                 "message_draft": scored.message_draft,
-                "updated_at": now_iso(),
+                "updated_at": now_iso() if materially_changed else row.get("updated_at"),
             },
         )
         rescored += 1
