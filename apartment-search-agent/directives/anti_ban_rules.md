@@ -76,15 +76,21 @@ approval.
 
 ## Paid LLM Scoring
 
-OpenRouter or other paid LLM scoring may be useful as a second-pass qualitative
-rating, but it must remain separate from the deterministic safety filters.
+OpenRouter paid LLM scoring is a second-pass qualitative rating that must remain
+separate from the deterministic safety filters.
 
-Before running paid scoring:
-- Simon must approve the model and expected cost
-- the scoring prompt must be stored in a directive or script config
+**Approved (Simon, 2026-05-30):** `execution/llm_rerank.py`, default model
+`google/gemma-4-31b` (env-overridable via `MODEL_RERANK` / `OPENROUTER_MODEL`),
+advisory only, manual opt-in. It runs dry-run by default (zero calls) and is
+capped at `--max-rows` (default 40) per run; ~one short call per listing keeps
+cost to a fraction of a cent. It is NOT part of the automated daily run.
+
+Standing constraints (unchanged):
+- the scoring prompt lives in the script config (`CRITERIA` in `llm_rerank.py`)
 - the LLM score must not override hard exclusions
 - the Google Sheet may display `openrouter_score` and `openrouter_reason`, but
-  deterministic `decision` and approval gates remain authoritative
+  the deterministic `decision` and approval gates remain authoritative — the
+  re-rank only re-orders / annotates within the `consider` tier
 
 ## Gender Restrictions
 

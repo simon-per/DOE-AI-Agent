@@ -16,6 +16,11 @@ for /f "usebackq" %%d in (`powershell -NoProfile -Command "Get-Date -Format yyyy
 if not exist ".tmp\logs" mkdir ".tmp\logs" >nul 2>&1
 set "LOG=.tmp\logs\daily_!STAMP!.log"
 
+REM Force UTF-8 stdout so German listing text (umlauts, etc.) logs cleanly to the
+REM redirected file instead of raising UnicodeEncodeError on the locale codepage.
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
 REM Prefer a project virtualenv, fall back to python on PATH.
 set "PY=.venv\Scripts\python.exe"
 if not exist "!PY!" set "PY=python"

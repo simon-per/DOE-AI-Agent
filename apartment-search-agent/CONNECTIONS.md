@@ -166,12 +166,15 @@ Current source strategy:
 
 ## OpenRouter Scoring
 
-The Google Sheet has placeholder columns:
+The Google Sheet surfaces two advisory columns:
 
 - `openrouter_score`
 - `openrouter_reason`
 
-Do not run paid LLM scoring until Simon approves the model, budget, and exact scoring prompt.
+Approved (2026-05-30): `execution/llm_rerank.py` fills them via OpenRouter
+(`OPENROUTER_API_KEY`), default model `google/gemma-4-31b`. Advisory only —
+dry-run by default, `--send` to write, `--max-rows` caps spend, and it never
+changes the deterministic `decision`. Manual command, not in the daily auto-run.
 
 ## Sending Policy
 

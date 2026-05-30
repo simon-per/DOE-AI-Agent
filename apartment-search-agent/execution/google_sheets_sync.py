@@ -495,8 +495,10 @@ def listing_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     for row in rows:
         item = dict(row)
         item["flags"] = json_list(item.pop("flags_json", ""))
-        item["openrouter_score"] = ""
-        item["openrouter_reason"] = ""
+        # Advisory LLM re-rank (execution/llm_rerank.py), shown when present.
+        # Coerce NULLs to "" so the cells stay clean for un-scored rows.
+        item["openrouter_score"] = "" if item.get("openrouter_score") is None else item["openrouter_score"]
+        item["openrouter_reason"] = item.get("openrouter_reason") or ""
         result.append(enrich_listing_row(item))
     return result
 

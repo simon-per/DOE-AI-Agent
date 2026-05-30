@@ -120,6 +120,16 @@ def _meta_text(row: dict) -> str:
     )
 
 
+def _llm_line(row: dict) -> str:
+    """Advisory LLM re-rank annotation, or '' when the row was not scored.
+    Advisory only — it never reflects or changes the deterministic decision."""
+    score = row.get("openrouter_score")
+    if score in (None, ""):
+        return ""
+    reason = (row.get("openrouter_reason") or "").strip()
+    return f"LLM {score} — {reason}" if reason else f"LLM {score}"
+
+
 def format_summary(rows: list[dict]) -> tuple[str, str, str]:
     """Return (subject, text_body, html_body). Each listing is a complete action
     packet: headline, meta, apply link/contact, and the ready-to-send draft."""
@@ -132,6 +142,9 @@ def format_summary(rows: list[dict]) -> tuple[str, str, str]:
         url = row.get("url") or row.get("canonical_url") or "(no url)"
         text.append(_headline(index, row))
         text.append(_meta_text(row))
+        llm_line = _llm_line(row)
+        if llm_line:
+            text.append(f"   {llm_line}")
         text.append(f"   Apply: {url}")
         if row.get("contact_email"):
             text.append(f"   Email: {row['contact_email']}")
@@ -173,10 +186,12 @@ def _format_html(rows: list[dict], count: int, plural: str) -> str:
         if row.get("contact_email"):
             email = html.escape(row["contact_email"])
             contact = f' · <a href="mailto:{html.escape(row["contact_email"], quote=True)}">{email}</a>'
+        llm = _llm_line(row)
+        llm_html = f"<br>{html.escape(llm)}" if llm else ""
         blocks.append(
             f"<h3>{index}. [{klass}] {title}</h3>"
             f"<p>{city} · {rent} · {commute}{move_in}<br>"
-            f"{wg_text} · price: {price} · via {source}<br>"
+            f"{wg_text} · price: {price} · via {source}{llm_html}<br>"
             f"{apply_html}{contact}</p>"
             f'<pre style="white-space:pre-wrap;border:1px solid #ddd;'
             f'padding:8px;border-radius:4px;">{draft}</pre>'

@@ -166,6 +166,24 @@ The full workflow runs it automatically after scoring (disable with
 DRY RUN by default — it only emails with `--send` or from a live (non-dry-run)
 workflow.
 
+## Advisory LLM Re-rank
+
+`execution/llm_rerank.py` adds a cheap second-pass qualitative score over the
+`consider` tier via OpenRouter. It is **advisory only**: it writes nothing but
+`openrouter_score` / `openrouter_reason` and never changes the deterministic
+`decision`, priority, or any safety filter. Not part of the daily auto-run.
+
+```powershell
+python execution/llm_rerank.py --dry-run            # prompt + candidate count, ZERO spend
+python execution/llm_rerank.py --send --max-rows 5  # capped real run (writes scores)
+```
+
+DRY-RUN by default (no API calls). `--send` needs `OPENROUTER_API_KEY`; with no
+key it is a logged no-op. Default model is `google/gemma-4-31b`, overridable via
+`MODEL_RERANK` / `OPENROUTER_MODEL`. `--max-rows` (default 40) caps spend at ~one
+short call per listing. Scores then show as an `LLM <n> — <reason>` line in the
+notifier brief and the Sheet's advisory columns.
+
 The script creates/updates `data/listings.sqlite`, dedupes listings, scores commute/rent/WG fit, flags exclusions and scam risk, and writes:
 
 - `data/application_queue.csv`
@@ -265,9 +283,9 @@ Dependencies expected in the Python environment:
 - `google-auth-oauthlib`
 - `google-api-python-client` for the optional service-account fallback
 
-The `Listings` tab includes empty `openrouter_score` and `openrouter_reason`
-columns. Do not add paid OpenRouter scoring until Simon explicitly approves the
-model, budget, and scoring prompt.
+The `Pipeline` tab surfaces the advisory `openrouter_score` / `openrouter_reason`
+columns, populated by the opt-in re-rank (see "Advisory LLM Re-rank"). They are
+display-only — the deterministic `decision` stays authoritative.
 
 The sync owns generated columns and clears stale generated rows/columns inside
 the worksheet grid. The `Pipeline` tab is keyed by `listing_id`: generated
