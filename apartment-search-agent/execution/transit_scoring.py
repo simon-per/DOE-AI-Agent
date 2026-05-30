@@ -26,6 +26,7 @@ import re
 import sys
 import urllib.parse
 from contextlib import closing
+from datetime import date, timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -81,6 +82,18 @@ def parse_duration_to_minutes(duration: str) -> int | None:
     return max(1, total)
 
 
+def _next_weekday_date(today: date | None = None) -> str:
+    """Next Tuesday (today if it's already Tuesday) as YYYY-MM-DD.
+
+    transport.opendata.ch defaults `date` to the run day, so a weekend/holiday
+    cron would score that day's sparse timetable and pin it in the 30-day cache.
+    Anchoring to a mid-week weekday keeps the cached duration representative
+    regardless of when the run happens. Tuesday avoids Monday holiday spillover."""
+    day = today or date.today()
+    days_ahead = (1 - day.weekday()) % 7  # Monday=0 … Tuesday=1
+    return (day + timedelta(days=days_ahead)).isoformat()
+
+
 def _query_transit_minutes(
     from_addr: str,
     to_addr: str,
@@ -93,6 +106,7 @@ def _query_transit_minutes(
         "from": from_addr,
         "to": to_addr,
         "limit": str(limit),
+        "date": _next_weekday_date(),
         "time": MORNING_DEPARTURE,
         # Trim the payload — we only need each connection's duration.
         "fields[]": "connections/duration",
@@ -108,6 +122,14 @@ def _query_transit_minutes(
         if (m := parse_duration_to_minutes(c.get("duration") or "")) is not None
     ]
     if not durations:
+        # Distinguish "no routes" (quietly fall back) from "API shape changed"
+        # (connections present but no parseable duration) so the latter is visible.
+        if connections:
+            print(
+                f"[transit_scoring] {len(connections)} connection(s) but no parseable "
+                f"duration for {from_addr!r} -> {to_addr!r} (API shape changed?)",
+                file=sys.stderr,
+            )
         return None
     return min(durations)
 

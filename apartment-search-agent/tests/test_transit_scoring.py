@@ -52,6 +52,67 @@ class QueryTransitTest(unittest.TestCase):
             self.assertEqual(ts._query_transit_minutes("Luzern", "Root D4"), 40)
 
 
+class NextWeekdayTest(unittest.TestCase):
+    def test_always_lands_on_tuesday_within_a_week(self) -> None:
+        from datetime import date
+        for day in range(1, 22):  # three full weeks of seed days
+            seed = date(2026, 6, day)
+            result = date.fromisoformat(ts._next_weekday_date(seed))
+            self.assertEqual(result.weekday(), 1, f"{seed} -> {result}")
+            self.assertGreaterEqual(result, seed)
+            self.assertLess((result - seed).days, 7)
+
+    def test_tuesday_maps_to_itself(self) -> None:
+        from datetime import date, timedelta
+        day = date(2026, 6, 1)
+        while day.weekday() != 1:
+            day += timedelta(days=1)
+        self.assertEqual(ts._next_weekday_date(day), day.isoformat())
+
+
+class QueryParamsTest(unittest.TestCase):
+    def test_query_pins_a_weekday_date(self) -> None:
+        import datetime as _dt
+        import re as _re
+
+        captured = {}
+
+        def fake_http(url, **kwargs):
+            captured["url"] = url
+            return _fake_connections("00d00:20:00")
+
+        with patch.object(cs, "_http_json", side_effect=fake_http):
+            ts._query_transit_minutes("Luzern", "Root D4")
+        match = _re.search(r"date=(\d{4}-\d{2}-\d{2})", captured["url"])
+        self.assertIsNotNone(match, captured["url"])
+        self.assertEqual(_dt.date.fromisoformat(match.group(1)).weekday(), 1)
+
+
+class ShapeChangeLogTest(unittest.TestCase):
+    def test_logs_when_connections_present_but_unparseable(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with patch.object(cs, "_http_json",
+                          return_value=_fake_connections("garbage", "also-bad")), \
+             redirect_stderr(buf):
+            result = ts._query_transit_minutes("Luzern", "Root D4")
+        self.assertIsNone(result)
+        self.assertIn("API shape changed", buf.getvalue())
+
+    def test_no_log_when_no_connections(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with patch.object(cs, "_http_json", return_value={"connections": []}), \
+             redirect_stderr(buf):
+            result = ts._query_transit_minutes("Nowhere", "Root D4")
+        self.assertIsNone(result)
+        self.assertEqual(buf.getvalue(), "")
+
+
 class LiveTransitTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(dir=cs.BASE_DIR / ".tmp")
