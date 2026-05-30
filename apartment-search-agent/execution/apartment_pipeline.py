@@ -485,23 +485,51 @@ def matching_pattern_keys(pattern_map: dict[str, list[str]], text: str) -> list[
     return [key for key, patterns in pattern_map.items() if any_pattern(patterns, text)]
 
 
-def _live_commute_lookup(city: str) -> tuple[int, str] | None:
-    """Live ORS lookup, no-op when no API key is configured. Imported lazily
-    so the static path keeps working without dotenv / network / sqlite3 setup."""
+def _live_ebike_lookup(query: str) -> tuple[int, str] | None:
+    """Live ORS e-bike lookup, no-op when no API key is configured. Imported
+    lazily so the static path keeps working without dotenv / network setup."""
     try:
         from execution.commute_scoring import is_enabled, live_commute_minutes
     except Exception:  # noqa: BLE001 - never let scoring break on import errors
         return None
     if not is_enabled():
         return None
-    query = city if "," in city else f"{city}, Switzerland"
     try:
         result = live_commute_minutes(query)
     except Exception:  # noqa: BLE001 - network/HTTP/SQLite errors never abort scoring
         return None
-    if result is None:
+    return (result.minutes, result.mode) if result is not None else None
+
+
+def _live_transit_lookup(city: str) -> tuple[int, str] | None:
+    """Live public-transport (oeV) lookup. Needs no API key, so it runs even
+    when ORS is unconfigured — this is what lifts Lucerne-core listings to A."""
+    try:
+        from execution.transit_scoring import live_transit_minutes
+    except Exception:  # noqa: BLE001 - never let scoring break on import errors
         return None
-    return result.minutes, result.mode
+    try:
+        result = live_transit_minutes(city)
+    except Exception:  # noqa: BLE001 - network/HTTP/SQLite errors never abort scoring
+        return None
+    return (result.minutes, result.mode) if result is not None else None
+
+
+def _live_commute_lookup(city: str) -> tuple[int, str] | None:
+    """Best live door-to-door commute to Root D4: min(e-bike, oeV).
+
+    Queries both modes (each lazily imported, each fail-silent) and returns the
+    faster. When both resolve, the mode label shows both legs so the tracker
+    explains why a listing ranks where it does."""
+    query = city if "," in city else f"{city}, Switzerland"
+    ebike = _live_ebike_lookup(query)
+    transit = _live_transit_lookup(city)
+    if ebike is None and transit is None:
+        return None
+    if ebike is not None and transit is not None:
+        best = min(ebike[0], transit[0])
+        return best, f"oeV {transit[0]} / e-bike {ebike[0]} (live)"
+    return ebike if ebike is not None else transit
 
 
 def estimate_commute(city: str, override_minutes: int | None = None) -> tuple[int | None, str, str]:

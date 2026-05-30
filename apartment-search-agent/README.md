@@ -87,20 +87,29 @@ type .tmp/batch.txt | python execution/manual_paste.py --dry-run
 
 Block format is documented in `execution/manual_paste.py`'s docstring.
 
-## Live Commute Scoring (Optional)
+## Live Commute Scoring
 
-Without setup the pipeline scores commute against a hand-curated city →
-minutes lookup. Setting `OPENROUTESERVICE_API_KEY` in `.env` switches the
-scorer to live e-bike routing against PHENOGY's coordinates, with a SQLite
-cache (`data/commute_cache.sqlite`) so each address only hits the API once.
+The pipeline scores commute by the **faster of two live paths**, falling back
+to a hand-curated city → minutes table when neither is reachable — listings
+never break for lack of routing. Both results cache in
+`data/commute_cache.sqlite`, so each address hits an API at most once.
+
+- **E-bike** — OpenRouteService routing to PHENOGY's coordinates. Opt-in: set
+  `OPENROUTESERVICE_API_KEY` in `.env` (2,000 free requests/day).
+- **Public transport (oeV)** — transport.opendata.ch, **no key required, on by
+  default**. This is what lifts Lucerne-core listings from B to A: ~11 min by
+  train vs ~35 min by bike. Set `TRANSPORT_OPENDATA_ENABLED=0` to disable.
 
 ```powershell
 python execution/commute_scoring.py "Buchrain, Switzerland"
 # -> 'Buchrain, Switzerland': 22 min via e-bike (live) (6.4 km)
+python execution/transit_scoring.py "Luzern" --to "Root D4"
+# -> 'Luzern' -> 'Root D4': 11 min via oeV (live)
 ```
 
-If the API is missing, rate-limited, or down, scoring silently falls back
-to the static table — listings never break for lack of routing.
+When both resolve, the tracker shows both legs (e.g. `oeV 11 / e-bike 35
+(live)`) and ranks on the minimum. If an API is missing, rate-limited, or down,
+that leg is silently skipped.
 
 The script creates/updates `data/listings.sqlite`, dedupes listings, scores commute/rent/WG fit, flags exclusions and scam risk, and writes:
 

@@ -101,12 +101,14 @@ need today.
 
 For e-bike routing:
 
-- [ ] OpenRouteService API key
+- [x] OpenRouteService API key — `OPENROUTESERVICE_API_KEY` (optional; the
+      e-bike leg is skipped when unset). Used by `execution/commute_scoring.py`.
 
 For public transport:
 
-- [ ] transport.opendata.ch, no key for simple Transport API use
-- [ ] OpenTransportData API key if using the official API manager / OJP flow later
+- [x] transport.opendata.ch — no key, on by default. Used by
+      `execution/transit_scoring.py`; disable with `TRANSPORT_OPENDATA_ENABLED=0`.
+- [ ] OpenTransportData API key only if migrating to the official API manager / OJP flow later
 
 Search target:
 

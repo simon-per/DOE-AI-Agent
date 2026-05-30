@@ -204,7 +204,8 @@ class PipelineIntegrationTest(unittest.TestCase):
     def test_estimate_commute_uses_static_when_api_disabled(self) -> None:
         from execution.apartment_pipeline import estimate_commute
 
-        with patch.object(cs, "api_key", return_value=None):
+        with patch.object(cs, "api_key", return_value=None), \
+             patch("execution.transit_scoring.live_transit_minutes", return_value=None):
             minutes, klass, mode = estimate_commute("Buchrain")
         self.assertEqual(minutes, 22)
         self.assertEqual(klass, "A")
@@ -216,7 +217,8 @@ class PipelineIntegrationTest(unittest.TestCase):
         with patch(
             "execution.commute_scoring.live_commute_minutes",
             return_value=cs.RouteResult(minutes=15, mode="e-bike (live)", distance_km=4.2),
-        ), patch.object(cs, "is_enabled", return_value=True):
+        ), patch.object(cs, "is_enabled", return_value=True), \
+             patch("execution.transit_scoring.live_transit_minutes", return_value=None):
             minutes, klass, mode = estimate_commute("Some custom address")
         self.assertEqual(minutes, 15)
         self.assertEqual(klass, "A+")
@@ -228,7 +230,8 @@ class PipelineIntegrationTest(unittest.TestCase):
         with patch(
             "execution.commute_scoring.live_commute_minutes",
             side_effect=RuntimeError("ORS down"),
-        ), patch.object(cs, "is_enabled", return_value=True):
+        ), patch.object(cs, "is_enabled", return_value=True), \
+             patch("execution.transit_scoring.live_transit_minutes", return_value=None):
             minutes, klass, mode = estimate_commute("Ebikon")
         # Falls back to static table entry for Ebikon (27 min, A).
         self.assertEqual(minutes, 27)
