@@ -279,8 +279,15 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
         if args.skip_google:
             print("Google Sheets sync skipped.")
         else:
-            google_sheets_main(build_google_args(args, db_path))
-            google_synced = not args.dry_run
+            try:
+                google_sheets_main(build_google_args(args, db_path))
+                google_synced = not args.dry_run
+            except Exception as exc:  # noqa: BLE001 - sync must never abort the run
+                # OAuth refresh / gspread / network failures are logged but never
+                # break the workflow: the morning brief has already been sent and
+                # the local tracker + CSV/Markdown exports remain the source of
+                # truth. Mirrors the email-ingest resilience pattern above.
+                print(f"Google Sheets sync unavailable: {exc}")
 
         return WorkflowResult(
             db_path=db_path,

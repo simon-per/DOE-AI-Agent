@@ -65,6 +65,36 @@ Dry-run mode copies the current tracker to `.tmp/`, performs the same workflow
 against temporary files, and runs Google Sheets in dry-run mode. It does not
 modify the real tracker, exports, or Google Sheet.
 
+A failed Google Sheet sync (expired OAuth, gspread/network error) is logged and
+skipped — it never aborts the run, so the morning action brief is always sent
+and the local tracker/exports stay authoritative.
+
+## Automated Daily Run
+
+`scripts\daily_apartment_run.cmd` is the unattended wrapper: it runs the full
+workflow (no `--dry-run`, so the apply-tier brief is emailed to Simon's own
+inbox), logging to `.tmp\logs\daily_YYYYMMDD.log`. It prefers `.venv\Scripts\
+python.exe` and falls back to `python` on PATH. It does **not** auto-send portal
+applications.
+
+Install the schedule yourself (the agent never registers a task). Either import
+the ready-made task definition (`WakeToRun` + `StartWhenAvailable` so a sleeping
+laptop still fires it):
+
+```powershell
+schtasks /Create /TN "DOE_ApartmentDaily" /XML "scripts\DOE_ApartmentDaily.xml" /F
+```
+
+…or create it inline (simpler, but without the wake-from-sleep settings):
+
+```powershell
+schtasks /Create /TN "DOE_ApartmentDaily" /TR "\"%CD%\scripts\daily_apartment_run.cmd\"" /SC DAILY /ST 07:30 /F
+```
+
+Run once on demand to verify: `schtasks /Run /TN "DOE_ApartmentDaily"` (or just
+execute `scripts\daily_apartment_run.cmd`), then check the latest
+`.tmp\logs\daily_*.log`.
+
 ## Manual Local Tools
 
 Use the deterministic tracker before adding any account automation:
