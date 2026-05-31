@@ -62,14 +62,19 @@ Start with:
 ## Workflow
 
 1. Ingest saved-search alerts or manually provided listing URLs.
-2. Normalize listing fields.
-3. Dedupe the listing against existing tracker entries.
-4. Apply hard filters.
-5. Score commute.
-6. Score WG fit.
-7. Generate a tailored application draft.
-8. Present the top queue to Simon.
-9. Send only after approval or prepare a draft for Simon to send.
+2. Reconcile liveness of previously-ingested Flatfox listings (per-pk public-API
+   check); mark taken-down ones `expired` so they drop out of the queue, brief,
+   plan, re-rank, and Sheet. Fail-safe: never expire on an API/network error or
+   an ambiguous (pk-filter-ignored) response. Bounded by `--reconcile-stale-hours`
+   / `--reconcile-max-checks`; `--skip-reconcile` opts out.
+3. Normalize listing fields.
+4. Dedupe the listing against existing tracker entries.
+5. Apply hard filters.
+6. Score commute.
+7. Score WG fit.
+8. Generate a tailored application draft.
+9. Present the top queue to Simon.
+10. Send only after approval or prepare a draft for Simon to send.
 
 ## Current Deterministic Tools
 
