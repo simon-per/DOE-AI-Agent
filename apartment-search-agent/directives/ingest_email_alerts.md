@@ -3,9 +3,9 @@
 ## Goal
 
 Pull new apartment listings into the local tracker from saved-search email
-alerts on portals that block direct scraping. As of 2026-05-29 this covers
+alerts on portals that block direct scraping. As of 2026-05-31 this covers
 **WGZimmer, Homegate, Newhome, ImmoScout24, Flatfox, Comparis, Anibis,
-Tutti, and Ronorp**.
+Tutti, Ronorp, WG-Gesucht, and UrbanHome**.
 
 This is the compliant alternative to scraping those portals — each one
 returns HTTP 403 to direct requests, and `directives/anti_ban_rules.md`
@@ -96,6 +96,14 @@ the source for private one-room sublets.
 **Ronorp.net** — "Insert-Alarm" on the Zentralschweiz wohnen category.
 Strong source for Luzern WG rooms specifically.
 
+**WG-Gesucht.de** — create a "Suchauftrag" for Luzern (region 152) covering
+WG-Zimmer **and** 1-Zimmer/Wohnungen, max CHF 1000, with email notification on
+(instant or daily). Net-new WG inventory the Swiss-only portals miss.
+
+**UrbanHome.ch** — "Suchabo" for Luzern (mieten, Wohnung + WG), daily email.
+Aggregator, but carries some exclusive direct listings; duplicates collapse via
+the tracker's upsert dedupe.
+
 ## Parser registry
 
 Defined in `execution/email_parsers/__init__.py`. Each parser:
@@ -125,6 +133,15 @@ To add a new portal:
 - If you discover an alert sender we don't recognise, the message gets
   dumped to `.tmp/email_samples/` instead of erroring. Iterate by reading
   the dump, updating the parser, rerunning with `--reprocess`.
+- **UrbanHome's `listing_url_pattern` is provisional.** Its detail pages render
+  client-side, so the exact path couldn't be confirmed without a real alert. The
+  current regex (a non-`/suchen/` URL carrying a 6+ digit id) errs toward
+  under-matching — a miss yields 0 rows, never junk. On the first real UrbanHome
+  alert, read the `.eml`, set the precise detail pattern, and rerun `--reprocess`.
+- **WG-Gesucht** detail links may arrive as click-tracking redirects
+  (`email.wg-gesucht.de/c/…`) rather than the direct `.<id>.html` URL. If the
+  first alert routes but parses 0 listings, the redirect wraps the target — add
+  unwrapping (decode the redirect's target param) and rerun `--reprocess`.
 
 ## Safety boundaries
 

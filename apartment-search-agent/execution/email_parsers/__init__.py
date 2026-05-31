@@ -16,6 +16,8 @@ from .immoscout24 import ImmoScout24Parser
 from .newhome import NewhomeParser
 from .ronorp import RonorpParser
 from .tutti import TuttiParser
+from .urbanhome import UrbanHomeParser
+from .wggesucht import WgGesuchtParser
 from .wgzimmer import WGZimmerParser
 
 REGISTERED_PARSERS: tuple[BaseEmailParser, ...] = (
@@ -28,6 +30,8 @@ REGISTERED_PARSERS: tuple[BaseEmailParser, ...] = (
     AnibisParser(),
     TuttiParser(),
     RonorpParser(),
+    WgGesuchtParser(),
+    UrbanHomeParser(),
 )
 
 

@@ -52,8 +52,9 @@ The workflow runner:
 
 - ingests Flatfox via the documented public API unless `--skip-flatfox` is set
 - ingests saved-search alert emails (WGZimmer / Homegate / Newhome /
-  ImmoScout24 / Flatfox) over Gmail IMAP unless `--skip-emails` is set —
-  this is the compliant alternative to scraping bot-protected portals, see
+  ImmoScout24 / Flatfox / Comparis / Anibis / Tutti / Ronorp / WG-Gesucht /
+  UrbanHome) over Gmail IMAP unless `--skip-emails` is set — this is the
+  compliant alternative to scraping bot-protected portals, see
   `directives/ingest_email_alerts.md`
 - reconciles Flatfox listing liveness unless `--skip-reconcile` is set — a per-pk
   check that marks taken-down listings `expired` so they drop out of the queue,

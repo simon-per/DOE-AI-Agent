@@ -10,6 +10,8 @@ from execution.email_parsers import (
     NewhomeParser,
     RonorpParser,
     TuttiParser,
+    UrbanHomeParser,
+    WgGesuchtParser,
     WGZimmerParser,
     parser_for_sender,
 )
@@ -152,6 +154,8 @@ class ParserDispatchTest(unittest.TestCase):
             "alerts@anibis.ch": AnibisParser,
             "no-reply@tutti.ch": TuttiParser,
             "info@ronorp.net": RonorpParser,
+            "news@wg-gesucht.de": WgGesuchtParser,
+            "noreply@urbanhome.ch": UrbanHomeParser,
         }
         for from_header, expected_cls in cases.items():
             with self.subTest(from_header=from_header):
@@ -261,6 +265,20 @@ class RonorpParserTest(_UrlExtractionMixin, unittest.TestCase):
     listing_url = "https://www.ronorp.net/zentralschweiz/ronorp/inserate/wohnen/wg-zimmer-luzern-998877"
 
 
+class WgGesuchtParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = WgGesuchtParser()
+    sender = "news@wg-gesucht.de"
+    # Detail page: city-district slug + the long numeric ad id before .html.
+    listing_url = "https://www.wg-gesucht.de/en/wg-zimmer-in-Luzern-Guetsch.13314062.html"
+
+
+class UrbanHomeParserTest(_UrlExtractionMixin, unittest.TestCase):
+    parser = UrbanHomeParser()
+    sender = "noreply@urbanhome.ch"
+    # Provisional detail shape: a non-/suchen/ path carrying a long numeric id.
+    listing_url = "https://www.urbanhome.ch/wohnung-mieten-luzern/1234567"
+
+
 class FooterAndSearchPageRejectionTest(unittest.TestCase):
     """Saved-search alerts always include footer / search-page links that
     look almost like listings. The patterns must reject them or every alert
@@ -330,6 +348,54 @@ class FooterAndSearchPageRejectionTest(unittest.TestCase):
             html="<a href='https://www.ronorp.net/zentralschweiz/ronorp/inserate/wohnen'>cat</a>",
         )
         self.assertEqual(RonorpParser().parse(msg), [])
+
+    def test_wggesucht_rejects_search_results_url(self) -> None:
+        # Search pages end in small dotted groups (152.0.1.0), not a 6+ digit
+        # ad id, so they must not be ingested as listings.
+        msg = make_message(
+            sender="news@wg-gesucht.de",
+            html=(
+                "<a href='https://www.wg-gesucht.de/en/wg-zimmer-in-Luzern.152.0.1.0.html'>"
+                "all results</a>"
+            ),
+        )
+        self.assertEqual(WgGesuchtParser().parse(msg), [])
+
+    def test_urbanhome_rejects_search_results_url(self) -> None:
+        # /suchen/ search-and-category pages carry no numeric listing id and are
+        # excluded by the provisional detail pattern. Includes a locale-prefixed
+        # search path and a category link with an incidental long number in the
+        # query string (must NOT be mistaken for a path id -> no junk row).
+        msg = make_message(
+            sender="noreply@urbanhome.ch",
+            html=(
+                "<a href='https://www.urbanhome.ch/suchen/mieten/wohnen/wg/lu/luzern'>"
+                "search</a>"
+                "<a href='https://www.urbanhome.ch/de/suchen/mieten/wohnen/lu/1234567'>"
+                "locale search</a>"
+                "<a href='https://www.urbanhome.ch/wohnung-mieten-luzern'>category</a>"
+                "<a href='https://www.urbanhome.ch/luzern?mc_eid=8a7b6c123456'>tracking</a>"
+                "<a href='https://www.urbanhome.ch/wohnung-mieten-luzern?page=100000'>page</a>"
+            ),
+        )
+        self.assertEqual(UrbanHomeParser().parse(msg), [])
+
+    def test_urbanhome_accepts_path_anchored_id(self) -> None:
+        # A real detail shape (numeric id as a path segment) is ingested, with or
+        # without a locale prefix, trailing slug, or tracking query.
+        for url in (
+            "https://www.urbanhome.ch/wohnung-mieten-luzern/1234567",
+            "https://www.urbanhome.ch/de/objekt/1234567/schoene-wohnung",
+            "https://www.urbanhome.ch/objekt/1234567?utm_source=suchabo",
+        ):
+            with self.subTest(url=url):
+                msg = make_message(
+                    sender="noreply@urbanhome.ch",
+                    html=f"<a href='{url}'>3.5 Zimmer in Luzern, CHF 1500</a>",
+                )
+                parsed = UrbanHomeParser().parse(msg)
+                self.assertEqual(len(parsed), 1)
+                self.assertEqual(parsed[0].source, "urbanhome.ch")
 
     def test_multiple_footer_urls_do_not_crowd_out_real_listing(self) -> None:
         # Reviewer M6: a real alert is mostly chrome — home, search-results,
