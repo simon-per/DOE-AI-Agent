@@ -52,7 +52,11 @@ from execution.flatfox_public_sync import (  # noqa: E402
     DEFAULT_CORRIDOR_KM,
     DEFAULT_TARGET_CITIES,
     FLATFOX_BASE_URL,
+    FlatfoxApiError,
+    FlatfoxPublicClient,
+    ReconcileStats,
     SyncStats,
+    reconcile_active_listings,
     sync_flatfox_public,
 )
 from execution.google_sheets_sync import (  # noqa: E402
@@ -72,6 +76,7 @@ class WorkflowResult:
     csv_path: Path | None
     drafts_path: Path | None
     google_synced: bool
+    reconcile_stats: ReconcileStats | None = None
 
 
 def tracker_counts(db_path: Path) -> dict[str, int]:
@@ -209,13 +214,19 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
         if args.skip_flatfox:
             print("Flatfox ingestion skipped.")
         else:
-            flatfox_stats = sync_flatfox_public(build_flatfox_args(args, db_path))
-            print(
-                "Flatfox public sync complete: "
-                f"pages={flatfox_stats.pages}, fetched={flatfox_stats.fetched}, "
-                f"matched={flatfox_stats.matched}, created={flatfox_stats.created}, "
-                f"updated={flatfox_stats.updated}, skipped={flatfox_stats.skipped}"
-            )
+            try:
+                flatfox_stats = sync_flatfox_public(build_flatfox_args(args, db_path))
+                print(
+                    "Flatfox public sync complete: "
+                    f"pages={flatfox_stats.pages}, fetched={flatfox_stats.fetched}, "
+                    f"matched={flatfox_stats.matched}, created={flatfox_stats.created}, "
+                    f"updated={flatfox_stats.updated}, skipped={flatfox_stats.skipped}"
+                )
+            except (FlatfoxApiError, OSError) as exc:
+                # A transient Flatfox 429/network error must never abort the run:
+                # the reconcile + brief about already-known listings still run.
+                # Mirrors the email-ingest / Google-sync resilience below.
+                print(f"Flatfox public sync unavailable: {exc}")
 
         email_stats: EmailIngestStats | None = None
         if args.skip_emails:
@@ -236,6 +247,40 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
                 # Missing/invalid creds or transient IMAP/network errors should
                 # surface a clear note but never abort the rest of the workflow.
                 print(f"Email alert ingestion unavailable: {exc}")
+
+        # Liveness reconcile runs before export/counts/brief so taken-down Flatfox
+        # listings are marked 'expired' and excluded from everything downstream.
+        reconcile_stats: ReconcileStats | None = None
+        if args.skip_reconcile:
+            print("Flatfox liveness reconcile skipped.")
+        else:
+            try:
+                client = FlatfoxPublicClient(
+                    base_url=args.flatfox_base_url,
+                    timeout_seconds=args.flatfox_timeout_seconds,
+                    max_retries=args.flatfox_max_retries,
+                )
+                with closing(connect(db_path)) as conn:
+                    reconcile_stats = reconcile_active_listings(
+                        conn,
+                        client,
+                        stale_hours=args.reconcile_stale_hours,
+                        max_checks=args.reconcile_max_checks,
+                        dry_run=args.dry_run,
+                        verbose=args.verbose,
+                    )
+                print(
+                    "Flatfox liveness reconcile complete: "
+                    f"candidates={reconcile_stats.candidates}, checked={reconcile_stats.checked}, "
+                    f"still_active={reconcile_stats.still_active}, expired={reconcile_stats.expired}, "
+                    f"skipped={reconcile_stats.skipped}"
+                    + (" (dry-run, no API calls)" if args.dry_run else "")
+                )
+            except Exception as exc:  # noqa: BLE001 - reconcile must never abort the run
+                # reconcile_active_listings is itself fail-safe per batch; this
+                # outer guard covers anything unexpected (e.g. a locked DB) so the
+                # export / brief / Sheet stages always run.
+                print(f"Flatfox liveness reconcile unavailable: {exc}")
 
         if args.skip_export:
             output_csv_path = None
@@ -298,6 +343,7 @@ def run_workflow(args: argparse.Namespace) -> WorkflowResult:
             csv_path=output_csv_path,
             drafts_path=output_drafts_path,
             google_synced=google_synced,
+            reconcile_stats=reconcile_stats,
         )
 
 
@@ -328,6 +374,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rent", type=int, default=1000)
     parser.add_argument("--include-over-budget", action="store_true")
     parser.add_argument("--include-unknown-rent", action="store_true")
+
+    parser.add_argument("--skip-reconcile", action="store_true",
+                        help="Skip the per-pk Flatfox liveness reconcile (expiry of taken-down listings).")
+    parser.add_argument("--reconcile-stale-hours", type=float, default=20.0,
+                        help="Only liveness-check Flatfox listings not re-seen within this many hours (default 20).")
+    parser.add_argument("--reconcile-max-checks", type=int, default=60,
+                        help="Cap on listings liveness-checked per reconcile run (default 60).")
 
     parser.add_argument("--skip-emails", action="store_true", help="Skip Gmail IMAP saved-search alert ingestion.")
     parser.add_argument("--emails-mailbox", default=EMAILS_DEFAULT_MAILBOX)
@@ -363,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--flatfox-limit must be between 1 and 100.")
     if args.flatfox_max_pages < 1:
         raise SystemExit("--flatfox-max-pages must be at least 1.")
+    if args.reconcile_max_checks < 1:
+        raise SystemExit("--reconcile-max-checks must be at least 1.")
     if args.export_limit < 1:
         raise SystemExit("--export-limit must be at least 1.")
 

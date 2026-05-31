@@ -55,6 +55,11 @@ The workflow runner:
   ImmoScout24 / Flatfox) over Gmail IMAP unless `--skip-emails` is set —
   this is the compliant alternative to scraping bot-protected portals, see
   `directives/ingest_email_alerts.md`
+- reconciles Flatfox listing liveness unless `--skip-reconcile` is set — a per-pk
+  check that marks taken-down listings `expired` so they drop out of the queue,
+  brief, plan, re-rank, and Sheet (fail-safe: never expires on an API error or an
+  ambiguous response). Bounded by `--reconcile-stale-hours` (default 20) and
+  `--reconcile-max-checks` (default 60)
 - scores, dedupes, and generates German drafts in SQLite
 - exports `data/application_queue.csv` and `data/message_drafts.md`
 - syncs the Google Sheet review tabs
@@ -65,9 +70,10 @@ Dry-run mode copies the current tracker to `.tmp/`, performs the same workflow
 against temporary files, and runs Google Sheets in dry-run mode. It does not
 modify the real tracker, exports, or Google Sheet.
 
-A failed Google Sheet sync (expired OAuth, gspread/network error) is logged and
-skipped — it never aborts the run, so the morning action brief is always sent
-and the local tracker/exports stay authoritative.
+A failed Flatfox sync, liveness reconcile, or Google Sheet sync (rate-limit,
+expired OAuth, gspread/network error) is logged and skipped — none of them aborts
+the run, so the morning action brief is always sent and the local tracker/exports
+stay authoritative.
 
 ## Automated Daily Run
 
@@ -233,6 +239,31 @@ Because Flatfox's documented public endpoint does not expose direct public
 price/category/geo query parameters, local filtering can only guarantee full
 coverage after a broad, throttled crawl or when using a valid Flatfox
 `selection` ID.
+
+### Listing freshness / liveness reconcile
+
+A listing ingested once would otherwise keep its `apply`/`consider` decision
+forever, so taken-down flats pile up in the brief. The reconcile asks the
+documented API about specific listing `pk`s (parsed from the stored URL) and
+marks the ones it confirms are gone as `expired` — which excludes them from the
+queue, daily plan, brief, re-rank, and Sheet. It also stamps `last_seen` on every
+re-sighting and reactivates a re-listed flat (`expired → new`).
+
+It is deliberately **fail-safe**: it only checks listings not re-seen within
+`--stale-hours` (default 20), caps the run at `--max-checks` (default 60), batches
+the `pk`s, and **never expires on doubt** — an API/network error or a response
+whose `pk`s aren't a subset of those requested (filter ignored) skips that batch.
+
+```powershell
+# List the listings that would be liveness-checked — zero API calls:
+python execution\flatfox_public_sync.py --reconcile-only --dry-run
+
+# Run a real, low-volume, capped reconcile (also runs inside the daily workflow):
+python execution\flatfox_public_sync.py --reconcile-only --max-checks 60
+```
+
+The daily workflow runs this automatically after ingest (before export/brief);
+disable with `--skip-reconcile`.
 
 ## Google Sheets Tracker
 

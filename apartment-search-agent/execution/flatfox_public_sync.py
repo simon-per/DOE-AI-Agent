@@ -641,7 +641,9 @@ def reconcile_active_listings(
             if item.get("pk") is not None
         }
         # Validity guard: a response containing pks we did not request means the
-        # pk filter was ignored — inconclusive, so skip the whole batch.
+        # pk filter was ignored — inconclusive, so skip the whole batch. (An empty
+        # `results` that is a subset of `requested` is conclusive the other way:
+        # every queried pk is confirmed absent, so each is expired below.)
         if not returned <= requested:
             stats = stats.add(skipped=len(batch))
             print(
