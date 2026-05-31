@@ -292,7 +292,20 @@ read-only seed and then stores any refreshed token in this repo. A legacy
 script will not write token refreshes outside this repository. The sync opens
 the existing spreadsheet by name and creates/updates these tabs:
 
-- `Pipeline` - one row per listing, including status, score, listing facts, draft, and application fields
+- `Pipeline` - the slim, **relevant-only** review tab (job-pipeline style):
+  - **Only actionable listings** (apply / consider / manual_review). System
+    `skip` (women-only, scam, far, over-budget) and taken-down `expired` listings
+    are not shown.
+  - **Core columns first** — `status, score, title, city, price_chf,
+    commute_class, best_commute_min, available_from, source, url` — then
+    secondary context (`system_decision, category, wg_fit_score, risk, flags,
+    system_reason, openrouter_score, message_draft`) and a manual tracking tail
+    (`sent_at, follow_up_date, response_status, response_notes, next_action`).
+  - **Manual `Status` column** with a dropdown and color-coding, mirroring the job
+    pipeline: New, Applied, Interviewing, Offer, Rejected, Irrelevant, Duplicate,
+    Expired, No_Response. Edit it as you progress — it's preserved across daily
+    syncs. The header is frozen + bold and the `score` column is color-banded
+    (green ≥70 / yellow 50–69 / red <50).
 - `Summary`
 - `Settings`
 - `Sources`

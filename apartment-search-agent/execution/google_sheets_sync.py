@@ -160,33 +160,33 @@ APPLICATION_MANUAL_COLUMNS = [
 APPLICATION_COLUMNS = APPLICATION_GENERATED_COLUMNS + APPLICATION_MANUAL_COLUMNS
 
 PIPELINE_COLUMNS = [
-    "listing_id",
+    # Core — the at-a-glance decision columns (job-pipeline style: relevant first)
     "status",
     "score",
-    "system_decision",
-    "source",
     "title",
     "city",
     "price_chf",
-    "available_from",
-    "category",
     "commute_class",
     "best_commute_min",
-    "price_score",
+    "available_from",
+    "source",
+    "url",
+    # Secondary — context "if you care"
+    "listing_id",
+    "system_decision",
+    "category",
     "wg_fit_score",
     "risk",
     "flags",
     "system_reason",
-    "url",
+    "openrouter_score",
     "message_draft",
-    "simon_approval",
-    "final_message",
+    # Manual tracking — edited by Simon, preserved across syncs
     "sent_at",
     "follow_up_date",
     "response_status",
     "response_notes",
     "next_action",
-    "last_manual_update",
 ]
 
 PIPELINE_MANUAL_COLUMNS = [
@@ -200,6 +200,41 @@ PIPELINE_MANUAL_COLUMNS = [
     "next_action",
     "last_manual_update",
 ]
+
+# Manual Status vocabulary, mirrored from the job pipeline
+# (../execution/write_jobs_to_sheet.py). Simon edits Status in the Sheet; the
+# value is preserved across daily syncs via merge_pipeline_values. The system
+# only ever sets the derived states (New/Applied/Expired/Irrelevant) — the rest
+# (Interviewing/Offer/Rejected/Duplicate/No_Response) are Simon's to set.
+STATUS_VALUES = [
+    "New",
+    "Applied",
+    "Interviewing",
+    "Offer",
+    "Rejected",
+    "Irrelevant",
+    "Duplicate",
+    "Expired",
+    "No_Response",
+]
+
+# RGB (0..1) per status, reusing the job sheet's color scheme.
+STATUS_COLORS: dict[str, tuple[float, float, float]] = {
+    "New": (0.80, 0.90, 1.00),          # light blue
+    "Applied": (0.56, 0.74, 0.96),      # blue
+    "Interviewing": (0.72, 0.88, 0.73), # green
+    "Offer": (0.40, 0.85, 0.50),        # bright green
+    "Rejected": (0.96, 0.70, 0.70),     # red
+    "Irrelevant": (0.87, 0.87, 0.87),   # grey
+    "Duplicate": (1.00, 0.76, 0.38),    # orange
+    "Expired": (0.80, 0.80, 0.80),      # grey
+    "No_Response": (0.93, 0.93, 0.93),  # light grey
+}
+
+# priority_score is 0..100 (apartment_pipeline.score_listing); apply needs >=60
+# with a strong commute, consider >=55. Color bands for the score column.
+SCORE_GREEN_MIN = 70
+SCORE_YELLOW_MIN = 50
 
 SOURCE_COLUMNS = [
     "source",
@@ -584,52 +619,58 @@ def application_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def default_pipeline_status(row: dict[str, Any]) -> str:
+    """Map the system decision/tracker status to the manual Status vocabulary
+    (job-pipeline style). Only produces system-derived states; Simon promotes
+    rows to Interviewing / Offer / Rejected / Duplicate / No_Response by hand."""
     tracker_status = str(row.get("status") or "")
     decision = str(row.get("decision") or "")
-    if tracker_status in {"sent", "archived", "expired"}:
-        return tracker_status
+    if tracker_status == "expired":
+        return "Expired"
+    if tracker_status == "sent":
+        return "Applied"
+    if tracker_status == "archived":
+        return "Irrelevant"
     if decision == "skip":
-        return "irrelevant"
-    if decision == "manual_review":
-        return "manual_review"
-    if decision == "consider":
-        return "maybe"
-    if decision == "apply":
-        return "new"
-    return tracker_status or "new"
+        return "Irrelevant"
+    return "New"
 
 
 def pipeline_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Relevant-only rows for the slim Pipeline tab: the actionable tiers, minus
+    taken-down (expired) or archived listings. System 'skip' (women-only, scam,
+    far, over-budget) never appears. Ordering is inherited from listing_rows
+    (decision tier -> priority_score desc -> rent)."""
     rows: list[dict[str, Any]] = []
     for row in listing_rows(conn):
+        if row.get("decision") not in ("apply", "consider", "manual_review"):
+            continue
+        if row.get("status") in ("expired", "archived"):
+            continue
         item = {
-            "listing_id": row.get("listing_id"),
             "status": default_pipeline_status(row),
             "score": row.get("total_score"),
-            "system_decision": row.get("decision"),
-            "source": row.get("source"),
             "title": row.get("title"),
             "city": row.get("city"),
             "price_chf": row.get("price_chf"),
-            "available_from": row.get("available_from"),
-            "category": row.get("category_normalized"),
             "commute_class": row.get("commute_class"),
             "best_commute_min": row.get("best_commute_min"),
-            "price_score": row.get("price_score"),
+            "available_from": row.get("available_from"),
+            "source": row.get("source"),
+            "url": row.get("url"),
+            "listing_id": row.get("listing_id"),
+            "system_decision": row.get("decision"),
+            "category": row.get("category_normalized"),
             "wg_fit_score": row.get("wg_fit_score"),
             "risk": row.get("scam_risk"),
             "flags": row.get("flags"),
             "system_reason": row.get("recommended_action"),
-            "url": row.get("url"),
+            "openrouter_score": row.get("openrouter_score"),
             "message_draft": row.get("message_draft"),
-            "simon_approval": "yes" if row.get("approval_status") == "approved" else "",
-            "final_message": "",
             "sent_at": row.get("sent_at"),
             "follow_up_date": "",
             "response_status": "",
             "response_notes": "",
             "next_action": "",
-            "last_manual_update": "",
         }
         rows.append(item)
     return rows
@@ -752,6 +793,20 @@ def pipeline_manual_values(values: list[list[Any]]) -> dict[str, dict[str, Any]]
     return result
 
 
+def has_manual_progress(manual_row: dict[str, Any]) -> bool:
+    """True when Simon has actually tracked a row — its Status moved off the
+    default 'New', or any other manual field is filled. Used to decide whether a
+    row that's no longer in the generated (relevant) set is worth keeping."""
+    status = str(manual_row.get("status") or "").strip()
+    if status and status.lower() != "new":
+        return True
+    return any(
+        str(manual_row.get(column) or "").strip()
+        for column in PIPELINE_MANUAL_COLUMNS
+        if column != "status"
+    )
+
+
 def merge_pipeline_values(
     generated_values: list[list[Any]],
     existing_pipeline_values: list[list[Any]] | None,
@@ -777,14 +832,173 @@ def merge_pipeline_values(
     for listing_id, manual_row in pipeline_manual.items():
         if listing_id in generated_ids:
             continue
+        # The slim Pipeline hides system 'skip'/'expired' rows. Without this
+        # guard, every such row that was ever synced would resurface here as an
+        # 'archived' row, defeating the slimming. Only keep rows Simon actually
+        # tracked (Status moved off New, or another manual field filled).
+        if not has_manual_progress(manual_row):
+            continue
         archived = {column: "" for column in headers}
         archived.update(manual_row)
         archived["listing_id"] = listing_id
-        archived["status"] = archived.get("status") or "archived"
+        archived["status"] = archived.get("status") or "Expired"
         archived["system_decision"] = "missing_from_tracker"
         merged.append([cell_value(archived.get(column)) for column in headers])
 
     return merged
+
+
+def _color(rgb: tuple[float, float, float]) -> dict[str, float]:
+    red, green, blue = rgb
+    return {"red": red, "green": green, "blue": blue}
+
+
+def pipeline_format_targets() -> tuple[int, int, int]:
+    """(header_len, status_col_index, score_col_index) for the Pipeline tab."""
+    return (
+        len(PIPELINE_COLUMNS),
+        PIPELINE_COLUMNS.index("status"),
+        PIPELINE_COLUMNS.index("score"),
+    )
+
+
+def build_pipeline_format_requests(
+    sheet_id: int,
+    header_len: int,
+    num_rows: int,
+    status_col: int,
+    score_col: int,
+    existing_rule_count: int,
+) -> list[dict[str, Any]]:
+    """Sheets API `batchUpdate` requests to make the Pipeline tab feel like the
+    job sheet: frozen bold header, a Status dropdown, per-status colors, and
+    green/yellow/red score bands. Idempotent — it first deletes the
+    `existing_rule_count` conditional-format rules so daily re-syncs don't pile up."""
+    data_end = max(num_rows + 1, 2)  # header is row 1; ensure a valid (non-empty) range
+    requests: list[dict[str, Any]] = []
+
+    # Clear existing conditional-format rules first (re-sync idempotency).
+    for _ in range(max(existing_rule_count, 0)):
+        requests.append({"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": 0}})
+
+    # Freeze the header row.
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+            "fields": "gridProperties.frozenRowCount",
+        }
+    })
+    # Bold + grey header.
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                "startColumnIndex": 0, "endColumnIndex": header_len,
+            },
+            "cell": {"userEnteredFormat": {
+                "textFormat": {"bold": True},
+                "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+            }},
+            "fields": "userEnteredFormat(textFormat,backgroundColor)",
+        }
+    })
+    # Status dropdown (non-strict so manual typos warn rather than reject).
+    status_range = {
+        "sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": data_end,
+        "startColumnIndex": status_col, "endColumnIndex": status_col + 1,
+    }
+    requests.append({
+        "setDataValidation": {
+            "range": status_range,
+            "rule": {
+                "condition": {"type": "ONE_OF_LIST",
+                              "values": [{"userEnteredValue": value} for value in STATUS_VALUES]},
+                "showCustomUi": True,
+                "strict": False,
+            },
+        }
+    })
+
+    # Score color bands.
+    score_range = {
+        "sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": data_end,
+        "startColumnIndex": score_col, "endColumnIndex": score_col + 1,
+    }
+    score_bands = [
+        ({"type": "NUMBER_GREATER_THAN_EQ", "values": [{"userEnteredValue": str(SCORE_GREEN_MIN)}]}, (0.72, 0.88, 0.73)),
+        ({"type": "NUMBER_BETWEEN", "values": [
+            {"userEnteredValue": str(SCORE_YELLOW_MIN)}, {"userEnteredValue": str(SCORE_GREEN_MIN - 1)},
+        ]}, (1.0, 0.95, 0.6)),
+        ({"type": "NUMBER_LESS", "values": [{"userEnteredValue": str(SCORE_YELLOW_MIN)}]}, (0.96, 0.7, 0.7)),
+    ]
+    for condition, rgb in score_bands:
+        requests.append({"addConditionalFormatRule": {
+            "rule": {"ranges": [score_range],
+                     "booleanRule": {"condition": condition, "format": {"backgroundColor": _color(rgb)}}},
+            "index": 0,
+        }})
+
+    # Per-status color rules.
+    for status_text, rgb in STATUS_COLORS.items():
+        requests.append({"addConditionalFormatRule": {
+            "rule": {"ranges": [status_range],
+                     "booleanRule": {
+                         "condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": status_text}]},
+                         "format": {"backgroundColor": _color(rgb)},
+                     }},
+            "index": 0,
+        }})
+
+    return requests
+
+
+def existing_cf_rule_count(sheets_metadata: dict[str, Any], sheet_id: int) -> int:
+    for sheet in sheets_metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") == sheet_id:
+            return len(sheet.get("conditionalFormats", []) or [])
+    return 0
+
+
+def format_pipeline_gspread(spreadsheet: Any, pipeline_values: list[list[Any]]) -> None:
+    """Apply Pipeline formatting via gspread (the daily-run OAuth path)."""
+    worksheet = sheets_api_call(spreadsheet.worksheet, PIPELINE_SHEET)
+    sheet_id = worksheet.id
+    metadata = sheets_api_call(spreadsheet.fetch_sheet_metadata)
+    header_len, status_col, score_col = pipeline_format_targets()
+    requests = build_pipeline_format_requests(
+        sheet_id, header_len, max(len(pipeline_values) - 1, 0), status_col, score_col,
+        existing_cf_rule_count(metadata, sheet_id),
+    )
+    if requests:
+        sheets_api_call(spreadsheet.batch_update, {"requests": requests})
+
+
+def format_pipeline_service(service: Any, spreadsheet_id: str, pipeline_values: list[list[Any]]) -> None:
+    """Apply Pipeline formatting via the legacy service-account path."""
+    metadata = execute_google_request(
+        service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title),conditionalFormats)",
+        )
+    )
+    sheet_id = None
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("title") == PIPELINE_SHEET:
+            sheet_id = sheet["properties"].get("sheetId")
+            break
+    if sheet_id is None:
+        return
+    header_len, status_col, score_col = pipeline_format_targets()
+    requests = build_pipeline_format_requests(
+        sheet_id, header_len, max(len(pipeline_values) - 1, 0), status_col, score_col,
+        existing_cf_rule_count(metadata, sheet_id),
+    )
+    if requests:
+        execute_google_request(
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": requests}
+            )
+        )
 
 
 def build_workbook_values(
@@ -959,6 +1173,11 @@ def sync_values(service: Any, spreadsheet_id: str, workbook: dict[str, list[list
                     body={},
                 )
             )
+    if PIPELINE_SHEET in workbook:
+        try:
+            format_pipeline_service(service, spreadsheet_id, workbook[PIPELINE_SHEET])
+        except Exception as exc:  # noqa: BLE001 - formatting must never abort the sync
+            print(f"Pipeline formatting skipped: {exc}")
 
 
 def service_sheet_values(service: Any, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
@@ -1141,6 +1360,11 @@ def sync_values_gspread(spreadsheet: Any, workbook: dict[str, list[list[Any]]]) 
             clear_ranges,
         )
     cleanup_worksheets_gspread(spreadsheet, workbook)
+    if PIPELINE_SHEET in workbook:
+        try:
+            format_pipeline_gspread(spreadsheet, workbook[PIPELINE_SHEET])
+        except Exception as exc:  # noqa: BLE001 - formatting must never abort the sync
+            print(f"Pipeline formatting skipped: {exc}")
 
 
 def sheet_values_are_blank(values: list[list[Any]]) -> bool:

@@ -18,10 +18,15 @@ from execution.google_sheets_sync import (
     PIPELINE_SHEET,
     QUEUE_SHEET,
     SOURCES_SHEET,
+    STATUS_COLORS,
+    STATUS_VALUES,
     SUMMARY_SHEET,
     SETTINGS_SHEET,
+    build_pipeline_format_requests,
     cleanup_worksheets_gspread,
+    default_pipeline_status,
     enrich_listing_row,
+    has_manual_progress,
     load_google_client,
     build_workbook_values,
     load_google_service,
@@ -52,7 +57,8 @@ class GoogleSheetsSyncTest(unittest.TestCase):
 
             with closing(connect(db_path)) as conn:
                 init_db(conn)
-                listing = ListingInput(
+                # Relevant (apply tier — Root, cheap, target move-in).
+                relevant = ListingInput(
                     url="https://flatfox.ch/en/flat/example/1/",
                     source="flatfox.ch",
                     title="WG Zimmer Root",
@@ -64,18 +70,56 @@ class GoogleSheetsSyncTest(unittest.TestCase):
                     raw_text="ruhig sauber Anmeldung",
                     commute_minutes=None,
                 )
-                upsert_listing(conn, score_listing(normalize_listing(listing)))
+                upsert_listing(conn, score_listing(normalize_listing(relevant)))
+                # Over-budget -> system 'skip' -> must NOT appear in the slim tab.
+                skipped = ListingInput(
+                    url="https://flatfox.ch/en/flat/example/2/",
+                    source="flatfox.ch",
+                    title="Teure Wohnung Luzern",
+                    rent_chf=2400,
+                    city="Luzern",
+                    move_in="16.07.",
+                    contact_name=None,
+                    contact_email=None,
+                    raw_text="grosse Wohnung",
+                    commute_minutes=None,
+                )
+                upsert_listing(conn, score_listing(normalize_listing(skipped)))
+                # Actionable but taken-down -> 'expired' -> must NOT appear.
+                expired = ListingInput(
+                    url="https://flatfox.ch/en/flat/example/3/",
+                    source="flatfox.ch",
+                    title="WG Buchrain",
+                    rent_chf=820,
+                    city="Buchrain",
+                    move_in="16.07.",
+                    contact_name=None,
+                    contact_email=None,
+                    raw_text="ruhig sauber Anmeldung Velo",
+                    commute_minutes=None,
+                )
+                expired_id, _ = upsert_listing(conn, score_listing(normalize_listing(expired)))
+                conn.execute("UPDATE listings SET status = 'expired' WHERE id = ?", (expired_id,))
+                conn.commit()
                 workbook = build_workbook_values(conn, sources_path)
 
             self.assertEqual(
                 set(workbook),
                 {PIPELINE_SHEET, SOURCES_SHEET, SUMMARY_SHEET, SETTINGS_SHEET},
             )
-            self.assertGreaterEqual(len(workbook[PIPELINE_SHEET]), 2)
             self.assertEqual(workbook[SOURCES_SHEET][1][0], "flatfox.ch")
-            self.assertIn("status", workbook[PIPELINE_SHEET][0])
-            self.assertIn("system_decision", workbook[PIPELINE_SHEET][0])
-            self.assertIn("final_message", workbook[PIPELINE_SHEET][0])
+            pipeline = workbook[PIPELINE_SHEET]
+            header = pipeline[0]
+            # Core-first slim layout, job-style status column leads.
+            self.assertEqual(header[0], "status")
+            for column in ("score", "title", "city", "price_chf", "commute_class", "system_decision"):
+                self.assertIn(column, header)
+            self.assertNotIn("final_message", header)
+            # Relevant-only: the over-budget skip and the expired row are excluded.
+            titles = {row[header.index("title")] for row in pipeline[1:]}
+            self.assertIn("WG Zimmer Root", titles)
+            self.assertNotIn("Teure Wohnung Luzern", titles)
+            self.assertNotIn("WG Buchrain", titles)
             self.assertEqual(workbook[SUMMARY_SHEET][0], ["metric", "value"])
 
     def test_enrich_is_active_and_last_seen_reflect_freshness(self) -> None:
@@ -330,6 +374,62 @@ class GoogleSheetsSyncTest(unittest.TestCase):
         merged = merge_pipeline_values(generated, existing_pipeline, existing_applications)
 
         self.assertEqual(merged[1], [1, "viewing", "Fresh title", "apply", "Pipeline message"])
+
+    def test_default_pipeline_status_maps_to_job_vocabulary(self) -> None:
+        self.assertEqual(default_pipeline_status({"decision": "apply", "status": "new"}), "New")
+        self.assertEqual(default_pipeline_status({"decision": "consider", "status": "new"}), "New")
+        self.assertEqual(default_pipeline_status({"decision": "manual_review", "status": "new"}), "New")
+        self.assertEqual(default_pipeline_status({"decision": "skip", "status": "new"}), "Irrelevant")
+        self.assertEqual(default_pipeline_status({"decision": "apply", "status": "expired"}), "Expired")
+        self.assertEqual(default_pipeline_status({"decision": "apply", "status": "sent"}), "Applied")
+        self.assertEqual(default_pipeline_status({"decision": "apply", "status": "archived"}), "Irrelevant")
+
+    def test_has_manual_progress(self) -> None:
+        self.assertFalse(has_manual_progress({"status": "New"}))
+        self.assertFalse(has_manual_progress({"status": ""}))
+        self.assertFalse(has_manual_progress({}))
+        self.assertTrue(has_manual_progress({"status": "Applied"}))
+        self.assertTrue(has_manual_progress({"status": "New", "response_notes": "called landlord"}))
+        self.assertTrue(has_manual_progress({"status": "New", "sent_at": "2026-06-01"}))
+
+    def test_merge_pipeline_drops_untracked_but_keeps_tracked_rows(self) -> None:
+        # The slim tab hides skip/expired. A previously-synced row that's no longer
+        # generated should vanish if untouched, but persist if Simon tracked it.
+        generated = [
+            ["listing_id", "status", "title", "system_decision"],
+            [2, "New", "Current relevant", "apply"],
+        ]
+        existing_pipeline = [
+            ["listing_id", "status", "title", "system_decision"],
+            ["1", "New", "Untouched skip", "skip"],
+            ["3", "Applied", "Tracked flat", "apply"],
+        ]
+
+        merged = merge_pipeline_values(generated, existing_pipeline, None)
+
+        ids = [str(row[0]) for row in merged[1:]]
+        self.assertIn("2", ids)        # generated relevant row
+        self.assertIn("3", ids)        # tracked -> preserved
+        self.assertNotIn("1", ids)     # untouched + gone -> dropped
+
+    def test_build_pipeline_format_requests_structure(self) -> None:
+        requests = build_pipeline_format_requests(
+            sheet_id=7, header_len=24, num_rows=3, status_col=0, score_col=1, existing_rule_count=2,
+        )
+        # The two stale conditional-format rules are deleted first (idempotent re-sync).
+        self.assertEqual(sum(1 for r in requests if "deleteConditionalFormatRule" in r), 2)
+        self.assertTrue(any("updateSheetProperties" in r for r in requests))  # freeze
+        self.assertTrue(any("repeatCell" in r for r in requests))             # bold header
+        validation = [r for r in requests if "setDataValidation" in r]
+        self.assertEqual(len(validation), 1)
+        values = [
+            v["userEnteredValue"]
+            for v in validation[0]["setDataValidation"]["rule"]["condition"]["values"]
+        ]
+        self.assertEqual(values, STATUS_VALUES)
+        # One color rule per status + three score bands.
+        cf_adds = [r for r in requests if "addConditionalFormatRule" in r]
+        self.assertEqual(len(cf_adds), len(STATUS_COLORS) + 3)
 
     def test_open_google_spreadsheet_prefers_id(self) -> None:
         client = MagicMock()
