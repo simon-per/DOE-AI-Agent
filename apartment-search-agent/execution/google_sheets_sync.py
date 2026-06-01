@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import time
+import traceback
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -963,7 +964,13 @@ def format_pipeline_gspread(spreadsheet: Any, pipeline_values: list[list[Any]]) 
     """Apply Pipeline formatting via gspread (the daily-run OAuth path)."""
     worksheet = sheets_api_call(spreadsheet.worksheet, PIPELINE_SHEET)
     sheet_id = worksheet.id
-    metadata = sheets_api_call(spreadsheet.fetch_sheet_metadata)
+    # Request conditionalFormats explicitly so existing_cf_rule_count is reliable
+    # (a bare fetch_sheet_metadata may omit it) — keeps daily re-syncs idempotent
+    # instead of piling up duplicate color rules. Mirrors format_pipeline_service.
+    metadata = sheets_api_call(
+        spreadsheet.fetch_sheet_metadata,
+        params={"fields": "sheets(properties(sheetId,title),conditionalFormats)"},
+    )
     header_len, status_col, score_col = pipeline_format_targets()
     requests = build_pipeline_format_requests(
         sheet_id, header_len, max(len(pipeline_values) - 1, 0), status_col, score_col,
@@ -1176,8 +1183,9 @@ def sync_values(service: Any, spreadsheet_id: str, workbook: dict[str, list[list
     if PIPELINE_SHEET in workbook:
         try:
             format_pipeline_service(service, spreadsheet_id, workbook[PIPELINE_SHEET])
-        except Exception as exc:  # noqa: BLE001 - formatting must never abort the sync
-            print(f"Pipeline formatting skipped: {exc}")
+        except Exception:  # noqa: BLE001 - formatting must never abort the sync
+            print("!!! Pipeline formatting FAILED (sync values are fine) - detail below:")
+            traceback.print_exc()
 
 
 def service_sheet_values(service: Any, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
@@ -1363,8 +1371,9 @@ def sync_values_gspread(spreadsheet: Any, workbook: dict[str, list[list[Any]]]) 
     if PIPELINE_SHEET in workbook:
         try:
             format_pipeline_gspread(spreadsheet, workbook[PIPELINE_SHEET])
-        except Exception as exc:  # noqa: BLE001 - formatting must never abort the sync
-            print(f"Pipeline formatting skipped: {exc}")
+        except Exception:  # noqa: BLE001 - formatting must never abort the sync
+            print("!!! Pipeline formatting FAILED (sync values are fine) - detail below:")
+            traceback.print_exc()
 
 
 def sheet_values_are_blank(values: list[list[Any]]) -> bool:

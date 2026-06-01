@@ -128,6 +128,20 @@ manual fields into `Pipeline`. The sync should remove a blank default
 `Settings`, `Sources`, so Simon does not open the document on an empty default
 tab.
 
+`Pipeline` is the masterfile: it shows only relevant listings (decision
+`apply`/`consider`/`manual_review`; system `skip`/`expired` rows are hidden) with
+the glanceable columns first and a job-style manual `Status` (New, Applied,
+Interviewing, Offer, Rejected, Irrelevant, Duplicate, Expired, No_Response). On a
+real (non-dry-run) sync the tab is also formatted via the Sheets `batchUpdate`
+API: a frozen bold header, a Status dropdown (data validation), per-status colors,
+and green/yellow/red score bands. Formatting is wrapped so it can never abort the
+value sync, but a failure now prints a loud `!!! Pipeline formatting FAILED` banner
+plus a full traceback — never a silent one-liner. Learnings: (1) formatting only
+lands on a completed live sync, never on `--dry-run`; (2) idempotency depends on
+fetching `conditionalFormats` explicitly via a `fields` mask — a bare
+`fetch_sheet_metadata` may omit it, which makes the delete-then-re-add cleanup
+skip its deletes and pile up duplicate color rules across daily re-syncs.
+
 The child repo should read the parent DOE AI Agent Google OAuth credentials by
 default, but keep writable token refreshes inside this repository:
 - credentials seed: `../credentials.json`
