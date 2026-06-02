@@ -33,20 +33,27 @@ Same filters everywhere:
 
 ## Step 2 — One Gmail filter so they never touch your inbox
 
-Gmail → **Settings → Filters and Blocked Addresses → Create a new filter**. In the
-**From** field paste:
+1. Gmail → **Settings (gear) → See all settings → Filters and Blocked Addresses →
+   Create a new filter**.
+2. In the **From** field, paste:
 
-```
-wgzimmer.ch OR homegate.ch OR immoscout24.ch OR newhome.ch OR comparis.ch OR anibis.ch OR tutti.ch OR ronorp.net OR wg-gesucht.de OR urbanhome.ch
-```
+   ```
+   wgzimmer.ch OR homegate.ch OR immoscout24.ch OR newhome.ch OR comparis.ch OR anibis.ch OR tutti.ch OR ronorp.net OR wg-gesucht.de OR urbanhome.ch
+   ```
 
-Click **Create filter**, then tick:
-
-- ✅ **Skip the Inbox (Archive it)** — this is what keeps your inbox clean
-- ✅ *(optional)* **Apply label:** `Apartments` — so you can browse them if you like
-- ✅ **Also apply to matching conversations** (sweeps any already there)
+3. Click **Create filter** (bottom-right), then tick:
+   - ✅ **Skip the Inbox (Archive it)** — keeps your inbox clean
+   - ✅ **Mark as read** — no unread badge anywhere
+   - ☑ *(optional)* **Apply the label:** `Apartments` — so you can browse them if you like
+   - ✅ **Also apply filter to matching conversations** (sweeps any already in your inbox)
+4. Click **Create filter**.
 
 Done. Alerts now bypass your inbox entirely; the daily run reads them from All Mail.
+
+**Note — Flatfox is intentionally NOT in the list.** Flatfox emails are replies to
+flats you've already contacted, so those stay in your inbox where you'll see them
+(its listings come in via the API anyway). "Mark as read" does not hide alerts from
+the agent — it reads All Mail by date + sender, not by read status.
 
 ## After you've set a few up
 
