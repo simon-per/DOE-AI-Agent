@@ -139,6 +139,52 @@ class IngestRoutingTest(_IngestTestBase):
         dumped = list(dump_dir.glob("unrouted_*.eml"))
         self.assertEqual(len(dumped), 1, "unrouted sample must land in the configured dir")
 
+    def test_routed_but_empty_is_dumped_and_marked_seen(self) -> None:
+        """A portal email that matches a sender but yields no listing URL must be
+        captured for parser finalization AND marked seen (so legitimately-empty
+        transactional mail is not re-dumped on every run)."""
+        dump_dir = Path(self._tmp.name) / "email_samples"
+        messages = [
+            make_email(
+                sender="news@homegate.ch",
+                subject="Ihre gespeicherte Suche",
+                html="<p>Keine neuen Treffer. "
+                "<a href='https://www.homegate.ch/account/login'>Login</a></p>",
+                message_id="<routed-empty@fixture>",
+            ),
+        ]
+        fake = FakeIMAP(messages)
+        with patch.object(ingest, "imap_credentials", return_value=("a@b.com", "pw")), \
+             patch.object(ingest, "connect_imap", return_value=fake):
+            stats = ingest.sync_email_alerts(self._build_args(dump_dir=dump_dir))
+
+        self.assertEqual(stats.routed, 1)
+        self.assertEqual(stats.listings_seen, 0)
+        self.assertEqual(stats.listings_created, 0)
+        dumped = list(dump_dir.glob("routed_empty_*.eml"))
+        self.assertEqual(len(dumped), 1, "routed-but-empty email must be captured")
+        self.assertIn("homegate", dumped[0].name)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            seen = conn.execute("SELECT message_id FROM email_alert_seen").fetchall()
+        self.assertEqual(len(seen), 1, "must be marked seen so it is not re-dumped")
+
+    def test_routed_but_empty_not_dumped_in_dry_run(self) -> None:
+        dump_dir = Path(self._tmp.name) / "email_samples"
+        messages = [
+            make_email(
+                sender="news@homegate.ch",
+                subject="Ihre gespeicherte Suche",
+                html="<p>Keine neuen Treffer.</p>",
+                message_id="<routed-empty-dry@fixture>",
+            ),
+        ]
+        fake = FakeIMAP(messages)
+        with patch.object(ingest, "imap_credentials", return_value=("a@b.com", "pw")), \
+             patch.object(ingest, "connect_imap", return_value=fake):
+            ingest.sync_email_alerts(self._build_args(dump_dir=dump_dir, dry_run=True))
+        self.assertFalse(dump_dir.exists() and list(dump_dir.glob("routed_empty_*.eml")),
+                         "dry-run must not write a routed-empty dump")
+
     def test_dry_run_does_not_write(self) -> None:
         messages = [
             make_email(
@@ -297,6 +343,33 @@ class ConnectImapTest(unittest.TestCase):
         self.assertIs(client, fake)
         self.assertTrue(fake.selected_readonly,
                         "connect_imap must open the mailbox read-only")
+
+    def _recording_imap(self):
+        class RecordingIMAP:
+            def __init__(self) -> None:
+                self.selected = None
+
+            def login(self, *_args) -> None:
+                pass
+
+            def select(self, mailbox, readonly=False):
+                self.selected = mailbox
+                return "OK", [b"1"]
+
+        return RecordingIMAP()
+
+    def test_mailbox_with_spaces_is_quoted(self) -> None:
+        rec = self._recording_imap()
+        with patch.object(ingest.imaplib, "IMAP4_SSL", return_value=rec):
+            ingest.connect_imap("imap.test", "u@v", "pw", "[Gmail]/All Mail")
+        self.assertEqual(rec.selected, '"[Gmail]/All Mail"',
+                         "names with spaces/brackets must be sent quoted")
+
+    def test_simple_mailbox_not_quoted(self) -> None:
+        rec = self._recording_imap()
+        with patch.object(ingest.imaplib, "IMAP4_SSL", return_value=rec):
+            ingest.connect_imap("imap.test", "u@v", "pw", "INBOX")
+        self.assertEqual(rec.selected, "INBOX", "simple atoms must stay unquoted")
 
     def test_login_failure_closes_socket(self) -> None:
         class FailingIMAP:

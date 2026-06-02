@@ -56,10 +56,19 @@ CLI flags:
   per processed message — prevents re-parsing on subsequent runs.
 - Unknown-sender alerts dumped to `.tmp/email_samples/unrouted_*.eml` so the
   parser registry can be extended without re-running IMAP.
+- **Routed-but-empty** alerts (sender matched, but no URL hit the portal's
+  `listing_url_pattern`) dumped once to `.tmp/email_samples/routed_empty_<source>_*.eml`
+  and still marked seen. This captures a real sample of any alert whose URL format
+  the parser doesn't yet match — finalize the pattern from it, then `--reprocess`.
 
 ## Per-portal saved-search setup
 
-Set up these searches once. They're free on every portal.
+Set up these searches once. They're free on every portal. **No inbox spam:** route
+the alerts to the archive with one Gmail filter (From = the portal domains → "Skip
+the Inbox (Archive it)", optional label `Apartments`). The daily run scans **All
+Mail** (`--emails-mailbox "[Gmail]/All Mail"` in `scripts/daily_apartment_run.cmd`),
+so archived alerts are still harvested while Simon's inbox stays clean. The
+user-facing checklist is `ALERT_SETUP.md`.
 
 **WGZimmer.ch** — log in → "Suchabo erstellen" with:
 - Canton: Luzern (+ optionally Zug)
@@ -133,6 +142,11 @@ To add a new portal:
 - If you discover an alert sender we don't recognise, the message gets
   dumped to `.tmp/email_samples/` instead of erroring. Iterate by reading
   the dump, updating the parser, rerunning with `--reprocess`.
+- A routed message that yields 0 listings is dumped to
+  `.tmp/email_samples/routed_empty_<source>_*.eml` (once — it's still marked seen).
+  Note that `--reprocess` bypasses the seen-table and will re-dump both
+  `unrouted_*` and `routed_empty_*` samples, so after a wide replay
+  (e.g. `--reprocess --days 90`) expect to clean `.tmp/email_samples/`.
 - **UrbanHome's `listing_url_pattern` is provisional.** Its detail pages render
   client-side, so the exact path couldn't be confirmed without a real alert. The
   current regex (a non-`/suchen/` URL carrying a 6+ digit id) errs toward

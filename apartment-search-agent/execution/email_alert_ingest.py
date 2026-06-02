@@ -127,7 +127,14 @@ def connect_imap(host: str, address: str, password: str, mailbox: str) -> imapli
     client = imaplib.IMAP4_SSL(host)
     try:
         client.login(address, password)
-        status, _ = client.select(mailbox, readonly=True)
+        # imaplib does not quote mailbox names; ones with spaces or brackets
+        # (e.g. "[Gmail]/All Mail") must be sent as a quoted string or the server
+        # rejects the SELECT with "Could not parse command". Leave simple atoms
+        # (INBOX, Apartments) and already-quoted names untouched.
+        selectable = mailbox
+        if not mailbox.startswith('"') and any(ch in mailbox for ch in " []"):
+            selectable = f'"{mailbox}"'
+        status, _ = client.select(selectable, readonly=True)
         if status != "OK":
             raise SystemExit(f"Could not select mailbox {mailbox!r}: status={status}")
     except BaseException:
@@ -191,15 +198,29 @@ def message_identifier(msg: Message, uid: bytes) -> str:
 _SENDER_DOMAIN_RE = re.compile(r"@([\w.-]+)")
 
 
-def dump_unrouted(msg: Message, uid: bytes, dump_dir: Path | None = None) -> Path:
+def _dump_message(msg: Message, uid: bytes, prefix: str, label: str, dump_dir: Path | None) -> Path:
     target_dir = dump_dir or UNROUTED_DUMP_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    domain_match = _SENDER_DOMAIN_RE.search(msg.get("From") or "")
-    sender_label = (domain_match.group(1) if domain_match else "unknown")[:40]
-    safe_label = "".join(ch for ch in sender_label if ch.isalnum() or ch in ".-_")
-    target = target_dir / f"unrouted_{safe_label or 'unknown'}_{uid.decode('ascii', 'replace')}.eml"
+    safe_label = "".join(ch for ch in (label or "unknown")[:40] if ch.isalnum() or ch in ".-_")
+    target = target_dir / f"{prefix}_{safe_label or 'unknown'}_{uid.decode('ascii', 'replace')}.eml"
     target.write_bytes(msg.as_bytes())
     return target
+
+
+def dump_unrouted(msg: Message, uid: bytes, dump_dir: Path | None = None) -> Path:
+    domain_match = _SENDER_DOMAIN_RE.search(msg.get("From") or "")
+    sender_label = domain_match.group(1) if domain_match else "unknown"
+    return _dump_message(msg, uid, "unrouted", sender_label, dump_dir)
+
+
+def dump_routed_empty(msg: Message, uid: bytes, source: str, dump_dir: Path | None = None) -> Path:
+    """Capture an email that matched a portal sender but yielded no listing URL.
+
+    This is the silent-miss case: a real saved-search alert whose URL format the
+    parser doesn't yet match, or a transactional/notification email with no
+    listing. Dumping it (once) gives a real sample to finalize the parser's
+    `listing_url_pattern` from without re-running IMAP."""
+    return _dump_message(msg, uid, "routed_empty", source, dump_dir)
 
 
 def listing_input_from_parsed(parsed, fallback_subject: str) -> ListingInput:
@@ -262,6 +283,18 @@ def process_message(
         return MessageOutcome(touched=0, parsed_ok=False, parser_source=parser.source)
 
     stats.routed += 1
+    if not parsed_listings:
+        # Matched a portal sender but no URL hit the listing pattern. Capture one
+        # .eml so a real alert we don't yet parse isn't silently lost; still mark
+        # it seen (parsed_ok=True) so legitimately-empty transactional mail is not
+        # re-dumped every run. A later parser fix backfills it via --reprocess.
+        if not dry_run:
+            dumped = dump_routed_empty(msg, uid, parser.source, dump_dir)
+            if verbose:
+                print(f"  routed but 0 listings: {parser.source} dumped={dumped}")
+        elif verbose:
+            print(f"  routed but 0 listings: {parser.source} (dry-run, not dumped)")
+        return MessageOutcome(touched=0, parsed_ok=True, parser_source=parser.source)
     subject = (msg.get("Subject") or "").strip()
     touched = 0
     for parsed in parsed_listings:

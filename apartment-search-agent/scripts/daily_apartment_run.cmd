@@ -27,7 +27,7 @@ set "PY=.venv\Scripts\python.exe"
 if not exist "!PY!" set "PY=python"
 
 >>"!LOG!" echo ==== %DATE% %TIME% START daily apartment run ====
-"!PY!" execution\apartment_workflow.py --flatfox-max-pages 5 --notify-since 2d >>"!LOG!" 2>&1
+"!PY!" execution\apartment_workflow.py --flatfox-max-pages 5 --notify-since 2d --emails-mailbox "[Gmail]/All Mail" >>"!LOG!" 2>&1
 set "RC=!ERRORLEVEL!"
 >>"!LOG!" echo ==== %DATE% %TIME% END rc=!RC! ====
 
